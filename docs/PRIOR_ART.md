@@ -119,8 +119,9 @@ separate erase/write factors are established. SolveDelta therefore does not clai
 the multi-edit product itself as new. At edit depth `K` it contains
 DeltaProduct-`K` as an exact identity-geometry reduction and must compare
 against the corresponding baseline. The contribution is that bounded
-asymmetric edits share a full-prefix LSSO transpose-dual adapter and use general dual
-erase/write factors. `K=1` is the current performance default; `K>1` remains a
+asymmetric edits share a full-prefix LSSO transpose-dual adapter and use gated
+key-derived erase covectors that become generally non-collinear with writes in
+the ambient frame. `K=1` is the current performance default; `K>1` remains a
 supported capacity setting and the exact DeltaProduct-`K` reduction remains a
 required test. This changes the default compute point rather than the model
 family's expressivity, and edit count is not part of the novelty claim.
@@ -129,9 +130,25 @@ Decision: GDN2 already uses asymmetric rank-one erase/write factors, so mild
 non-normality is not unique to SolveDelta. A fresh algebraic audit corrected a
 stronger claim: `a^T b >= 0` fixes the one nontrivial eigenvalue but does not
 make the symmetric part of `ab^T` positive semidefinite unless the factors are
-positively collinear. The former H+S/dissipative label was removed. The
-remaining project-specific mechanism is accurately named an orthogonal erase
-residual.
+positively collinear. The former H+S/dissipative label was removed. A later
+orthogonal erase-residual candidate was also deleted: no task evidence showed
+that its extra skew coordinate mattered, while it required an additional chart
+action in forward and a rank-two chart cotangent in backward. The canonical
+erase source is now exactly the gated normalized key. This preserves the full
+bounded LDU geometry and exact GDN2 reduction while making the frame contract
+strictly smaller. Specifically, at fixed `(P,a)`, finite sigmoid erase gates
+satisfy `a_i bar_b_i = beta_i a_i^2 >= 0`,
+`supp(bar_b) = supp(a)`, and
+`0 < |bar_b_i| < 2 |a_i|` on that support. The FP64 oracle also admits the
+closed gate endpoints, whose zero endpoint gives the weaker
+`supp(bar_b) subseteq supp(a)` condition. The deleted residual could move
+`bar_b` along the chart-dependent orthogonal direction `Omega a` and leave
+that cone. A different shared prefix frame
+cannot in general recover this edit-specific degree because the same `P` also
+acts on every write, erase, and read vector. The loss is accepted provisionally
+because no task ablation supported it and it materially enlarged both frame
+actions and their VJP; task evidence remains the final check, not the speed
+result alone.
 
 ## LSSO provenance and inherited solve-geometry properties
 
@@ -259,13 +276,12 @@ Decision: strict masking destroys ordinary low rank, but retains a
 sequentially semiseparable generator. For one geometry chunk, every token's
 strict factor is a dense boundary triangle plus masked outer products from at
 most `C` local sources. This supports exact `O(C r^2 + C^2 r)` lower, upper,
-transpose, and skew actions without materializing `C x r x r` factors.
+and transpose actions without materializing `C x r x r` factors.
 
 The deleted C16 packet and C32 panel prototypes established useful facts but
 are not maintained implementations. In particular, coordinate blocking can
 turn cross-block generator contractions into wide-RHS matrix products; only
-the diagonal coordinate block needs a strict prefix/suffix scan. The identity
-`Omega^T=-Omega` also allows paired directed blocks to share work. These are
+the diagonal coordinate block needs a strict prefix/suffix scan. These are
 algebraic inputs to the replacement chunk operator, not compatibility
 requirements for its ABI.
 
@@ -355,21 +371,28 @@ semiseparable action over the finite chunk: shared boundary blocks and local
 generators form broad RHS products, while exact diagonal-block substitution
 retains tokenwise frame updates and dense `J,D`.
 
-Decision: the complete per-token factor cotangent has masked outer-product
-rank at most five for `K=1`: one primal-solve term, two erase/read terms, and
-the rank-two skew cotangent. This supports a compact blocked VJP without
-writing tokenwise dense cotangents. An independent multi-BMM realization was
-rejected: ordinary FP32 failed the legal `2^12` cancellation probe, while a
-two-sided split restored accuracy but took `2.207 ms` and added about
-`336 MiB`, essentially consuming the entire `2.320 ms` baseline budget before
-local, radial, or prefix reverse. Any compensated product must therefore live
-inside the eventual fused blocked kernel.
+Decision: after deleting the unsupported skew residual, the complete per-token
+factor cotangent has masked outer-product rank at most three for `K=1`: one
+primal-action term and one term for each of the erase and read dual actions.
+This supports a compact blocked VJP without writing tokenwise dense
+cotangents. An independent multi-BMM realization was rejected: ordinary FP32
+failed the legal `2^12` cancellation probe, while a two-sided split restored
+accuracy but took `2.207 ms` and added about `336 MiB`, essentially consuming
+the entire `2.320 ms` baseline budget before local, radial, or prefix reverse.
+Any compensated product must therefore live inside the eventual fused blocked
+kernel.
 
 Decision: linearity across those descriptors permits one exact qbar
-reassociation. The primal, dual, and skew masked outers can be summed in fixed
-compensated arithmetic before contraction with each dense boundary, while the
-local semiseparable pass consumes the same descriptor bundle. This result is
-retained for the new backward, not as an old kernel interface.
+reassociation. The primal and dual masked outers can be summed before
+contraction with each dense boundary, while the local semiseparable pass
+consumes the same descriptor bundle. A first per-product high/low compensated
+CUDA realization restored the `2^12` cancellation gradient but raised the
+target-profile frame forward-plus-backward time to roughly `194 ms`; it was
+therefore rejected. The simpler uncompensated FP32 reverse still measured about
+`118 ms` forward-plus-backward and leaves that adversarial decay VJP as an
+explicit failed gate. This checkpoint retains neither the compensated code nor
+a relaxed ceiling or hidden fallback; the remaining problem is a backward
+schedule redesign, not another local precision patch.
 
 Decision: a projected radial reverse can recover each affine-prefix norm and
 its scalar VJP from `<A_t,B>` and `<A_t,L_s>` projections without a full action

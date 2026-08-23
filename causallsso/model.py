@@ -96,7 +96,6 @@ class SolveDelta(nn.Module):
             h * k_edits * v,       # edit values
             h * k_edits * r,       # erase logits
             h * k_edits * v,       # write logits
-            h * k_edits,           # skew logits
             h,                     # geometry decay logits
             h * r,                 # associative decay logits
         )
@@ -126,7 +125,7 @@ class SolveDelta(nn.Module):
         valid_mask: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
         geometry_enabled: bool = True,
-        skew_enabled: bool = True,
+        associative_decay_enabled: bool = True,
         return_final_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, SolveDeltaLayerState]:
         if hidden_states.ndim != 3:
@@ -147,7 +146,7 @@ class SolveDelta(nn.Module):
         projected = self.in_proj(hidden_states).split(self.projection_sizes, dim=-1)
         (
             u_raw, h_raw, q_raw, key_raw, value_raw,
-            erase_raw, write_raw, skew_raw, geometry_raw, associative_raw,
+            erase_raw, write_raw, geometry_raw, associative_raw,
         ) = projected
 
         operator_initial = initial_state.operator if initial_state is not None else None
@@ -184,11 +183,6 @@ class SolveDelta(nn.Module):
         write = 2.0 * torch.sigmoid(
             write_raw.view(batch, length, h_count, edits, v_dim)
         )
-        skew = torch.tanh(
-            skew_raw.view(batch, length, h_count, edits)
-        )
-        if not skew_enabled:
-            skew = torch.zeros_like(skew)
 
         geometry_log_decay = -torch.exp(self.geometry_log_rate).view(1, 1, h_count)
         geometry_log_decay = geometry_log_decay * torch.nn.functional.softplus(
@@ -199,6 +193,8 @@ class SolveDelta(nn.Module):
         associative_log_decay = associative_log_decay * torch.nn.functional.softplus(
             associative_raw + self.associative_decay_bias.view(1, 1, h_count, r)
         )
+        if not associative_decay_enabled:
+            associative_log_decay = torch.zeros_like(associative_log_decay)
         strength = torch.sigmoid(self.geometry_strength_logit)
         if not geometry_enabled:
             strength = torch.zeros_like(strength)
@@ -214,7 +210,6 @@ class SolveDelta(nn.Module):
             associative_log_decay.to(reference_dtype),
             erase.to(reference_dtype),
             write.to(reference_dtype),
-            skew.to(reference_dtype),
             strength.to(reference_dtype),
             initial_state=operator_initial,
             valid_mask=valid_mask,

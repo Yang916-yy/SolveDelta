@@ -270,7 +270,7 @@ at::Tensor mathdx_trsm128_cuda(
 
 }  // namespace
 
-TORCH_LIBRARY(causallsso, m) {
+TORCH_LIBRARY_FRAGMENT(causallsso, m) {
     m.def("mathdx_trsm128(Tensor factor_col, Tensor rhs_col, bool upper) -> Tensor");
     m.def("mathdx_solve_frame128(Tensor lower, Tensor diagonal, Tensor upper, Tensor keys, Tensor dual_rhs) -> (Tensor, Tensor)");
 }

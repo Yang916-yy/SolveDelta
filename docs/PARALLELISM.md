@@ -68,7 +68,8 @@ d=U^{-1}\Sigma^{-1}L^{-1}a,
 while the `K` erase covectors and one query share
 
 \[
-[e,\chi]=U^T\Sigma L^T[\widetilde b,q].
+[e,\chi]=U^T\Sigma L^T[\bar b,q],
+\qquad \bar b=\beta\odot a.
 \]
 
 The production unit is the whole chunk, not an isolated narrow-RHS TRSM. It
@@ -129,9 +130,9 @@ geometry boundary, decay, and shared strength.
 
 For `K=1`, the complete strict-factor cotangent can be represented by a small
 fixed set of masked outer descriptors: one primal-solve term, erase/read dual
-terms, and the skew terms. The backward contracts those descriptors directly
-with boundary matrices and local generators. It must not write a tokenwise
-dense factor cotangent or replay `C` dense token matrices.
+terms. The backward contracts those descriptors directly with boundary
+matrices and local generators. It must not write a tokenwise dense factor
+cotangent or replay `C` dense token matrices.
 
 The intended reverse schedule is:
 

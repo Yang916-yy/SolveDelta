@@ -4,6 +4,34 @@ if(POLICY CMP0144)
 endif()
 project(causallsso_native LANGUAGES CXX CUDA)
 
+find_package(Torch REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+
+add_library(
+  causallsso_chunk SHARED
+  solvedelta_c32_forward.cu
+  solvedelta_c32_backward.cu
+)
+target_compile_features(causallsso_chunk PRIVATE cxx_std_20)
+target_compile_options(
+  causallsso_chunk PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-extended-lambda;-Xptxas=-v>
+)
+target_link_libraries(
+  causallsso_chunk PRIVATE
+  ${TORCH_LIBRARIES}
+  torch_cuda
+  c10_cuda
+)
+set_target_properties(
+  causallsso_chunk
+  PROPERTIES
+    PREFIX "lib"
+    CUDA_ARCHITECTURES 120-real
+    CUDA_SEPARABLE_COMPILATION ON
+    INTERPROCEDURAL_OPTIMIZATION ON
+)
+
 option(
   CAUSALLSSO_BUILD_MATHDX_ORACLE
   "Build the optional MathDx r=128 validation oracle"
@@ -11,8 +39,6 @@ option(
 )
 
 if(CAUSALLSSO_BUILD_MATHDX_ORACLE)
-  find_package(Torch REQUIRED)
-  find_package(CUDAToolkit REQUIRED)
   set(MATHDX_ROOT "" CACHE PATH "MathDx installation prefix")
   find_package(
     mathdx REQUIRED COMPONENTS cublasdx CONFIG

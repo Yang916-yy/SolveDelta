@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from causallsso import SolveDelta, SolveDeltaConfig
+import causallsso.model as model_module
 from causallsso.model import _CausalShortConvolution
 
 
@@ -28,17 +29,35 @@ def test_model_owns_projections_and_supports_non_128_reference_width() -> None:
     assert torch.isfinite(hidden.grad).all()
 
 
-def test_geometry_and_skew_structural_switches_are_exact() -> None:
+def test_geometry_structural_switch_is_exact() -> None:
     config = SolveDeltaConfig(16, 2, head_k_dim=4, head_v_dim=4, num_edits=1)
     model = SolveDelta(config).double()
     hidden = torch.randn(1, 3, 16, dtype=torch.float64)
     _, state = model(
         hidden,
         geometry_enabled=False,
-        skew_enabled=False,
         return_final_state=True,
     )
     assert torch.isfinite(state.operator.S).all()
+
+
+def test_associative_decay_structural_switch_is_exact(monkeypatch) -> None:
+    captured_decay = None
+    original_reference = model_module.solvedelta_reference
+
+    def capture_reference(*args, **kwargs):
+        nonlocal captured_decay
+        captured_decay = args[6]
+        return original_reference(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "solvedelta_reference", capture_reference)
+    config = SolveDeltaConfig(16, 2, head_k_dim=4, head_v_dim=4)
+    model = SolveDelta(config).double()
+    hidden = torch.randn(1, 3, 16, dtype=torch.float64)
+    model(hidden, associative_decay_enabled=False)
+
+    assert captured_decay is not None
+    assert torch.equal(captured_decay, torch.zeros_like(captured_decay))
 
 
 def test_short_conv_recurrent_split_matches_whole_sequence() -> None:

@@ -55,7 +55,7 @@ The containing layer applies fixed GDN2-style depthwise causal `conv4` plus
 SiLU independently to the projected query, packed edit keys, and packed edit
 values before head reshape and normalization. This frontend is enabled by
 default and has one structural off switch. Geometry features, drives, decay,
-erase/write/skew logits, and output gates are not convolved. Recurrent layer
+erase/write logits, and output gates are not convolved. Recurrent layer
 state therefore owns the operator state plus the three four-token convolution
 caches; convolution does not alter the four-tensor operator recurrence below.
 For a batch of size `B`, those caches are `C_q:[B,Hr,4]`,
@@ -128,15 +128,22 @@ H_t=J_t/m_t,
 \qquad R_t=D_t/m_t,
 \]
 
-After the first valid token, normalized `u` gives
+Because normalization maps a zero projected feature to zero, reachable states
+satisfy
 
 \[
-\operatorname{tr}(H_t)=1,
+0\le\operatorname{tr}(H_t)\le1,
 \qquad 0\preceq H_t\preceq I,
 \]
 
-Forgetting changes the remembered geometry but not these normalized Gram
-facts. Let
+with trace one exactly when every positively weighted remembered normalized
+geometry feature has unit norm. Under the executable
+`F.normalize(..., eps=1e-12)` contract, this includes raw projected features
+whose norm is at least `eps`; a nonzero sub-`eps` feature has norm strictly
+between zero and one after normalization and therefore contributes less than
+unit trace. A zero feature is a deterministic no-direction observation, not an
+invalid state. Forgetting changes the remembered geometry but not these
+normalized Gram facts. Let
 
 \[
 \gamma_g=\sigma(\widehat\gamma_g)\in(0,1).
@@ -345,8 +352,7 @@ b_{t,j}\in(0,2)^r,
 \quad w_{t,j}\in(0,2)^{d_v},
 \]
 
-and a scalar skew logit `kappa_hat_{t,j}`. Construct the local edit entirely in
-the fixed solve domain:
+Construct the local edit entirely in the fixed solve domain:
 
 \[
 b_{t,j}=2\sigma(\widehat b_{t,j}),
@@ -357,7 +363,7 @@ w_{t,j}=2\sigma(\widehat w_{t,j}).
 \[
 a_{t,j}=k_{t,j},
 \qquad
-b^{(0)}_{t,j}=b_{t,j}\odot k_{t,j}.
+\bar b_{t,j}=b_{t,j}\odot k_{t,j}.
 \]
 
 There is no separate write-direction gate. Adding a bounded sigmoid gate here
@@ -370,72 +376,41 @@ erase control.
 The base nonnegative pairing is
 
 \[
-\tau_{t,j}=(b^{(0)}_{t,j})^Ta_{t,j}
+\tau_{t,j}=\bar b_{t,j}^Ta_{t,j}
 =\sum_i b_{t,j,i}k_{t,j,i}^2.
 \]
 
-Normalized edit keys and finite sigmoid logits give `0 < tau < 2`; including
-the continuous gate closure and explicit boundary interventions gives
+For a nonzero normalized edit key, finite sigmoid logits give `0 < tau < 2`.
+A zero projected key remains zero under normalization and gives the identity
+edit with `tau=0`. Thus the finite contract is `0 <= tau < 2`; including the
+continuous gate closure and explicit boundary interventions gives
 
 \[
 0\le\tau_{t,j}\le2.
 \]
 
 The coordinatewise base pair guarantees only the scalar pairing above. It does
-not make the rank-one generator `a b^(0)T` positive semidefinite. Indeed, the
-smallest eigenvalue of its symmetric part is
+not make the rank-one generator $a\bar b^T$ positive semidefinite. For `r >= 2`,
+the smallest eigenvalue of its symmetric part is
 
 \[
-\lambda_{\min}\!\left(\frac{ab^T+ba^T}{2}\right)
-=\frac{a^Tb-\|a\|_2\|b\|_2}{2}\le0,
+\lambda_{\min}\!\left(
+\frac{a\bar b^T+\bar b a^T}{2}\right)
+=\frac{a^T\bar b-\|a\|_2\|\bar b\|_2}{2}\le0,
 \]
 
-with equality only when the nonzero factors are positively collinear. Calling
-this general asymmetric edit dissipative would therefore be incorrect.
+with equality only when the nonzero factors are positively collinear. For
+`r=1` the symmetric part is the nonnegative scalar `a bar_b`; there is no
+non-normal direction. Calling the general higher-dimensional asymmetric edit
+dissipative would therefore be incorrect.
 
-Extract one bounded skew action from the same causal system coordinate,
-
-\[
-\Omega_t=\frac12\left[E_t-E_t^T\right],
-\qquad E_t=N_t^-+N_t^+,
-\]
-
-\[
-s_{t,j}=\Omega_ta_{t,j},
-\qquad a_{t,j}^Ts_{t,j}=0,
-\]
-
-but do not expose its unbounded magnitude directly. With the fixed
-implementation constant `kappa_max = 1`, define
-
-\[
-n_{t,j}
-=\kappa_{\max}\tau_{t,j}(2-\tau_{t,j})
-\tanh(\widehat\kappa_{t,j})
-\frac{s_{t,j}}{\sqrt{1+\|s_{t,j}\|_2^2}}.
-\]
-
-Thus
-
-\[
-a_{t,j}^Tn_{t,j}=0,
-\]
-
-and skew shuts off at the identity/Jordan boundary `tau=0` and the reflection
-boundary `tau=2`. `kappa_hat` is initialized to zero.
-
-Define the solve-domain erase action, canonical write vector, erase covector,
-and value target:
-
-\[
-\widetilde b_{t,j}=b^{(0)}_{t,j}+n_{t,j},
-\]
+Define the canonical write vector, erase covector, and value target:
 
 \[
 \boxed{
 d_{t,j}=P_ta_{t,j},
 \qquad
-e_{t,j}=P_t^{-T}\widetilde b_{t,j},
+e_{t,j}=P_t^{-T}\bar b_{t,j},
 \qquad
 z_{t,j}=w_{t,j}\odot v_{t,j}.
 }
@@ -447,18 +422,12 @@ Each pairing remains exactly
 \boxed{e_{t,j}^Td_{t,j}=\tau_{t,j}\in[0,2].}
 \]
 
-This is an orthogonal erase residual: it changes erase direction without
-changing the eigenvalue certificate. It does not provide an Euclidean
-contraction or positive-semidefinite Hermitian-part certificate.
-
-The declared gates and residual normalization also give
+The declared gates give
 
 \[
 \|a_{t,j}\|_2\le1,
 \qquad
-\|b^{(0)}_{t,j}\|_2\le2,
-\qquad
-\|n_{t,j}\|_2\le1,
+\|\bar b_{t,j}\|_2\le2,
 \]
 
 and therefore
@@ -466,7 +435,7 @@ and therefore
 \[
 \|d_{t,j}\|_2\le B_P,
 \qquad
-\|e_{t,j}\|_2\le3B_D.
+\|e_{t,j}\|_2\le2B_D.
 \]
 
 These are finiteness bounds, not tight trainability guarantees. Realized norms
@@ -547,7 +516,7 @@ choice keeps `S_t` fixed but applies
 
 \[
 \boxed{
-I-d_te_t^T=P_t(I-a_t\widetilde b_t^T)P_t^{-1}.
+I-d_te_t^T=P_t(I-a_t\bar b_t^T)P_t^{-1}.
 }
 \]
 
@@ -559,15 +528,22 @@ composed rather than treated as competing inputs.
 ## 6. Exact containment
 
 Here exact means equality at finite shared gate parameters, together with the
-explicit structural identity-geometry and zero-skew component switches. It
-never means convergence as a sigmoid logit tends to infinity. The open
+explicit structural identity-geometry switch. It never means convergence as a
+sigmoid logit tends to infinity. The open
 `(0,2)` ranges of `b` and `w` match the corresponding finite-logit baseline
 gates; `[0,2]` below denotes their continuous stability closure, not a step
 needed by the reductions.
 
+Reduction equality is defined on the common observable state: token outputs,
+associative state `S`, and any shared convolution caches, together with their
+Jacobians on shared inputs and parameters. SolveDelta's extra `(m,J,D)` cache
+continues to update under identity geometry but is inert with respect to this
+projection. A loss placed directly on that auxiliary cache has no GDN2 state
+counterpart and is not part of the reduction claim.
+
 ### GDN2 and ordinary Delta family
 
-Set `K=1`, identity geometry, and disable skew. Then
+Set `K=1` and identity geometry. Then
 
 \[
 d_{t,1}=k_{t,1},
@@ -580,36 +556,44 @@ KDA, GDN, and DeltaNet.
 
 ### DeltaProduct-K
 
-Set identity geometry and skew to zero. For all `K` edits, tie the erase scalar
-`b=beta` and set the value target `z=beta v`. Each edit becomes
+Set identity geometry. For all `K` edits, tie the erase scalar `b=beta`, set the
+value target `z=beta v`, and structurally disable associative decay for the
+ungated baseline. Each edit becomes
 
 \[
 S\leftarrow S+ k\,\beta(v-S^Tk)^T,
 \]
 
-so their ordered composition is DeltaProduct-`K`. The `[0,2]` erase and value
-ranges include the negative-eigenvalue Householder setting.
+so their ordered composition is DeltaProduct-`K`. Finite gates in `(0,2)`
+include the negative-eigenvalue regime `beta>1`; the exact Householder value
+`beta=2` belongs only to the declared stability closure.
 
-All reductions require deterministic output, state, and gradient equality.
+All reductions require deterministic output, projected-state, and shared
+gradient equality. Ordinary DeltaNet uses the same structural no-decay
+intervention; gated reductions retain their matched finite decay.
 
 ## 7. Guaranteed expression gains
 
-One rank-one factor
+One finite nonzero rank-one factor
 
 \[
 I-de^T
 \]
 
-fixes an `r-1` dimensional subspace and has only one nontrivial eigenvalue.
-`K` ordered factors can produce an identity-plus-rank-at-most-`K` transition.
-For `K >= 2` they can act on a two-dimensional subspace, produce nonsymmetric
-rank-two changes, and realize rotations through the DeltaProduct reduction.
+fixes an `r-1` dimensional subspace and has only one non-unit eigenvalue. The
+zero edit is the identity and fixes the full space. `K` ordered factors can
+produce an identity-plus-rank-at-most-`K` transition. For `K >= 2` they can act
+on a two-dimensional subspace, produce nonsymmetric rank-two changes, and at
+finite gates realize planar rotation-contractions with a nonreal conjugate
+eigenvalue pair. Exact orthogonal rotations arise only at the `beta=2`
+Householder closure endpoint and are not a finite-parameter claim.
 
-Within each factor, the orthogonal erase residual removes the solve-domain coordinatewise
-sign restriction while preserving the global pairing. Prefix-dependent `P_t`
-makes `(d,e,chi)` depend on all tokens represented in the causal geometry
-state. Thus two prefixes with the same current edit token but different
-geometry summaries can induce different memory-edit coefficients.
+Within each factor, the transpose-dual frame maps the solve-domain pair into
+generally non-collinear ambient write and erase factors while preserving their
+exact pairing. Prefix-dependent `P_t` makes `(d,e,chi)` depend on all tokens
+represented in the causal geometry state. Thus two prefixes with the same
+current edit token but different geometry summaries can induce different
+memory-edit coefficients.
 
 The solve-frame chart itself has no low-rank or orthogonal-only local ceiling.
 As a map on its ambient matrix coordinates, its joint identity differential is
@@ -672,8 +656,8 @@ unbounded-edit DeltaProduct, or deeper/wider networks.
 The single route retains the following explicit boundaries.
 
 1. **Non-normal transients.** `e^T d in [0,2]` controls the nontrivial
-   eigenvalue of each edit, not its largest singular value. Bounded skew and
-   channel decay mitigate but do not prove global stability across changing
+   eigenvalue of each edit, not its largest singular value. Channel decay and
+   the bounded frame do not prove global stability across changing
    adapters and `K`-factor products. GDN2 already has mild non-normality from
    asymmetric erase factors; SolveDelta adds the similarity bound
 
@@ -696,11 +680,11 @@ The single route retains the following explicit boundaries.
    an accepted fixed-size capacity cost: `J` preserves sign-robust occupancy
    geometry while `D` preserves directional driven geometry. It is not a
    compression blocker, but both moments must show utilization and task value.
-4. **Identifiability.** Solve-adapter orientation, dual-factor scaling, `K` edit
-   slots, and skew action introduce gauges. The contract fixes update order,
-   gate roles, and skew normalization, but utilization must be measured.
+4. **Identifiability.** Solve-adapter orientation, dual-factor scaling, and `K`
+   edit slots introduce gauges. The contract fixes update order and gate roles,
+   but utilization must be measured.
 5. **Attribution.** Gains must survive interventions that remove prefix
-   geometry, the orthogonal erase residual, reduce `K`, or remove the independent geometry feature under
+   geometry, reduce `K`, or remove the independent geometry feature under
    matched budgets.
 6. **Inheritance scope.** The original LSSO reference remains a provenance
    diagnostic for normalized prefix moments and solved contextual adaptation,
@@ -715,8 +699,8 @@ SolveDelta should not remain the main operator unless it:
 1. matches its FP64 token recurrence in every optimized path;
 2. recovers GDN2 at `K=1` and DeltaProduct-`K` exactly;
 3. uses prefix geometry on controlled history-collision tasks;
-4. shows gains from the orthogonal erase residual under matched budgets, while
-   the chosen `K` passes ordinary DeltaProduct reduction and throughput checks;
+4. shows that the chosen `K` passes ordinary DeltaProduct reduction and
+   throughput checks;
 5. remains finite and trainable over the declared long-sequence envelope; and
 6. reaches acceptable complete-layer throughput at `r=128` and justifies the
    fixed two-moment cache by intervention evidence.

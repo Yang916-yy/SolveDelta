@@ -92,7 +92,6 @@ def test_triton_chunk_geometry_matches_fp64_reference(dtype, precision, ceiling)
         zeros_r,
         torch.ones_like(keys),
         torch.zeros_like(values),
-        torch.zeros(batch, length, heads, edits, device="cuda", dtype=torch.float64),
         torch.zeros(heads, device="cuda", dtype=torch.float64),
         return_state_history=True,
     )

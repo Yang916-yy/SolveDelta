@@ -1,7 +1,8 @@
 # SolveDelta
 
 > **Status:** unfinished research repository. The FP64 operator contract is
-> frozen; the single optimized `chunk + WY` training backend is being rebuilt.
+> frozen; the single `chunk + WY` training backend is implemented as a dense
+> prototype but has not passed its complete backward and performance gates.
 
 Causal LSSO studies one causal sequence operator: **SolveDelta**. A decayed
 prefix constructs a compact bounded system, whose primal and exact
@@ -27,6 +28,8 @@ reductions or comparison baselines.
   nonlinear maps. They are not compressed or summed before the chart.
 - The associative memory stays in one fixed basis. Writes use the primal
   action; erase and read covectors use the exact dual action.
+- Channel-wise associative decay is enabled by default and has one structural
+  off intervention for exact ungated Delta-family reductions.
 
 Per head, the recurrent operator state is
 
@@ -58,7 +61,7 @@ At every token, one shared frame transforms all edit vectors:
 
 \[
 d_{t,j}=P_ta_{t,j},\qquad
-e_{t,j}=P_t^{-T}\widetilde b_{t,j},\qquad
+e_{t,j}=P_t^{-T}b_{t,j},\quad b_{t,j}=\beta_{t,j}\odot a_{t,j},\qquad
 \chi_t=P_t^{-T}q_t.
 \]
 
@@ -70,8 +73,8 @@ S_{t,j}=(I-d_{t,j}e_{t,j}^T)S_{t,j-1}+d_{t,j}z_{t,j}^T,
 \qquad y_t=S_{t,K}^T\chi_t.
 \]
 
-The normalized edit key is the local write direction. The bounded skew
-residual remains part of the current contract pending a measured ablation.
+The normalized edit key is the local write direction, and its elementwise
+erase gate defines the solve-domain erase covector. There is no skew branch.
 
 ## Implementation status
 
@@ -87,10 +90,16 @@ The intended training path has one direction:
 
 The Triton affine geometry boundary scan and its adjoint are checked in. The
 former packet, panel, standalone polynomial solve, and isolated chart-VJP
-production paths were removed. The replacement chunk-owned CUDA operator is
-being implemented with one forward/backward ABI; model dispatch remains on the
-reference implementation until that operator passes the frozen internal and
-end-to-end error ceilings.
+production paths were removed. One replacement `r=128`, `K=1`, `C=32` CUDA
+operator now owns frame forward and backward under a single ABI. Its forward,
+ordinary backward, irregular-tail, identity, zero-boundary-mass, and
+determinism tests pass. The declared `2^12` J/D cancellation probe still leaves
+the decay VJP above its internal ceiling in the uncompensated FP32 contraction.
+On the local SM120 target profile, the isolated frame measured about `1.53 ms`
+forward and `118.04 ms` forward-plus-backward. The backend is therefore not
+accepted and model dispatch remains on the reference implementation. Both the
+numerical and performance failures are kept explicit rather than hidden by a
+tolerance change or fallback.
 
 MathDx is retained only as an optional exact `r=128` triangular validation
 oracle and possible decode candidate. It is not imported by model dispatch and

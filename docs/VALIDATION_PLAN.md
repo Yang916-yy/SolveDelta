@@ -24,8 +24,9 @@ definitions, including long chunks whose ordinary cumulative products
 underflow in low precision. This is the same numerical boundary handled by
 mature Gated Delta kernels, not a new model variant.
 
-Use deterministic FP64 tests covering zero state, repeated keys, orthogonal
-keys, weak and strong skew, short sequences, and sequences longer than `r`.
+Use deterministic FP64 tests covering zero state, zero projected geometry,
+query, and key vectors, repeated keys, orthogonal keys, weak and strong
+geometry, short sequences, and sequences longer than `r`.
 Include both direct-`head_k_dim` and total-key-width frontend resolution, with
 at least one non-128 `d_k`. Perturbing future tokens must not affect earlier
 outputs or states. Whole-sequence execution must equal arbitrary recurrent
@@ -94,11 +95,13 @@ collapsed baseline that accumulates `D+J`; it must identify this pair.
 For every edit slot check
 
 \[
-a_{t,j}^Tn_{t,j}=0,
-\qquad
 e_{t,j}^Td_{t,j}
-=\sum_i b_{t,j,i}k_{t,j,i}^2\in[0,2].
+=\sum_i b_{t,j,i}k_{t,j,i}^2\in[0,2),
 \]
+
+for finite gate logits, with the upper endpoint reserved for the declared
+closure. A zero normalized key must give `d=e=0`, exact pairing zero, and an
+identity edit.
 
 Check both unit-triangular solve residuals, finite forward values, and finite input/parameter
 gradients over the declared training envelope. The pairing result is an
@@ -185,8 +188,8 @@ and for every primal/dual pair
 
 \[
 \pi=
-\frac{|e^Td-\widetilde b^Ta|}
-{\|e\|_2\|d\|_2+\|\widetilde b\|_2\|a\|_2+10^{-12}}.
+\frac{|e^Td-\bar b^Ta|}
+{\|e\|_2\|d\|_2+\|\bar b\|_2\|a\|_2+10^{-12}}.
 \]
 
 The complete Triton--CUDA--FLA layer then uses these end-to-end ceilings:
@@ -243,16 +246,21 @@ rather than consuming the FP16 budget.
 
 ## Phase 1: exact Delta-family reductions
 
-Set `num_edits = 1`, `gamma_g = 0`, disable skew, and verify that
+Set `num_edits = 1`, `gamma_g = 0`, and verify that
 `X^(H) = X^(R) = N^- = N^+ = 0`, `Sigma = M = P = I`.
-Compare every output, intermediate state, final state, input gradient, and
-parameter gradient with the official GDN2 naive recurrence. Apply the
-published gate ties and repeat for KDA, GDN, and DeltaNet. No sigmoid endpoint
-or limiting-logit argument is allowed in an exact reduction.
+Compare every output, associative intermediate/final state `S`, shared
+convolution cache, shared-input gradient, and shared-parameter gradient with
+the official GDN2 naive recurrence. The additional `(m,J,D)` cache continues
+to update but must have zero influence on that common observable projection;
+do not compare losses placed directly on states the baseline does not own.
+Apply the published gate ties and repeat for KDA and GDN. Structurally disable
+associative decay for ordinary DeltaNet. No sigmoid endpoint or limiting-logit
+argument is allowed in an exact reduction.
 
-At identity geometry with symmetric edits, compare `K = 1, 2, 4` with the
-corresponding official DeltaProduct-`K` naive recurrence, including the
-negative-eigenvalue range.
+At identity geometry with associative decay structurally disabled and
+symmetric edits, compare `K = 1, 2, 4` with the corresponding official ungated
+DeltaProduct-`K` naive recurrence, including the finite negative-eigenvalue
+range. A gated DeltaProduct comparison instead retains matched decay.
 These are reductions, not maintained models.
 
 Required strictness witnesses include:
@@ -266,13 +274,19 @@ Required strictness witnesses include:
 - a complementary fixed-state comparison showing the same general compression
   principle in the identity-geometry Delta baseline, without claiming that its
   recursive state is merely a second-order moment;
-- a legal prefix-conditioned orthogonal-residual erase unavailable to one
-  identity-geometry GDN2 edit;
-- a two-edit planar rotation unavailable to any single rank-one transition.
+- a two-edit finite planar rotation-contraction with nonreal conjugate
+  eigenvalues, unavailable to any single rank-one transition; any exact
+  orthogonal-rotation or Householder check must be labeled a `beta=2` closure
+  diagnostic rather than a finite exact reduction.
 
-Also construct a non-collinear legal `(a,b)` pair and verify that the symmetric
-part of `ab^T` has a negative eigenvalue despite `a^T b >= 0`. This prevents the
-pairing certificate from being mislabeled as dissipativity.
+Also construct a legal solve-domain pair `(a,bar_b)` using nonconstant positive
+`beta` with `bar_b=beta* a`. Verify the coordinatewise cone
+`a_i bar_b_i>=0`, exact support inclusion, and, for `r>=2`, a negative
+eigenvalue of the symmetric part despite `a^T bar_b>=0`. Then use a nontrivial
+bounded frame to show that ambient `(d,e)` may have a negative coordinatewise
+product while preserving `e^T d=bar_b^T a`. This prevents the pairing
+certificate from being mislabeled as dissipativity and directly witnesses
+strict capacity beyond identity-geometry GDN2.
 
 ## Phase 2: LSSO provenance and causal-frame property contract
 
@@ -344,7 +358,7 @@ frame backend has not passed the release gate yet.
 - FP32 factor/action finiteness and long-rollout drift;
 - radial and diagonal saturation fractions plus their gradient magnitudes;
 - realized `||M||`, `||M^-1||`, `cond(M)`, and edit transition singular values;
-- pairing drift `|e^T d-b_tilde^T a|`, especially at pairing zero and two;
+- pairing drift $|e^T d-\bar b^T a|$, especially at pairing zero and two;
 - reuse of boundary/chart data across all local primal and dual right-hand sides;
 - no full-sequence `T x r x r` geometry or factor materialization;
 - native provider/architecture dispatch fails explicitly when unsupported;
@@ -373,8 +387,7 @@ The required SolveDelta interventions are component switches inside the same
 operator, not public variants:
 
 - identity geometry (`gamma_g = 0`);
-- zero skew versus the full bounded LDU chart;
-- orthogonal erase residual forced to zero;
+- associative decay structurally disabled for ungated reduction tests;
 - `K` swept over the supported values, with matched-parameter and
   matched-compute comparisons where applicable; treat this as ordinary
   capacity/throughput selection inherited from DeltaProduct, not as a new
@@ -384,8 +397,8 @@ operator, not public variants:
 - solve-conditioned versus identity read, clearly labeled as an ablation;
 - geometry-state reset/retention interventions.
 
-Report the learned orthogonal-residual utilization, per-slot edit contribution, transition singular
-values, state norms, and intervention loss changes. Report quality at matched
+Report per-slot edit contribution, transition singular values, state norms,
+and intervention loss changes. Report quality at matched
 parameters, recurrent-cache bytes, training FLOPs, wall time, and decoding
 latency. The main claim survives only if gains over GDN2 and DeltaProduct-2
 remain after these controls.

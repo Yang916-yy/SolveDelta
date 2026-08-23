@@ -10,7 +10,6 @@ C_H = 1.0 / 8.0
 C_R = 1.0 / 8.0
 S_H = 1.0 / 8.0
 S_R = 1.0 / 8.0
-KAPPA_MAX = 1.0
 
 
 class SolveDeltaState(NamedTuple):
@@ -29,11 +28,11 @@ def bounded_ldu_reference(
     H: torch.Tensor,
     R: torch.Tensor,
     geometry_strength: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Construct the canonical bounded LDU factors.
 
-    Returns ``(lower, diagonal, upper, omega)`` with ``lower`` and ``upper``
-    unit triangular, ``diagonal`` stored as a vector, and ``omega`` skew.
+    Returns ``(lower, diagonal, upper)`` with ``lower`` and ``upper`` unit
+    triangular and ``diagonal`` stored as a vector.
     """
     if H.shape != R.shape or H.ndim < 2 or H.shape[-1] != H.shape[-2]:
         raise ValueError("H and R must have equal [..., r, r] shapes")
@@ -59,9 +58,7 @@ def bounded_ldu_reference(
 
     lower = eye + n_lower
     upper = eye + n_upper
-    e = n_lower + n_upper
-    omega = 0.5 * (e - e.transpose(-1, -2))
-    return lower, diagonal, upper, omega
+    return lower, diagonal, upper
 
 
 def apply_primal_reference(
@@ -123,7 +120,6 @@ def _validate_inputs(
     associative_log_decay: torch.Tensor,
     erase: torch.Tensor,
     write: torch.Tensor,
-    skew: torch.Tensor,
 ) -> tuple[int, int, int, int, int, int]:
     if u.ndim != 4:
         raise ValueError("u must have shape [B, T, H, r]")
@@ -144,9 +140,17 @@ def _validate_inputs(
         raise ValueError("erase must match keys shape")
     if write.shape != values.shape:
         raise ValueError("write must match values shape")
-    if skew.shape != (batch, length, heads, edits):
-        raise ValueError("skew must have shape [B, T, H, K]")
-    tensors = (u, h, q, keys, values, geometry_log_decay, associative_log_decay, erase, write, skew)
+    tensors = (
+        u,
+        h,
+        q,
+        keys,
+        values,
+        geometry_log_decay,
+        associative_log_decay,
+        erase,
+        write,
+    )
     if any(x.device != u.device for x in tensors):
         raise ValueError("all inputs must share one device")
     if any(x.dtype != u.dtype for x in tensors):
@@ -166,7 +170,6 @@ def solvedelta_reference(
     associative_log_decay: torch.Tensor,
     erase: torch.Tensor,
     write: torch.Tensor,
-    skew: torch.Tensor,
     geometry_strength: torch.Tensor,
     *,
     initial_state: SolveDeltaState | None = None,
@@ -179,13 +182,13 @@ def solvedelta_reference(
     The function is intentionally composed from ordinary PyTorch operations.
     Calling it with FP64 tensors defines numerical truth for optimized paths.
     Inputs ``erase`` and ``write`` are activated gates in ``[0, 2]``;
-    ``skew`` is the activated scalar in ``[-1, 1]``; log decays are nonpositive.
-    Invalid tokens emit zero and leave every recurrent state unchanged. A reset
-    is applied immediately before its valid token.
+    log decays are nonpositive. Invalid tokens emit zero and leave every
+    recurrent state unchanged. A reset is applied immediately before its valid
+    token.
     """
     batch, length, heads, edits, r, value_dim = _validate_inputs(
         u, h, q, keys, values, geometry_log_decay,
-        associative_log_decay, erase, write, skew,
+        associative_log_decay, erase, write,
     )
     if geometry_strength.shape not in ((heads,), (1, heads)):
         raise ValueError("geometry_strength must have shape [H] or [1, H]")
@@ -228,26 +231,16 @@ def solvedelta_reference(
         D_new = lambda_g[..., None, None] * state.D + u_t[..., :, None] * h_t[..., None, :]
         H_t = J_new / m_new[..., None, None]
         R_t = D_new / m_new[..., None, None]
-        lower, diagonal, upper, omega = bounded_ldu_reference(
+        lower, diagonal, upper = bounded_ldu_reference(
             H_t, R_t, geometry_strength
         )
 
         S_new = torch.exp(associative_log_decay[:, t])[..., None] * state.S
         for j in range(edits):
             a = keys[:, t, :, j]
-            b0 = erase[:, t, :, j] * a
-            tau = (b0 * a).sum(dim=-1)
-            direction = (omega @ a.unsqueeze(-1)).squeeze(-1)
-            direction = direction / torch.sqrt(1.0 + direction.square().sum(dim=-1, keepdim=True))
-            n = (
-                KAPPA_MAX
-                * tau
-                * (2.0 - tau)
-                * skew[:, t, :, j]
-            )[..., None] * direction
-            b_tilde = b0 + n
+            b = erase[:, t, :, j] * a
             d = apply_primal_reference(lower, diagonal, upper, a)
-            e = apply_dual_reference(lower, diagonal, upper, b_tilde)
+            e = apply_dual_reference(lower, diagonal, upper, b)
             z = write[:, t, :, j] * values[:, t, :, j]
             prediction = (S_new.transpose(-1, -2) @ e.unsqueeze(-1)).squeeze(-1)
             innovation = z - prediction

@@ -63,9 +63,15 @@ the decision it informed.
   sigmoid write-direction gate whose endpoint must be forced to recover a
   baseline. Exact reductions must hold at finite shared parameters or through
   an explicit structural component switch, never only in a parameter limit.
+- The erase solve-domain covector is the elementwise gated normalized key.
+  There is no skew logit, orthogonal erase residual, or skew specialization in
+  the current operator.
 - The associative state always remains in one fixed ambient basis. Do not move
   it into a time-varying solve domain. Local write vectors use the primal action;
   erase and read covectors use its exact dual action.
+- Channel-wise associative decay is enabled by default. It may be structurally
+  disabled to test exact ungated DeltaNet and DeltaProduct reductions; that
+  intervention is not a second operator variant.
 - Full-prefix conditioning means dependence on every token represented in
   `(m,J,D)`, not lossless recovery of the original ordered prefix. State the
   moment-collision boundary explicitly. Do not present history collision as
@@ -85,8 +91,7 @@ the decision it informed.
 - Canonical numerical constants are `c_H = c_R = 1/8` for the two separately
   mapped strict-triangular coordinates, total `c = 1/4`, and
   `s_H = s_R = 1/8` with total diagonal log-scale bound `s_max = 1/4`.
-  `kappa_max = 1` bounds the orthogonal erase residual. They are fixed
-  implementation details, not public model variants.
+  They are fixed implementation details, not public model variants.
 - Do not call a general asymmetric rank-one factor dissipative or positive
   semidefinite merely because `e^T d >= 0`. The contract guarantees pairing and
   eigenvalue location, not a positive-semidefinite Hermitian part or Euclidean
