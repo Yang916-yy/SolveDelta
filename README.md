@@ -2,7 +2,9 @@
 
 > **Status:** unfinished research repository. The FP64 operator contract is
 > frozen; the single `chunk + WY` training backend is implemented as a dense
-> prototype but has not passed its complete backward and performance gates.
+> `r=128`, `K=1`, SM120 prototype with a complete forward and backward. It has
+> passed the current dense composition tests, but not the full model-dispatch,
+> mask/reset, numerical-release, or matched-GDN2 performance gates.
 
 Causal LSSO studies one causal sequence operator: **SolveDelta**. A decayed
 prefix constructs a compact bounded system, whose primal and exact
@@ -89,17 +91,24 @@ The intended training path has one direction:
 \]
 
 The Triton affine geometry boundary scan and its adjoint are checked in. The
-former packet, panel, standalone polynomial solve, and isolated chart-VJP
-production paths were removed. One replacement `r=128`, `K=1`, `C=32` CUDA
-operator now owns frame forward and backward under a single ABI. Its forward,
-ordinary backward, irregular-tail, identity, zero-boundary-mass, and
-determinism tests pass. The declared `2^12` J/D cancellation probe still leaves
-the decay VJP above its internal ceiling in the uncompensated FP32 contraction.
-On the local SM120 target profile, the isolated frame measured about `1.53 ms`
-forward and `118.04 ms` forward-plus-backward. The backend is therefore not
-accepted and model dispatch remains on the reference implementation. Both the
-numerical and performance failures are kept explicit rather than hidden by a
-tolerance change or fallback.
+former packet, panel, standalone polynomial solve, isolated chart-VJP, and old
+multi-VJP frame paths were removed. One replacement `r=128`, `K=1`, `C=32`
+CUDA operator now owns frame forward and backward under a single ABI. Its
+forward, per-action and joint backward, irregular-tail, identity,
+zero-boundary-mass, cancellation, determinism, and complete dense
+scan/frame/FLA-WY composition tests pass against the FP64 token oracle.
+
+The frame reverse assigns the eight `16 x 16` coordinate tiles through one
+diagonal phase and seven deterministic perfect-matching phases. Every dense
+moment entry is replayed once, and each phase has disjoint output ownership, so
+the implementation needs neither atomics nor a full-sequence `T x r x r`
+workspace. On the local SM120 target profile
+`B=1,T=1024,H=8,r=d_v=128,K=1`, the dense prototype measured about `1.918 ms`
+forward and `14.622 ms` forward-plus-backward. This replaces the previous
+roughly `118 ms` frame-backward path, but is still not close enough to the
+matched GDN2 target to enable model dispatch. The uncompensated local
+`boundary_m` cancellation diagnostic also remains a declared numerical
+limitation; no compensation or tolerance fallback is hidden in the backend.
 
 MathDx is retained only as an optional exact `r=128` triangular validation
 oracle and possible decode candidate. It is not imported by model dispatch and
@@ -135,7 +144,17 @@ hidden = torch.randn(2, 32, 256, dtype=torch.float64)
 output = layer(hidden)
 ```
 
-The optional SM120 MathDx oracle can be built separately:
+The SM120 native frame library and optional MathDx oracle are built with CMake.
+The dense composition additionally requires FLA:
+
+```bash
+python -m pip install -e ".[native,test]"
+CUDACXX=/path/to/nvcc cmake -S native -B build/native \
+  -DCMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+cmake --build build/native --parallel
+```
+
+Enable the MathDx oracle separately when its SDK is installed:
 
 ```bash
 CUDACXX=/path/to/nvcc cmake -S native -B build/native \

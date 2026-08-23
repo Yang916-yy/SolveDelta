@@ -59,6 +59,15 @@ about 5.5 MiB extra peak memory. The two FLA issue reports changed validation,
 not model math: cross-chunk lengths, multiple seeds and gate regimes, and
 repeat-run gradient determinism are mandatory checks for the optimized path.
 
+Decision: the generalized DPLR exterior admits the finite equivalent mapping
+`k=b=d` and `a=-e*exp(g)`, instead of `k=d`, `b=-d`, and `a=e*exp(g)`. The
+installed FLA implementation and its backward were tested bitwise under both
+mappings for `K=1,2`, including output and final-state cotangents. The selected
+mapping aliases `b` with `k` and removes the redundant signed write-direction
+allocation. It does not change the operator or claim a new WY algorithm;
+eliminating materialized `a` would require a separately validated direct-`e`
+FLA specialization.
+
 Decision: the installed FLA 0.5.2 GDN2 and GatedDeltaProduct layers establish
 three independent depthwise causal `conv4`, bias-free, SiLU branches over the
 projected query, packed keys, and packed values. Convolution precedes head
@@ -388,11 +397,34 @@ contraction with each dense boundary, while the local semiseparable pass
 consumes the same descriptor bundle. A first per-product high/low compensated
 CUDA realization restored the `2^12` cancellation gradient but raised the
 target-profile frame forward-plus-backward time to roughly `194 ms`; it was
-therefore rejected. The simpler uncompensated FP32 reverse still measured about
-`118 ms` forward-plus-backward and leaves that adversarial decay VJP as an
-explicit failed gate. This checkpoint retains neither the compensated code nor
-a relaxed ceiling or hidden fallback; the remaining problem is a backward
-schedule redesign, not another local precision patch.
+therefore rejected. Precision compensation was not carried into the rewrite.
+
+The replacement reverse first removed the old stack-heavy replay, then removed
+duplicate arithmetic. With eight coordinate tiles, the complete graph of
+off-diagonal tile pairs decomposes into seven perfect matchings. One additional
+phase owns all diagonal tiles. Within a phase the blocks update disjoint
+coordinate groups, so both matrix orientations are handled once without
+atomics; the phase sequence and final 36-part scalar reduction are
+deterministic. On the local SM120 target profile this reduced the moment replay
+from `12.654 ms` to `4.883 ms`, raw frame backward from `19.029 ms` to
+`11.303 ms`, and the dense scan/frame/FLA-WY forward-plus-backward from
+`22.262 ms` to `14.622 ms`. The full dense composition VJP and repeatability
+tests pass. The remaining local cancellation diagnostic and the still-large
+gap to matched GDN2 remain explicit gates; the result is an accepted repository
+checkpoint, not a performance-complete backend.
+
+A multi-panel determinism audit exposed a shared-memory write-after-read race
+in the common radial reduction, not in the perfect-matching schedule. Its warp
+partials and broadcast results had reused four slots across consecutive token
+reductions. Assigning the results separate slots restored bitwise repeatability
+for multiple batches, heads, and chunks without changing the reduction order or
+the measured `11.300 ms` raw backward median.
+
+The same audit found that the Triton scalar adjoint zeroed invalid tail values
+but had not masked their store addresses. On multi-batch tails those lanes could
+cross the batch stride and overwrite valid decay gradients. An explicit valid
+store mask and `B=2,T=35` FP64/repeatability regressions now enforce the packed
+address boundary.
 
 Decision: a projected radial reverse can recover each affine-prefix norm and
 its scalar VJP from `<A_t,B>` and `<A_t,L_s>` projections without a full action

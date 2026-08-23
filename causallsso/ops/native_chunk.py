@@ -145,10 +145,10 @@ def _validate_forward_outputs(
     outputs: object,
     inputs: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    if not isinstance(outputs, (tuple, list)) or len(outputs) != 6:
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
         raise RuntimeError(
             "c32_frame_forward must return "
-            "(d,e,chi,inv_m,lower_primal,lower_dual_scaled)"
+            "(d,e,chi,lower_primal,lower_dual_scaled)"
         )
     tensors = tuple(outputs)
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
@@ -156,12 +156,10 @@ def _validate_forward_outputs(
 
     u, _, _, key, _, query, _, _, _, _ = inputs
     batch, length, heads, rank = u.shape
-    chunks = (length + _CHUNK_SIZE - 1) // _CHUNK_SIZE
     expected_shapes = (
         key.shape,
         key.shape,
         query.shape,
-        (batch, heads, chunks, _CHUNK_SIZE),
         (batch, length, heads, _EDITS, rank),
         (batch, length, heads, 2, rank),
     )
@@ -169,7 +167,6 @@ def _validate_forward_outputs(
         "d",
         "e",
         "chi",
-        "inv_m",
         "lower_primal",
         "lower_dual_scaled",
     )
@@ -276,10 +273,9 @@ class _NativeChunkFrame(torch.autograd.Function):
             torch.ops.causallsso.c32_frame_forward(*inputs),
             inputs,
         )
-        d, e, chi, inv_m, lower_primal, lower_dual_scaled = outputs
+        d, e, chi, lower_primal, lower_dual_scaled = outputs
         ctx.save_for_backward(
             *inputs,
-            inv_m,
             lower_primal,
             lower_dual_scaled,
             d,
@@ -292,7 +288,7 @@ class _NativeChunkFrame(torch.autograd.Function):
     def backward(ctx, grad_d, grad_e, grad_chi):
         saved = ctx.saved_tensors
         inputs = saved[: len(_INPUT_NAMES)]
-        inv_m, lower_primal, lower_dual_scaled, d = saved[len(_INPUT_NAMES) :]
+        lower_primal, lower_dual_scaled, d = saved[len(_INPUT_NAMES) :]
 
         grad_d = _validate_output_cotangent("grad_d", grad_d, d)
         grad_e = _validate_output_cotangent("grad_e", grad_e, inputs[3])
@@ -300,7 +296,6 @@ class _NativeChunkFrame(torch.autograd.Function):
         gradients = _validate_backward_outputs(
             torch.ops.causallsso.c32_frame_backward(
                 *inputs,
-                inv_m,
                 lower_primal,
                 lower_dual_scaled,
                 d,

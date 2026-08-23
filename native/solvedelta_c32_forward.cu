@@ -850,18 +850,15 @@ C32ForwardResult c32_frame_forward_cuda(
         write_direction,
         erase_direction,
         solved_query,
-        inverse_mass,
         lower_primal,
         lower_dual_scaled};
 }
 
 
 TORCH_LIBRARY(causallsso, m) {
-    m.def("c32_frame_forward(Tensor u, Tensor h, Tensor geometry_log_decay, Tensor key, Tensor erase, Tensor query, Tensor geometry_strength, Tensor boundary_m, Tensor boundary_J, Tensor boundary_D) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
-    m.def("c32_frame_backward(Tensor u, Tensor h, Tensor geometry_log_decay, Tensor key, Tensor erase, Tensor query, Tensor geometry_strength, Tensor boundary_m, Tensor boundary_J, Tensor boundary_D, Tensor inverse_mass, Tensor lower_primal, Tensor lower_dual_scaled, Tensor write_direction, Tensor grad_write_direction, Tensor grad_erase_direction, Tensor grad_query) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("c32_frame_forward(Tensor u, Tensor h, Tensor geometry_log_decay, Tensor key, Tensor erase, Tensor query, Tensor geometry_strength, Tensor boundary_m, Tensor boundary_J, Tensor boundary_D) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(causallsso, CUDA, m) {
     m.impl("c32_frame_forward", &c32_frame_forward_cuda);
-    m.impl("c32_frame_backward", &c32_frame_backward_cuda);
 }

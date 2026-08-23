@@ -33,11 +33,13 @@ pytestmark = pytest.mark.skipif(
 def _inputs(
     *,
     length: int,
+    batch: int = 1,
+    heads: int = 1,
     strength: float = 0.7,
     seed: int = 20260824,
 ) -> tuple[torch.Tensor, ...]:
     torch.manual_seed(seed + length)
-    batch, heads, rank = 1, 1, 128
+    rank = 128
     chunks = (length + 31) // 32
     u = F.normalize(
         torch.randn(batch, length, heads, rank, device="cuda"), dim=-1
@@ -265,4 +267,39 @@ def test_native_chunk_backward_is_bitwise_repeatable() -> None:
     for name, left, right in zip(_INPUT_NAMES, first, second):
         assert left is not None, name
         assert right is not None, name
+        assert torch.equal(left, right), name
+
+
+def test_native_chunk_multi_panel_vjp_matches_fp64_and_is_repeatable() -> None:
+    inputs = _inputs(length=35, batch=2, heads=2, seed=6100)
+    with torch.no_grad():
+        outputs = _reference(
+            *(tensor.double() for tensor in inputs)
+        )
+        cotangents = _cotangents(outputs, route="all", seed=6200)
+    expected = _vjp(
+        _reference,
+        inputs,
+        cotangents,
+        dtype=torch.float64,
+    )
+    first = _vjp(
+        _native,
+        inputs,
+        cotangents,
+        dtype=torch.float32,
+    )
+    second = _vjp(
+        _native,
+        inputs,
+        cotangents,
+        dtype=torch.float32,
+    )
+    for name, expected_gradient, left, right in zip(
+        _INPUT_NAMES, expected, first, second
+    ):
+        assert expected_gradient is not None, name
+        assert left is not None, name
+        assert right is not None, name
+        _assert_gradient(f"multi_panel.{name}", expected_gradient, left)
         assert torch.equal(left, right), name

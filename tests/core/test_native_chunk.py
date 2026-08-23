@@ -129,7 +129,7 @@ def test_native_chunk_saved_forward_quantities_match_fp64() -> None:
     contiguous = tuple(tensor.contiguous() for tensor in inputs)
     native_chunk_frame(*contiguous)
     raw = torch.ops.causallsso.c32_frame_forward(*contiguous)
-    _, _, _, inverse_mass, lower_primal, lower_dual_scaled = raw
+    _, _, _, lower_primal, lower_dual_scaled = raw
 
     u, h, log_decay, key, erase, query, strength, bm, bJ, bD = (
         tensor.double() for tensor in inputs
@@ -137,7 +137,6 @@ def test_native_chunk_saved_forward_quantities_match_fp64() -> None:
     mass = bm[:, :, 0]
     moment_j = bJ[:, :, 0]
     moment_d = bD[:, :, 0]
-    expected_inverse = torch.zeros_like(inverse_mass, dtype=torch.float64)
     expected_lower = []
     expected_dual = []
     for token in range(3):
@@ -167,13 +166,11 @@ def test_native_chunk_saved_forward_quantities_match_fp64() -> None:
         dual_scaled = diagonal.unsqueeze(-1) * (
             lower.transpose(-1, -2) @ dual_rhs
         )
-        expected_inverse[:, :, 0, token] = mass.reciprocal()
         expected_lower.append(lower_key.unsqueeze(-2))
         expected_dual.append(dual_scaled.transpose(-1, -2))
 
     expected_lower = torch.stack(expected_lower, dim=1)
     expected_dual = torch.stack(expected_dual, dim=1)
-    assert _rho(expected_inverse, inverse_mass) < 5e-4
     assert _rho(expected_lower, lower_primal) < 5e-4
     assert _rho(expected_dual, lower_dual_scaled) < 5e-4
 
@@ -187,8 +184,6 @@ def test_native_chunk_forward_is_repeatable_and_preserves_pairing() -> None:
     second_raw = torch.ops.causallsso.c32_frame_forward(*contiguous)
     for first, second in zip(first_raw, second_raw):
         assert torch.equal(first, second)
-    assert torch.count_nonzero(first_raw[3][:, :, -1, 1:]) == 0
-
     d, e = first_raw[:2]
     expected_pairing = (
         inputs[3] * (inputs[4] * inputs[3])

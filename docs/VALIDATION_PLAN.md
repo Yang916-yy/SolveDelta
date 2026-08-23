@@ -349,8 +349,11 @@ and the complete token recurrence over the normal envelope.
 
 The local environment gate has been exercised for PyTorch `2.13.0+cu130`,
 Triton `3.7.1`, CUDA 13.0 Update 2, MathDx 26.06/cuBLASDx 0.7.0, and FLA 0.5.2
-on SM120. This establishes toolchain feasibility only. The replacement native
-frame backend has not passed the release gate yet.
+on SM120. The dense `r=128`, `K=1` scan/frame/FLA-WY composition now passes its
+current forward, final-state, joint-VJP, and repeatability tests. This is a
+validated implementation checkpoint, not the full release gate: masks,
+resets, packed sequences, complete frontend dispatch, the stricter internal
+numerical table, and matched-baseline performance remain open.
 
 - lower/upper residual and complete solve-action relative error;
 - all `K` `(d,e)` pairs, `chi`, outputs, and recurrent states;

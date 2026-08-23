@@ -135,6 +135,90 @@ def test_triton_geometry_rejects_unsupported_chunk_size() -> None:
         triton_geometry_chunk_scan(u, h, log_decay, chunk_size=8)
 
 
+def test_triton_geometry_strided_inputs_match_contiguous_forward_and_vjp() -> None:
+    torch.manual_seed(20260825)
+    batch, length, heads, rank = 1, 33, 2, 64
+
+    def padded_view(value: torch.Tensor) -> torch.Tensor:
+        flat = value.reshape(batch, length, -1)
+        storage = torch.cat((flat, torch.zeros_like(flat[..., :7])), dim=-1)
+        return storage[..., : flat.shape[-1]].view_as(value)
+
+    dense_u = F.normalize(
+        torch.randn(batch, length, heads, rank, device="cuda"), dim=-1
+    )
+    dense_h = 0.2 * torch.randn_like(dense_u)
+    dense_decay = -0.1 * torch.rand(batch, length, heads, device="cuda")
+    strided_inputs = tuple(
+        value.detach().requires_grad_(True)
+        for value in (
+            padded_view(dense_u),
+            padded_view(dense_h),
+            padded_view(dense_decay),
+        )
+    )
+    assert all(not value.is_contiguous() for value in strided_inputs)
+
+    with torch.no_grad():
+        direct_boundary, direct_final = triton_geometry_chunk_scan(
+            *(value.detach() for value in strided_inputs),
+            chunk_size=32,
+            input_precision="ieee",
+        )
+        dense_boundary, dense_final = triton_geometry_chunk_scan(
+            dense_u,
+            dense_h,
+            dense_decay,
+            chunk_size=32,
+            input_precision="ieee",
+        )
+    for actual, expected in zip(
+        (*direct_boundary[:3], *direct_final[:3]),
+        (*dense_boundary[:3], *dense_final[:3]),
+    ):
+        assert torch.equal(actual, expected)
+
+    boundary, final = triton_geometry_chunk_scan(
+        *strided_inputs,
+        chunk_size=32,
+        input_precision="ieee",
+    )
+    expected_boundary, expected_final = triton_geometry_chunk_scan(
+        dense_u,
+        dense_h,
+        dense_decay,
+        chunk_size=32,
+        input_precision="ieee",
+    )
+    actual_outputs = (*boundary[:3], *final[:3])
+    expected_outputs = (*expected_boundary[:3], *expected_final[:3])
+    for actual, expected in zip(actual_outputs, expected_outputs):
+        assert torch.equal(actual, expected)
+
+    output_grads = tuple(torch.randn_like(value) for value in actual_outputs)
+    actual_grads = torch.autograd.grad(
+        actual_outputs,
+        strided_inputs,
+        output_grads,
+    )
+    contiguous_inputs = tuple(
+        value.detach().contiguous().requires_grad_(True)
+        for value in strided_inputs
+    )
+    contiguous_boundary, contiguous_final = triton_geometry_chunk_scan(
+        *contiguous_inputs,
+        chunk_size=32,
+        input_precision="ieee",
+    )
+    expected_grads = torch.autograd.grad(
+        (*contiguous_boundary[:3], *contiguous_final[:3]),
+        contiguous_inputs,
+        output_grads,
+    )
+    for actual, expected in zip(actual_grads, expected_grads):
+        assert torch.equal(actual, expected)
+
+
 def _geometry_vjp(
     inputs: tuple[torch.Tensor, ...],
     output_grads: tuple[torch.Tensor, ...],
@@ -170,24 +254,26 @@ def _geometry_vjp(
 
 
 @pytest.mark.parametrize(
-    ("length", "rank", "chunk_size", "underflow"),
+    ("batch", "length", "heads", "rank", "chunk_size", "underflow"),
     [
-        (7, 128, 16, False),
-        (16, 128, 16, False),
-        (17, 128, 16, False),
-        (65, 128, 16, False),
-        (11, 128, 16, True),
-        (130, 64, 64, False),
+        (1, 7, 2, 128, 16, False),
+        (1, 16, 2, 128, 16, False),
+        (1, 17, 2, 128, 16, False),
+        (1, 65, 2, 128, 16, False),
+        (1, 11, 2, 128, 16, True),
+        (1, 130, 2, 64, 64, False),
+        (2, 35, 2, 128, 32, False),
     ],
 )
 def test_triton_geometry_affine_adjoint_matches_fp64(
+    batch: int,
     length: int,
+    heads: int,
     rank: int,
     chunk_size: int,
     underflow: bool,
 ) -> None:
     torch.manual_seed(20260823 + length + rank)
-    batch, heads = 1, 2
     u = F.normalize(
         torch.randn(batch, length, heads, rank, device="cuda"), dim=-1
     )
@@ -232,7 +318,7 @@ def test_triton_geometry_affine_adjoint_matches_fp64(
 
 def test_triton_geometry_affine_adjoint_is_bitwise_repeatable() -> None:
     torch.manual_seed(20260903)
-    batch, length, heads, rank = 1, 17, 2, 128
+    batch, length, heads, rank, chunk_size = 2, 35, 2, 128, 32
     inputs = (
         F.normalize(
             torch.randn(batch, length, heads, rank, device="cuda"), dim=-1
@@ -245,11 +331,11 @@ def test_triton_geometry_affine_adjoint_is_bitwise_repeatable() -> None:
     )
     with torch.no_grad():
         outputs = _geometry_scan_recompute(
-            *(value.double() for value in inputs), 16
+            *(value.double() for value in inputs), chunk_size
         )
     output_grads = tuple(torch.randn_like(value, dtype=torch.float32) for value in outputs)
-    first = _geometry_vjp(inputs, output_grads, chunk_size=16)
-    second = _geometry_vjp(inputs, output_grads, chunk_size=16)
+    first = _geometry_vjp(inputs, output_grads, chunk_size=chunk_size)
+    second = _geometry_vjp(inputs, output_grads, chunk_size=chunk_size)
     assert all(torch.equal(left, right) for left, right in zip(first, second))
 
 

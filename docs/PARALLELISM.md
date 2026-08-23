@@ -49,6 +49,8 @@ exact summary of all earlier valid tokens.
 The checked-in Triton scan owns the boundary forward and its affine adjoint.
 Its output contract is one boundary before each chunk plus the final geometry
 state. Chunk size changes implementation scheduling, not operator semantics.
+Tail lanes are masked at the load and store address, not merely zeroed, so one
+batch's final partial chunk cannot write into the next batch's decay gradient.
 
 ## 2. Chunk-local frame problem
 
@@ -142,6 +144,19 @@ The intended reverse schedule is:
 4. return boundary `(m,J,D)` cotangents and local `(u,h,log_decay)` cotangents;
 5. let the Triton affine adjoint propagate boundary cotangents across chunks.
 
+The checked-in `r=128`, `C=32` specialization partitions coordinates into
+eight tiles of 16. Its moment reverse uses one diagonal phase followed by the
+seven perfect matchings of the complete graph on those tiles. A diagonal block
+or unordered off-diagonal tile pair owns all affected output coordinates in
+its phase, processes both orientations, and writes one deterministic partial.
+Consequently every moment entry is replayed once, phase-local writes are
+disjoint, and the final scalar reduction has a fixed order. This removes the
+old duplicate off-diagonal replay without atomics or tokenwise dense states.
+The radial tile reduction likewise keeps its warp partials and four broadcast
+results in disjoint shared-memory slots. Reusing the first partial slots for
+the broadcast results creates a cross-token write-after-read race because the
+reduction is called repeatedly inside one kernel.
+
 Saved workspace belongs to the chunk VJP contract and must be reported. The
 first target is approximately 8--10 MiB at
 `B=1,T=1024,H=8,r=128,C=32,K=1`, not the previous tokenwise dense replay.
@@ -161,8 +176,13 @@ S_{t,j}=(I-d_{t,j}e_{t,j}^T)S_{t,j-1}+d_{t,j}z_{t,j}^T.
 FLA's generalized DPLR Delta operator is used with the exact identification
 
 \[
-k=d,\qquad v=z,\qquad a=e\odot\exp(g),\qquad b=-d.
+k=b=d,\qquad v=z,\qquad a=-e\odot\exp(g).
 \]
+
+This finite sign reparameterization is exactly the same rank-one transition.
+Aliasing `b` with `k` removes one signed vector allocation. FLA's current
+public ABI still requires materializing `a`; a future direct-`e`
+specialization is an implementation experiment, not part of this backend.
 
 For `K>1`, micro-time is flattened in token-major, edit-minor order. Decay is
 applied only on the first edit and the query is read only after the final edit.

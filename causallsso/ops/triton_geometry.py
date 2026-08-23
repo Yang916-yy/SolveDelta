@@ -153,13 +153,11 @@ def _chunk_matrix_summary_kernel(
 
 @triton.jit
 def _matrix_boundary_scan_kernel(
-    summary_J,
-    summary_D,
+    chunk_J,
+    chunk_D,
     chunk_lambda,
     initial_J,
     initial_D,
-    boundary_J,
-    boundary_D,
     final_J,
     final_D,
     heads: tl.constexpr,
@@ -176,15 +174,17 @@ def _matrix_boundary_scan_kernel(
     current_D = tl.load(initial_D + head_batch * matrix_size + offsets, mask=mask, other=0.0)
     for chunk in tl.range(0, chunks):
         boundary_base = (head_batch * chunks + chunk) * matrix_size
-        tl.store(boundary_J + boundary_base + offsets, current_J, mask=mask)
-        tl.store(boundary_D + boundary_base + offsets, current_D, mask=mask)
+        summary_J = tl.load(
+            chunk_J + boundary_base + offsets, mask=mask, other=0.0
+        )
+        summary_D = tl.load(
+            chunk_D + boundary_base + offsets, mask=mask, other=0.0
+        )
         factor = tl.load(chunk_lambda + head_batch * chunks + chunk)
-        current_J = factor * current_J + tl.load(
-            summary_J + boundary_base + offsets, mask=mask, other=0.0
-        )
-        current_D = factor * current_D + tl.load(
-            summary_D + boundary_base + offsets, mask=mask, other=0.0
-        )
+        tl.store(chunk_J + boundary_base + offsets, current_J, mask=mask)
+        tl.store(chunk_D + boundary_base + offsets, current_D, mask=mask)
+        current_J = factor * current_J + summary_J
+        current_D = factor * current_D + summary_D
     tl.store(final_J + head_batch * matrix_size + offsets, current_J, mask=mask)
     tl.store(final_D + head_batch * matrix_size + offsets, current_D, mask=mask)
 
@@ -510,6 +510,7 @@ def _chunk_summary_scalar_vjp_kernel(
         + tokens * stride_t
         + head * stride_h,
         tl.where(valid, high + low, 0.0),
+        mask=valid,
     )
 
 
@@ -548,10 +549,6 @@ def _triton_geometry_chunk_scan_forward(
     chunks = triton.cdiv(length, chunk_size)
     if chunks == 0:
         raise ValueError("length must be positive")
-    u = u.contiguous()
-    h = h.contiguous()
-    geometry_log_decay = geometry_log_decay.contiguous()
-
     weights = torch.empty(batch, heads, chunks, chunk_size, device=u.device, dtype=torch.float32)
     chunk_lambda = torch.empty(batch, heads, chunks, device=u.device, dtype=torch.float32)
     chunk_mass = torch.empty_like(chunk_lambda)
@@ -569,15 +566,18 @@ def _triton_geometry_chunk_scan_forward(
         stride_h=geometry_log_decay.stride(2),
     )
 
-    summary_J = torch.empty(batch, heads, chunks, rank, rank, device=u.device, dtype=torch.float32)
-    summary_D = torch.empty_like(summary_J)
+    # The summary kernel fills the public boundary storage first. The affine
+    # scan then consumes each summary before replacing it with that chunk's
+    # incoming state, so no second pair of chunk matrices is required.
+    boundary_J = torch.empty(batch, heads, chunks, rank, rank, device=u.device, dtype=torch.float32)
+    boundary_D = torch.empty_like(boundary_J)
     rank_blocks = triton.cdiv(rank, 32)
     _chunk_matrix_summary_kernel[(chunks, batch * heads, rank_blocks * rank_blocks)](
         u,
         h,
         weights,
-        summary_J,
-        summary_D,
+        boundary_J,
+        boundary_D,
         length=length,
         heads=heads,
         rank=rank,
@@ -609,8 +609,6 @@ def _triton_geometry_chunk_scan_forward(
             raise ValueError("initial geometry state shapes do not match inputs")
 
     boundary_m = torch.empty(batch, heads, chunks, device=u.device, dtype=state_dtype)
-    boundary_J = torch.empty(batch, heads, chunks, rank, rank, device=u.device, dtype=state_dtype)
-    boundary_D = torch.empty_like(boundary_J)
     final_m = torch.empty(batch, heads, device=u.device, dtype=state_dtype)
     final_J = torch.empty(batch, heads, rank, rank, device=u.device, dtype=state_dtype)
     final_D = torch.empty_like(final_J)
@@ -624,13 +622,11 @@ def _triton_geometry_chunk_scan_forward(
         chunks=chunks,
     )
     _matrix_boundary_scan_kernel[(triton.cdiv(rank * rank, 256), batch * heads)](
-        summary_J,
-        summary_D,
+        boundary_J,
+        boundary_D,
         chunk_lambda,
         initial_J,
         initial_D,
-        boundary_J,
-        boundary_D,
         final_J,
         final_D,
         heads=heads,
@@ -830,6 +826,14 @@ class _TritonGeometryChunkScan(torch.autograd.Function):
         chunk_size,
         input_precision,
     ):
+        needs_backward = any(ctx.needs_input_grad[:6])
+        if needs_backward:
+            # The scan kernels accept arbitrary strides. Canonicalize once for
+            # both the forward kernels and their saved backward inputs instead
+            # of staging the same projection view twice.
+            u = u.contiguous()
+            h = h.contiguous()
+            geometry_log_decay = geometry_log_decay.contiguous()
         initial = SolveDeltaState(
             initial_m,
             initial_J,
@@ -844,14 +848,15 @@ class _TritonGeometryChunkScan(torch.autograd.Function):
             chunk_size=chunk_size,
             input_precision=input_precision,
         )
-        ctx.save_for_backward(
-            u.contiguous(),
-            h.contiguous(),
-            geometry_log_decay.contiguous(),
-            boundary.m,
-            boundary.J,
-            boundary.D,
-        )
+        if needs_backward:
+            ctx.save_for_backward(
+                u,
+                h,
+                geometry_log_decay,
+                boundary.m,
+                boundary.J,
+                boundary.D,
+            )
         ctx.chunk_size = chunk_size
         return boundary.m, boundary.J, boundary.D, final.m, final.J, final.D
 

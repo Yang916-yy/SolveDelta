@@ -10,7 +10,6 @@ using C32ForwardResult = std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
-    at::Tensor,
     at::Tensor>;
 
 using C32BackwardResult = std::tuple<
@@ -48,10 +47,9 @@ C32BackwardResult c32_frame_backward_cuda(
     const at::Tensor& boundary_m,
     const at::Tensor& boundary_j,
     const at::Tensor& boundary_d,
-    const at::Tensor& inverse_mass,
     const at::Tensor& lower_primal,
     const at::Tensor& lower_dual_scaled,
     const at::Tensor& write_direction,
     const at::Tensor& grad_write_direction,
     const at::Tensor& grad_erase_direction,
-    const at::Tensor& grad_query);
+    const at::Tensor& grad_solved_query);

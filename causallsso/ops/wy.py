@@ -56,13 +56,19 @@ def _validate_inputs(
     return batch, length, heads, edits, rank, value_dim
 
 
+def _materialize_fla_activation(e: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    """Build ``a=-e*exp(g)`` without a second sign-only allocation."""
+    a = e * torch.exp(g)
+    return a.neg_()
+
+
 def _pack_edits(
     chi: torch.Tensor,
     d: torch.Tensor,
     e: torch.Tensor,
     z: torch.Tensor,
     log_decay: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expand tokens in token-major, edit-minor order for FLA's DPLR ABI."""
     batch, length, heads, edits, rank = d.shape
     value_dim = z.shape[-1]
@@ -75,9 +81,8 @@ def _pack_edits(
     packed_v = z.transpose(2, 3).reshape(batch, length * edits, heads, value_dim)
     packed_e = e.transpose(2, 3).reshape(batch, length * edits, heads, rank)
     packed_g = expanded_decay.reshape(batch, length * edits, heads, rank)
-    packed_a = packed_e * torch.exp(packed_g)
-    packed_b = -packed_k
-    return packed_q, packed_k, packed_v, packed_a, packed_b, packed_g
+    packed_a = _materialize_fla_activation(packed_e, packed_g)
+    return packed_q, packed_k, packed_v, packed_a, packed_g
 
 
 def wy_associative(
@@ -100,7 +105,11 @@ def wy_associative(
     ``S <- S + d (z - S^T e)^T``.
 
     FLA's generalized Delta transition is algebraically identical under
-    ``k=d, v=z, a=e*exp(g), b=-d``. For ``K > 1``, token time is expanded in
+    ``k=b=d, v=z, a=-e*exp(g)``. Sharing ``b`` with ``k`` avoids materializing
+    the otherwise redundant signed copy of every edit direction. FLA's public
+    DPLR ABI still requires materialized ``a``; eliminating it requires a
+    direct-``e`` specialization inside the WY kernels rather than this wrapper.
+    For ``K > 1``, token time is expanded in
     token-major, edit-minor order: only edit zero receives ``g`` and only edit
     ``K-1`` receives ``chi``. Thus decay happens once and each output is read
     after the final edit. ``log_decay`` is required to be nonpositive by the
@@ -123,24 +132,23 @@ def wy_associative(
         k = d.squeeze(3)
         v = z.squeeze(3)
         g = log_decay
-        a = e.squeeze(3) * torch.exp(g)
-        b = -k
+        a = _materialize_fla_activation(e.squeeze(3), g)
     else:
-        q, k, v, a, b, g = _pack_edits(chi, d, e, z, log_decay)
+        q, k, v, a, g = _pack_edits(chi, d, e, z, log_decay)
 
     expanded_output, final_state = chunk_dplr_delta_rule(
         q=q,
         k=k,
         v=v,
         a=a,
-        b=b,
+        b=k,
         gk=g,
         scale=1.0,
         initial_state=initial_state,
         output_final_state=output_final_state,
         safe_gate=False,
         chunk_size=chunk_size,
-        disable_recompute=True,
+        disable_recompute=False,
     )
     if edits == 1:
         return expanded_output, final_state
