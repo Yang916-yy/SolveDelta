@@ -1,0 +1,958 @@
+from __future__ import annotations
+
+from typing import Literal
+
+import torch
+import triton
+import triton.language as tl
+
+from causallsso.reference import SolveDeltaState
+
+
+@triton.jit
+def _twofold_product_add(high, low, left, right):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .f32 product, product_err, summed, virtual, scratch;
+            .reg .f32 sum_err, correction;
+            mul.rn.f32 product, $4, $5;
+            neg.f32 scratch, product;
+            fma.rn.f32 product_err, $4, $5, scratch;
+            add.rn.f32 summed, $2, product;
+            sub.rn.f32 virtual, summed, $2;
+            sub.rn.f32 scratch, summed, virtual;
+            sub.rn.f32 scratch, $2, scratch;
+            sub.rn.f32 sum_err, product, virtual;
+            add.rn.f32 sum_err, scratch, sum_err;
+            add.rn.f32 correction, $3, product_err;
+            add.rn.f32 correction, correction, sum_err;
+            add.rn.f32 $0, summed, correction;
+            sub.rn.f32 scratch, $0, summed;
+            sub.rn.f32 $1, correction, scratch;
+        }
+        """,
+        "=f,=f,f,f,f,f",
+        [high, low, left, right],
+        dtype=(tl.float32, tl.float32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _chunk_weights_kernel(
+    log_decay,
+    weights,
+    chunk_lambda,
+    chunk_mass,
+    length: tl.constexpr,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    chunk_size: tl.constexpr,
+    stride_b: tl.constexpr,
+    stride_t: tl.constexpr,
+    stride_h: tl.constexpr,
+):
+    program = tl.program_id(0)
+    chunk = program % chunks
+    head = (program // chunks) % heads
+    batch = program // (chunks * heads)
+    offsets = tl.arange(0, chunk_size)
+    tokens = chunk * chunk_size + offsets
+    mask = tokens < length
+    pointer = log_decay + batch * stride_b + tokens * stride_t + head * stride_h
+    logs = tl.load(pointer, mask=mask, other=0.0).to(tl.float32)
+    suffix_inclusive = tl.cumsum(logs, axis=0, reverse=True)
+    suffix_exclusive = suffix_inclusive - logs
+    local_weights = tl.exp(suffix_exclusive)
+    local_weights = tl.where(mask, local_weights, 0.0)
+    base = ((batch * heads + head) * chunks + chunk) * chunk_size
+    tl.store(weights + base + offsets, local_weights)
+    summary_index = (batch * heads + head) * chunks + chunk
+    tl.store(chunk_lambda + summary_index, tl.exp(tl.sum(logs, axis=0)))
+    tl.store(chunk_mass + summary_index, tl.sum(local_weights, axis=0))
+
+
+@triton.jit
+def _chunk_matrix_summary_kernel(
+    u,
+    h_value,
+    weights,
+    summary_J,
+    summary_D,
+    length: tl.constexpr,
+    heads: tl.constexpr,
+    rank: tl.constexpr,
+    chunks: tl.constexpr,
+    chunk_size: tl.constexpr,
+    block_r: tl.constexpr,
+    input_precision: tl.constexpr,
+    stride_ub: tl.constexpr,
+    stride_ut: tl.constexpr,
+    stride_uh: tl.constexpr,
+    stride_ur: tl.constexpr,
+    stride_hb: tl.constexpr,
+    stride_ht: tl.constexpr,
+    stride_hh: tl.constexpr,
+    stride_hr: tl.constexpr,
+):
+    chunk = tl.program_id(0)
+    head_batch = tl.program_id(1)
+    row_block = tl.program_id(2) // tl.cdiv(rank, block_r)
+    col_block = tl.program_id(2) % tl.cdiv(rank, block_r)
+    batch = head_batch // heads
+    head = head_batch % heads
+    rows = row_block * block_r + tl.arange(0, block_r)
+    cols = col_block * block_r + tl.arange(0, block_r)
+    local_t = tl.arange(0, chunk_size)
+    tokens = chunk * chunk_size + local_t
+    token_mask = tokens < length
+
+    u_left_ptr = (
+        u
+        + batch * stride_ub
+        + tokens[None, :] * stride_ut
+        + head * stride_uh
+        + rows[:, None] * stride_ur
+    )
+    u_right_ptr = (
+        u
+        + batch * stride_ub
+        + tokens[:, None] * stride_ut
+        + head * stride_uh
+        + cols[None, :] * stride_ur
+    )
+    h_right_ptr = (
+        h_value
+        + batch * stride_hb
+        + tokens[:, None] * stride_ht
+        + head * stride_hh
+        + cols[None, :] * stride_hr
+    )
+    mask_left = (rows[:, None] < rank) & token_mask[None, :]
+    mask_right = token_mask[:, None] & (cols[None, :] < rank)
+    u_left = tl.load(u_left_ptr, mask=mask_left, other=0.0)
+    u_right = tl.load(u_right_ptr, mask=mask_right, other=0.0)
+    h_right = tl.load(h_right_ptr, mask=mask_right, other=0.0)
+    weight_base = (head_batch * chunks + chunk) * chunk_size
+    local_weights = tl.load(weights + weight_base + local_t)
+    # Preserve the tensor-core input dtype while accumulating the dot product
+    # in FP32. Multiplying BF16/FP16 by FP32 otherwise promotes only the left
+    # operand and makes the two dot operands ill-typed.
+    weighted_left = u_left * local_weights.to(u_left.dtype)[None, :]
+    j_tile = tl.dot(weighted_left, u_right, input_precision=input_precision)
+    d_tile = tl.dot(weighted_left, h_right, input_precision=input_precision)
+
+    output_base = (head_batch * chunks + chunk) * rank * rank
+    output_offsets = output_base + rows[:, None] * rank + cols[None, :]
+    output_mask = (rows[:, None] < rank) & (cols[None, :] < rank)
+    tl.store(summary_J + output_offsets, j_tile, mask=output_mask)
+    tl.store(summary_D + output_offsets, d_tile, mask=output_mask)
+
+
+@triton.jit
+def _matrix_boundary_scan_kernel(
+    summary_J,
+    summary_D,
+    chunk_lambda,
+    initial_J,
+    initial_D,
+    boundary_J,
+    boundary_D,
+    final_J,
+    final_D,
+    heads: tl.constexpr,
+    rank: tl.constexpr,
+    chunks: tl.constexpr,
+    block: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    head_batch = tl.program_id(1)
+    offsets = tile * block + tl.arange(0, block)
+    matrix_size = rank * rank
+    mask = offsets < matrix_size
+    current_J = tl.load(initial_J + head_batch * matrix_size + offsets, mask=mask, other=0.0)
+    current_D = tl.load(initial_D + head_batch * matrix_size + offsets, mask=mask, other=0.0)
+    for chunk in tl.range(0, chunks):
+        boundary_base = (head_batch * chunks + chunk) * matrix_size
+        tl.store(boundary_J + boundary_base + offsets, current_J, mask=mask)
+        tl.store(boundary_D + boundary_base + offsets, current_D, mask=mask)
+        factor = tl.load(chunk_lambda + head_batch * chunks + chunk)
+        current_J = factor * current_J + tl.load(
+            summary_J + boundary_base + offsets, mask=mask, other=0.0
+        )
+        current_D = factor * current_D + tl.load(
+            summary_D + boundary_base + offsets, mask=mask, other=0.0
+        )
+    tl.store(final_J + head_batch * matrix_size + offsets, current_J, mask=mask)
+    tl.store(final_D + head_batch * matrix_size + offsets, current_D, mask=mask)
+
+
+@triton.jit
+def _mass_boundary_scan_kernel(
+    chunk_lambda,
+    chunk_mass,
+    initial_m,
+    boundary_m,
+    final_m,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+):
+    head_batch = tl.program_id(0)
+    current = tl.load(initial_m + head_batch)
+    for chunk in tl.range(0, chunks):
+        index = head_batch * chunks + chunk
+        tl.store(boundary_m + index, current)
+        current = tl.load(chunk_lambda + index) * current + tl.load(chunk_mass + index)
+    tl.store(final_m + head_batch, current)
+
+
+@triton.jit
+def _matrix_adjoint_scan_kernel(
+    boundary_J,
+    boundary_D,
+    grad_boundary_J,
+    grad_boundary_D,
+    grad_final_J,
+    grad_final_D,
+    chunk_lambda,
+    grad_summary_J,
+    grad_summary_D,
+    grad_initial_J,
+    grad_initial_D,
+    lambda_partial,
+    rank: tl.constexpr,
+    chunks: tl.constexpr,
+    tile_size: tl.constexpr,
+    tiles: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    head_batch = tl.program_id(1)
+    matrix_size = rank * rank
+    offsets = tile * tile_size + tl.arange(0, tile_size)
+    mask = offsets < matrix_size
+    state_base = head_batch * matrix_size
+    carry_J = tl.load(
+        grad_final_J + state_base + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    carry_D = tl.load(
+        grad_final_D + state_base + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+
+    for reverse in tl.range(0, chunks):
+        chunk = chunks - 1 - reverse
+        panel = head_batch * chunks + chunk
+        panel_base = panel * matrix_size
+        tl.store(grad_summary_J + panel_base + offsets, carry_J, mask=mask)
+        tl.store(grad_summary_D + panel_base + offsets, carry_D, mask=mask)
+        state_J = tl.load(
+            boundary_J + panel_base + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        state_D = tl.load(
+            boundary_D + panel_base + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        tl.store(
+            lambda_partial + panel * tiles + tile,
+            tl.sum(carry_J * state_J + carry_D * state_D, axis=0),
+        )
+        decay = tl.load(chunk_lambda + panel).to(tl.float32)
+        local_J = tl.load(
+            grad_boundary_J + panel_base + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        local_D = tl.load(
+            grad_boundary_D + panel_base + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        carry_J = local_J + decay * carry_J
+        carry_D = local_D + decay * carry_D
+
+    tl.store(grad_initial_J + state_base + offsets, carry_J, mask=mask)
+    tl.store(grad_initial_D + state_base + offsets, carry_D, mask=mask)
+
+
+@triton.jit
+def _mass_adjoint_scan_kernel(
+    boundary_m,
+    grad_boundary_m,
+    grad_final_m,
+    chunk_lambda,
+    grad_summary_m,
+    grad_initial_m,
+    lambda_mass,
+    chunks: tl.constexpr,
+):
+    head_batch = tl.program_id(0)
+    carry = tl.load(grad_final_m + head_batch).to(tl.float32)
+    for reverse in tl.range(0, chunks):
+        chunk = chunks - 1 - reverse
+        panel = head_batch * chunks + chunk
+        tl.store(grad_summary_m + panel, carry)
+        tl.store(lambda_mass + panel, carry * tl.load(boundary_m + panel))
+        carry = (
+            tl.load(grad_boundary_m + panel).to(tl.float32)
+            + tl.load(chunk_lambda + panel).to(tl.float32) * carry
+        )
+    tl.store(grad_initial_m + head_batch, carry)
+
+
+@triton.jit
+def _reduce_chunk_lambda_grad_kernel(
+    lambda_partial,
+    lambda_mass,
+    grad_lambda,
+    tiles: tl.constexpr,
+    reduce_block: tl.constexpr,
+):
+    panel = tl.program_id(0)
+    offsets = tl.arange(0, reduce_block)
+    values = tl.load(
+        lambda_partial + panel * tiles + offsets,
+        mask=offsets < tiles,
+        other=0.0,
+    )
+    tl.store(
+        grad_lambda + panel,
+        tl.sum(values, axis=0) + tl.load(lambda_mass + panel),
+    )
+
+
+@triton.jit
+def _chunk_summary_vector_vjp_kernel(
+    grad_summary_J,
+    grad_summary_D,
+    u,
+    h_value,
+    weights,
+    grad_u,
+    grad_h,
+    grad_weight_partial,
+    length: tl.constexpr,
+    heads: tl.constexpr,
+    rank: tl.constexpr,
+    chunks: tl.constexpr,
+    chunk_size: tl.constexpr,
+    block_r: tl.constexpr,
+    row_blocks: tl.constexpr,
+    stride_ub: tl.constexpr,
+    stride_ut: tl.constexpr,
+    stride_uh: tl.constexpr,
+    stride_ur: tl.constexpr,
+    stride_hb: tl.constexpr,
+    stride_ht: tl.constexpr,
+    stride_hh: tl.constexpr,
+    stride_hr: tl.constexpr,
+):
+    row_block = tl.program_id(0)
+    panel = tl.program_id(1)
+    chunk = panel % chunks
+    head_batch = panel // chunks
+    head = head_batch % heads
+    batch = head_batch // heads
+    rows = row_block * block_r + tl.arange(0, block_r)
+    local_t = tl.arange(0, chunk_size)
+    tokens = chunk * chunk_size + local_t
+    valid = tokens < length
+    matrix_base = panel * rank * rank
+
+    action_J = tl.zeros((block_r, chunk_size), tl.float32)
+    action_Jt = tl.zeros((block_r, chunk_size), tl.float32)
+    action_D = tl.zeros((block_r, chunk_size), tl.float32)
+    action_Dt = tl.zeros((block_r, chunk_size), tl.float32)
+    for col_block in tl.static_range(0, row_blocks):
+        cols = col_block * block_r + tl.arange(0, block_r)
+        grad_J = tl.load(
+            grad_summary_J
+            + matrix_base
+            + rows[:, None] * rank
+            + cols[None, :]
+        ).to(tl.float32)
+        grad_Jt_source = tl.load(
+            grad_summary_J
+            + matrix_base
+            + cols[:, None] * rank
+            + rows[None, :]
+        ).to(tl.float32)
+        grad_D = tl.load(
+            grad_summary_D
+            + matrix_base
+            + rows[:, None] * rank
+            + cols[None, :]
+        ).to(tl.float32)
+        grad_Dt_source = tl.load(
+            grad_summary_D
+            + matrix_base
+            + cols[:, None] * rank
+            + rows[None, :]
+        ).to(tl.float32)
+        source_u = tl.load(
+            u
+            + batch * stride_ub
+            + tokens[None, :] * stride_ut
+            + head * stride_uh
+            + cols[:, None] * stride_ur,
+            mask=valid[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        source_h = tl.load(
+            h_value
+            + batch * stride_hb
+            + tokens[None, :] * stride_ht
+            + head * stride_hh
+            + cols[:, None] * stride_hr,
+            mask=valid[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        action_J += tl.dot(grad_J, source_u, input_precision="ieee")
+        action_Jt += tl.dot(
+            tl.trans(grad_Jt_source), source_u, input_precision="ieee"
+        )
+        action_D += tl.dot(grad_D, source_h, input_precision="ieee")
+        action_Dt += tl.dot(
+            tl.trans(grad_Dt_source), source_u, input_precision="ieee"
+        )
+
+    local_u = tl.load(
+        u
+        + batch * stride_ub
+        + tokens[None, :] * stride_ut
+        + head * stride_uh
+        + rows[:, None] * stride_ur,
+        mask=valid[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    weight = tl.load(
+        weights + panel * chunk_size + local_t, mask=valid, other=0.0
+    ).to(tl.float32)
+    output_u = (
+        batch * stride_ub
+        + tokens[None, :] * stride_ut
+        + head * stride_uh
+        + rows[:, None] * stride_ur
+    )
+    output_h = (
+        batch * stride_hb
+        + tokens[None, :] * stride_ht
+        + head * stride_hh
+        + rows[:, None] * stride_hr
+    )
+    tl.store(
+        grad_u + output_u,
+        (action_J + action_Jt + action_D) * weight[None, :],
+        mask=valid[None, :],
+    )
+    tl.store(
+        grad_h + output_h,
+        action_Dt * weight[None, :],
+        mask=valid[None, :],
+    )
+    grad_weight = tl.sum(local_u * (action_J + action_D), axis=0)
+    tl.store(
+        grad_weight_partial
+        + (panel * row_blocks + row_block) * chunk_size
+        + local_t,
+        tl.where(valid, grad_weight, 0.0),
+    )
+
+
+@triton.jit
+def _chunk_summary_scalar_vjp_kernel(
+    weights,
+    chunk_lambda,
+    grad_summary_m,
+    grad_lambda,
+    grad_weight_partial,
+    grad_log_decay,
+    length: tl.constexpr,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    chunk_size: tl.constexpr,
+    row_blocks: tl.constexpr,
+    stride_b: tl.constexpr,
+    stride_t: tl.constexpr,
+    stride_h: tl.constexpr,
+):
+    panel = tl.program_id(0)
+    chunk = panel % chunks
+    head_batch = panel // chunks
+    head = head_batch % heads
+    batch = head_batch // heads
+    local_t = tl.arange(0, chunk_size)
+    tokens = chunk * chunk_size + local_t
+    valid = tokens < length
+    high = tl.zeros((chunk_size,), tl.float32)
+    low = tl.zeros((chunk_size,), tl.float32)
+    grad_lambda_value = tl.load(grad_lambda + panel).to(tl.float32)
+    lambda_value = tl.load(chunk_lambda + panel).to(tl.float32)
+    high, low = _twofold_product_add(
+        high, low, grad_lambda_value, lambda_value
+    )
+    for source in tl.static_range(0, chunk_size):
+        source_grad_weight = tl.load(grad_summary_m + panel).to(tl.float32)
+        for row_block in tl.static_range(0, row_blocks):
+            source_grad_weight += tl.load(
+                grad_weight_partial
+                + (panel * row_blocks + row_block) * chunk_size
+                + source
+            ).to(tl.float32)
+        source_weight = tl.load(
+            weights + panel * chunk_size + source
+        ).to(tl.float32)
+        include = source < local_t
+        high, low = _twofold_product_add(
+            high,
+            low,
+            tl.where(include, source_grad_weight, 0.0),
+            source_weight,
+        )
+    tl.store(
+        grad_log_decay
+        + batch * stride_b
+        + tokens * stride_t
+        + head * stride_h,
+        tl.where(valid, high + low, 0.0),
+    )
+
+
+def _triton_geometry_chunk_scan_forward(
+    u: torch.Tensor,
+    h: torch.Tensor,
+    geometry_log_decay: torch.Tensor,
+    *,
+    initial_state: SolveDeltaState | None = None,
+    chunk_size: int = 64,
+    input_precision: Literal["ieee", "tf32"] = "ieee",
+) -> tuple[SolveDeltaState, SolveDeltaState]:
+    """Compute chunk-start and final geometry states without tokenwise matrices.
+
+    ``u`` must already be normalized. Boundary ``S`` tensors are empty because
+    this operation owns only ``m,J,D``. The function is currently a forward
+    kernel used to validate the geometry schedule before fused backward.
+    """
+    if not torch.cuda.is_available() or u.device.type != "cuda":
+        raise ValueError("Triton geometry scan requires CUDA tensors")
+    if u.ndim != 4 or h.shape != u.shape:
+        raise ValueError("u and h must have equal [B, T, H, r] shapes")
+    if geometry_log_decay.shape != u.shape[:3]:
+        raise ValueError("geometry_log_decay must have shape [B, T, H]")
+    if u.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise TypeError("Triton geometry scan supports FP32, BF16, or FP16 inputs")
+    if h.dtype != u.dtype or geometry_log_decay.dtype != u.dtype:
+        raise TypeError("u, h, and geometry_log_decay must share one dtype")
+    if chunk_size not in (16, 32, 64):
+        raise ValueError("Triton geometry chunk_size must be one of 16, 32, 64")
+    if input_precision not in ("ieee", "tf32"):
+        raise ValueError("input_precision must be 'ieee' or 'tf32'")
+    batch, length, heads, rank = u.shape
+    if rank % 32:
+        raise ValueError("the first Triton specialization requires r divisible by 32")
+    chunks = triton.cdiv(length, chunk_size)
+    if chunks == 0:
+        raise ValueError("length must be positive")
+    u = u.contiguous()
+    h = h.contiguous()
+    geometry_log_decay = geometry_log_decay.contiguous()
+
+    weights = torch.empty(batch, heads, chunks, chunk_size, device=u.device, dtype=torch.float32)
+    chunk_lambda = torch.empty(batch, heads, chunks, device=u.device, dtype=torch.float32)
+    chunk_mass = torch.empty_like(chunk_lambda)
+    _chunk_weights_kernel[(batch * heads * chunks,)](
+        geometry_log_decay,
+        weights,
+        chunk_lambda,
+        chunk_mass,
+        length=length,
+        heads=heads,
+        chunks=chunks,
+        chunk_size=chunk_size,
+        stride_b=geometry_log_decay.stride(0),
+        stride_t=geometry_log_decay.stride(1),
+        stride_h=geometry_log_decay.stride(2),
+    )
+
+    summary_J = torch.empty(batch, heads, chunks, rank, rank, device=u.device, dtype=torch.float32)
+    summary_D = torch.empty_like(summary_J)
+    rank_blocks = triton.cdiv(rank, 32)
+    _chunk_matrix_summary_kernel[(chunks, batch * heads, rank_blocks * rank_blocks)](
+        u,
+        h,
+        weights,
+        summary_J,
+        summary_D,
+        length=length,
+        heads=heads,
+        rank=rank,
+        chunks=chunks,
+        chunk_size=chunk_size,
+        block_r=32,
+        input_precision=input_precision,
+        stride_ub=u.stride(0),
+        stride_ut=u.stride(1),
+        stride_uh=u.stride(2),
+        stride_ur=u.stride(3),
+        stride_hb=h.stride(0),
+        stride_ht=h.stride(1),
+        stride_hh=h.stride(2),
+        stride_hr=h.stride(3),
+        num_warps=8,
+    )
+
+    state_dtype = torch.float32
+    if initial_state is None:
+        initial_m = torch.zeros(batch, heads, device=u.device, dtype=state_dtype)
+        initial_J = torch.zeros(batch, heads, rank, rank, device=u.device, dtype=state_dtype)
+        initial_D = torch.zeros_like(initial_J)
+    else:
+        initial_m = initial_state.m.float().contiguous()
+        initial_J = initial_state.J.float().contiguous()
+        initial_D = initial_state.D.float().contiguous()
+        if initial_m.shape != (batch, heads) or initial_J.shape != (batch, heads, rank, rank) or initial_D.shape != initial_J.shape:
+            raise ValueError("initial geometry state shapes do not match inputs")
+
+    boundary_m = torch.empty(batch, heads, chunks, device=u.device, dtype=state_dtype)
+    boundary_J = torch.empty(batch, heads, chunks, rank, rank, device=u.device, dtype=state_dtype)
+    boundary_D = torch.empty_like(boundary_J)
+    final_m = torch.empty(batch, heads, device=u.device, dtype=state_dtype)
+    final_J = torch.empty(batch, heads, rank, rank, device=u.device, dtype=state_dtype)
+    final_D = torch.empty_like(final_J)
+    _mass_boundary_scan_kernel[(batch * heads,)](
+        chunk_lambda,
+        chunk_mass,
+        initial_m,
+        boundary_m,
+        final_m,
+        heads=heads,
+        chunks=chunks,
+    )
+    _matrix_boundary_scan_kernel[(triton.cdiv(rank * rank, 256), batch * heads)](
+        summary_J,
+        summary_D,
+        chunk_lambda,
+        initial_J,
+        initial_D,
+        boundary_J,
+        boundary_D,
+        final_J,
+        final_D,
+        heads=heads,
+        rank=rank,
+        chunks=chunks,
+        block=256,
+        num_warps=8,
+    )
+    empty_boundary_S = torch.empty(0, device=u.device, dtype=state_dtype)
+    empty_final_S = torch.empty(0, device=u.device, dtype=state_dtype)
+    return (
+        SolveDeltaState(boundary_m, boundary_J, boundary_D, empty_boundary_S),
+        SolveDeltaState(final_m, final_J, final_D, empty_final_S),
+    )
+
+
+def _triton_geometry_chunk_scan_backward(
+    u: torch.Tensor,
+    h: torch.Tensor,
+    geometry_log_decay: torch.Tensor,
+    boundary_m: torch.Tensor,
+    boundary_J: torch.Tensor,
+    boundary_D: torch.Tensor,
+    grad_boundary_m: torch.Tensor,
+    grad_boundary_J: torch.Tensor,
+    grad_boundary_D: torch.Tensor,
+    grad_final_m: torch.Tensor,
+    grad_final_J: torch.Tensor,
+    grad_final_D: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, ...]:
+    """Exact affine-scan adjoint for geometry boundaries and chunk summaries."""
+    batch, length, heads, rank = u.shape
+    chunks = triton.cdiv(length, chunk_size)
+    panels = batch * heads * chunks
+    head_batches = batch * heads
+
+    weights = torch.empty(
+        batch,
+        heads,
+        chunks,
+        chunk_size,
+        device=u.device,
+        dtype=torch.float32,
+    )
+    chunk_lambda = torch.empty(
+        batch, heads, chunks, device=u.device, dtype=torch.float32
+    )
+    chunk_mass = torch.empty_like(chunk_lambda)
+    _chunk_weights_kernel[(panels,)](
+        geometry_log_decay,
+        weights,
+        chunk_lambda,
+        chunk_mass,
+        length=length,
+        heads=heads,
+        chunks=chunks,
+        chunk_size=chunk_size,
+        stride_b=geometry_log_decay.stride(0),
+        stride_t=geometry_log_decay.stride(1),
+        stride_h=geometry_log_decay.stride(2),
+        num_warps=4,
+    )
+
+    grad_summary_J = torch.empty_like(boundary_J)
+    grad_summary_D = torch.empty_like(boundary_D)
+    grad_initial_J = torch.empty_like(grad_final_J)
+    grad_initial_D = torch.empty_like(grad_final_D)
+    matrix_tile = 256
+    matrix_tiles = triton.cdiv(rank * rank, matrix_tile)
+    lambda_partial = torch.empty(
+        panels, matrix_tiles, device=u.device, dtype=torch.float32
+    )
+    _matrix_adjoint_scan_kernel[(matrix_tiles, head_batches)](
+        boundary_J,
+        boundary_D,
+        grad_boundary_J,
+        grad_boundary_D,
+        grad_final_J,
+        grad_final_D,
+        chunk_lambda,
+        grad_summary_J,
+        grad_summary_D,
+        grad_initial_J,
+        grad_initial_D,
+        lambda_partial,
+        rank=rank,
+        chunks=chunks,
+        tile_size=matrix_tile,
+        tiles=matrix_tiles,
+        num_warps=8,
+        num_stages=1,
+    )
+
+    grad_summary_m = torch.empty_like(boundary_m)
+    grad_initial_m = torch.empty_like(grad_final_m)
+    lambda_mass = torch.empty_like(chunk_lambda)
+    _mass_adjoint_scan_kernel[(head_batches,)](
+        boundary_m,
+        grad_boundary_m,
+        grad_final_m,
+        chunk_lambda,
+        grad_summary_m,
+        grad_initial_m,
+        lambda_mass,
+        chunks=chunks,
+        num_warps=1,
+        num_stages=1,
+    )
+    grad_lambda = torch.empty_like(chunk_lambda)
+    _reduce_chunk_lambda_grad_kernel[(panels,)](
+        lambda_partial,
+        lambda_mass,
+        grad_lambda,
+        tiles=matrix_tiles,
+        reduce_block=triton.next_power_of_2(matrix_tiles),
+        num_warps=4,
+        num_stages=1,
+    )
+
+    grad_u = torch.empty_like(u)
+    grad_h = torch.empty_like(h)
+    row_blocks = rank // 32
+    grad_weight_partial = torch.empty(
+        panels,
+        row_blocks,
+        chunk_size,
+        device=u.device,
+        dtype=torch.float32,
+    )
+    _chunk_summary_vector_vjp_kernel[(row_blocks, panels)](
+        grad_summary_J,
+        grad_summary_D,
+        u,
+        h,
+        weights,
+        grad_u,
+        grad_h,
+        grad_weight_partial,
+        length=length,
+        heads=heads,
+        rank=rank,
+        chunks=chunks,
+        chunk_size=chunk_size,
+        block_r=32,
+        row_blocks=row_blocks,
+        stride_ub=u.stride(0),
+        stride_ut=u.stride(1),
+        stride_uh=u.stride(2),
+        stride_ur=u.stride(3),
+        stride_hb=h.stride(0),
+        stride_ht=h.stride(1),
+        stride_hh=h.stride(2),
+        stride_hr=h.stride(3),
+        num_warps=8,
+        num_stages=1,
+    )
+    grad_log_decay = torch.empty_like(geometry_log_decay)
+    _chunk_summary_scalar_vjp_kernel[(panels,)](
+        weights,
+        chunk_lambda,
+        grad_summary_m,
+        grad_lambda,
+        grad_weight_partial,
+        grad_log_decay,
+        length=length,
+        heads=heads,
+        chunks=chunks,
+        chunk_size=chunk_size,
+        row_blocks=row_blocks,
+        stride_b=grad_log_decay.stride(0),
+        stride_t=grad_log_decay.stride(1),
+        stride_h=grad_log_decay.stride(2),
+        num_warps=1,
+        num_stages=1,
+    )
+    return (
+        grad_u,
+        grad_h,
+        grad_log_decay,
+        grad_initial_m,
+        grad_initial_J,
+        grad_initial_D,
+    )
+
+
+def _geometry_scan_recompute(
+    u: torch.Tensor,
+    h: torch.Tensor,
+    geometry_log_decay: torch.Tensor,
+    initial_m: torch.Tensor,
+    initial_J: torch.Tensor,
+    initial_D: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, ...]:
+    """Differentiable chunk-summary form used as the native backward oracle."""
+    _, length, _, _ = u.shape
+    current_m, current_J, current_D = initial_m, initial_J, initial_D
+    boundary_m, boundary_J, boundary_D = [], [], []
+    for start in range(0, length, chunk_size):
+        end = min(start + chunk_size, length)
+        boundary_m.append(current_m)
+        boundary_J.append(current_J)
+        boundary_D.append(current_D)
+        logs = geometry_log_decay[:, start:end].permute(0, 2, 1)
+        suffix = torch.flip(torch.cumsum(torch.flip(logs, dims=(-1,)), dim=-1), dims=(-1,))
+        weights = torch.exp(suffix - logs)
+        local_u = u[:, start:end].permute(0, 2, 1, 3)
+        local_h = h[:, start:end].permute(0, 2, 1, 3)
+        weighted_u = local_u * weights[..., None]
+        summary_J = weighted_u.transpose(-1, -2) @ local_u
+        summary_D = weighted_u.transpose(-1, -2) @ local_h
+        chunk_lambda = torch.exp(logs.sum(-1))
+        current_m = chunk_lambda * current_m + weights.sum(-1)
+        current_J = chunk_lambda[..., None, None] * current_J + summary_J
+        current_D = chunk_lambda[..., None, None] * current_D + summary_D
+    return (
+        torch.stack(boundary_m, dim=2),
+        torch.stack(boundary_J, dim=2),
+        torch.stack(boundary_D, dim=2),
+        current_m,
+        current_J,
+        current_D,
+    )
+
+
+_compiled_geometry_scan_recompute = torch.compile(
+    _geometry_scan_recompute,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+class _TritonGeometryChunkScan(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        u,
+        h,
+        geometry_log_decay,
+        initial_m,
+        initial_J,
+        initial_D,
+        chunk_size,
+        input_precision,
+    ):
+        initial = SolveDeltaState(
+            initial_m,
+            initial_J,
+            initial_D,
+            torch.empty(0, device=u.device, dtype=u.dtype),
+        )
+        boundary, final = _triton_geometry_chunk_scan_forward(
+            u,
+            h,
+            geometry_log_decay,
+            initial_state=initial,
+            chunk_size=chunk_size,
+            input_precision=input_precision,
+        )
+        ctx.save_for_backward(
+            u.contiguous(),
+            h.contiguous(),
+            geometry_log_decay.contiguous(),
+            boundary.m,
+            boundary.J,
+            boundary.D,
+        )
+        ctx.chunk_size = chunk_size
+        return boundary.m, boundary.J, boundary.D, final.m, final.J, final.D
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        u, h, geometry_log_decay, boundary_m, boundary_J, boundary_D = (
+            ctx.saved_tensors
+        )
+        gradients = _triton_geometry_chunk_scan_backward(
+            u,
+            h,
+            geometry_log_decay,
+            boundary_m,
+            boundary_J,
+            boundary_D,
+            *(gradient.contiguous() for gradient in grad_outputs),
+            ctx.chunk_size,
+        )
+        return (*gradients, None, None)
+
+
+def triton_geometry_chunk_scan(
+    u: torch.Tensor,
+    h: torch.Tensor,
+    geometry_log_decay: torch.Tensor,
+    *,
+    initial_state: SolveDeltaState | None = None,
+    chunk_size: int = 64,
+    input_precision: Literal["ieee", "tf32"] = "ieee",
+) -> tuple[SolveDeltaState, SolveDeltaState]:
+    """Autograd-capable chunk-boundary geometry scan."""
+    if u.ndim != 4:
+        raise ValueError("u must have shape [B,T,H,r]")
+    batch, _, heads, rank = u.shape
+    if initial_state is None:
+        initial_m = torch.zeros(batch, heads, device=u.device, dtype=torch.float32)
+        initial_J = torch.zeros(batch, heads, rank, rank, device=u.device, dtype=torch.float32)
+        initial_D = torch.zeros_like(initial_J)
+    else:
+        initial_m = initial_state.m.float()
+        initial_J = initial_state.J.float()
+        initial_D = initial_state.D.float()
+    outputs = _TritonGeometryChunkScan.apply(
+        u,
+        h,
+        geometry_log_decay,
+        initial_m,
+        initial_J,
+        initial_D,
+        chunk_size,
+        input_precision,
+    )
+    empty = torch.empty(0, device=u.device, dtype=torch.float32)
+    return (
+        SolveDeltaState(outputs[0], outputs[1], outputs[2], empty),
+        SolveDeltaState(outputs[3], outputs[4], outputs[5], empty),
+    )
