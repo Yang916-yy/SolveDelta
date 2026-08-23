@@ -240,6 +240,94 @@ def test_fused_backward_matches_fp64_contract(
         assert _rho(reference.grad, native.grad) < geometry_ceiling
 
 
+def test_skewless_c32_fused_state_vjp_matches_fp64_contract() -> None:
+    torch.manual_seed(20260823)
+    batch, length, heads, rank, value_dim = 1, 33, 1, 128, 16
+    master = (
+        torch.randn(batch, length, heads, rank, device="cuda"),
+        0.2 * torch.randn(batch, length, heads, rank, device="cuda"),
+        torch.randn(batch, length, heads, rank, device="cuda"),
+        torch.randn(batch, length, heads, 1, rank, device="cuda"),
+        0.1 * torch.randn(batch, length, heads, 1, value_dim, device="cuda"),
+        -0.05 * torch.rand(batch, length, heads, device="cuda"),
+        -0.03 * torch.rand(batch, length, heads, rank, device="cuda"),
+        2.0 * torch.rand(batch, length, heads, 1, rank, device="cuda"),
+        2.0 * torch.rand(batch, length, heads, 1, value_dim, device="cuda"),
+        2.0 * torch.rand(batch, length, heads, 1, device="cuda") - 1.0,
+        torch.sigmoid(torch.randn(heads, device="cuda")),
+    )
+    native_inputs = tuple(x.detach().requires_grad_(True) for x in master)
+    reference_inputs = tuple(
+        x.detach().double().requires_grad_(True) for x in master
+    )
+    initial_master = SolveDeltaState(
+        4.0 + torch.rand(batch, heads, device="cuda"),
+        0.02 * torch.randn(batch, heads, rank, rank, device="cuda"),
+        0.02 * torch.randn(batch, heads, rank, rank, device="cuda"),
+        0.03 * torch.randn(batch, heads, rank, value_dim, device="cuda"),
+    )
+    native_initial = SolveDeltaState(
+        *(value.detach().requires_grad_(True) for value in initial_master)
+    )
+    reference_initial = SolveDeltaState(
+        *(value.detach().double().requires_grad_(True) for value in initial_master)
+    )
+    output_cotangent = torch.randn(
+        batch, length, heads, value_dim, device="cuda"
+    )
+    state_cotangents = (
+        1e-2 * torch.randn(batch, heads, device="cuda"),
+        1e-3 * torch.randn(batch, heads, rank, rank, device="cuda"),
+        1e-3 * torch.randn(batch, heads, rank, rank, device="cuda"),
+        torch.randn(batch, heads, rank, value_dim, device="cuda"),
+    )
+
+    actual, actual_state = solvedelta_fused(
+        *native_inputs,
+        initial_state=native_initial,
+        output_final_state=True,
+        outer_dtype=torch.bfloat16,
+        skew_enabled=False,
+    )
+    actual_loss = (actual.float() * output_cotangent).sum()
+    actual_loss = actual_loss + sum(
+        (value.float() * cotangent).sum()
+        for value, cotangent in zip(actual_state, state_cotangents)
+    )
+    actual_loss.backward()
+
+    reference_arguments = list(reference_inputs)
+    reference_arguments[9] = torch.zeros_like(reference_arguments[9])
+    expected, expected_state = solvedelta_reference(
+        *reference_arguments, initial_state=reference_initial
+    )
+    expected_loss = (expected * output_cotangent.double()).sum()
+    expected_loss = expected_loss + sum(
+        (value * cotangent.double()).sum()
+        for value, cotangent in zip(expected_state, state_cotangents)
+    )
+    expected_loss.backward()
+
+    assert _rho(expected, actual) < 6e-3
+    for index, (reference_state, native_state) in enumerate(
+        zip(expected_state, actual_state)
+    ):
+        ceiling = 6e-3 if index == 3 else 2e-4
+        assert _rho(reference_state, native_state) < ceiling
+    for index, (reference, native) in enumerate(
+        zip(reference_inputs, native_inputs)
+    ):
+        if index == 9:
+            assert native.grad is None
+            continue
+        assert native.grad is not None and torch.isfinite(native.grad).all()
+        ceiling = 1.5e-2 if index in (2, 3, 4, 6) else 2.5e-2
+        assert _rho(reference.grad, native.grad) < ceiling
+    for reference, native in zip(reference_initial, native_initial):
+        assert native.grad is not None and torch.isfinite(native.grad).all()
+        assert _rho(reference.grad, native.grad) < 2.5e-2
+
+
 def test_fused_backward_is_repeatable() -> None:
     """Guard the chunk/WY and shared-memory boundaries against CUDA races."""
     torch.manual_seed(20260820)

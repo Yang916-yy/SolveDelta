@@ -5,6 +5,7 @@ from .mathdx import (
     mathdx_solve_frame128,
     mathdx_trsm128,
 )
+from .panel_frame import panel_frame128
 from .packet_frame import packet_frame128
 from .triton_bounded_ldu import bounded_ldu_vjp128
 from .triton_geometry import triton_geometry_chunk_scan
@@ -16,6 +17,7 @@ __all__ = [
     "cuda_chunk_solve_frame128",
     "mathdx_solve_frame128",
     "mathdx_trsm128",
+    "panel_frame128",
     "packet_frame128",
     "bounded_ldu_vjp128",
     "triton_geometry_chunk_scan",

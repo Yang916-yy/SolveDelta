@@ -15,6 +15,10 @@ find_package(
 add_library(
   causallsso_mathdx SHARED
   mathdx_trsm.cu
+  panel_frame32.cu
+  panel_frame32_backward.cu
+  panel_frame32_radial.cu
+  panel_frame32_radial_vjp.cu
   packet_frame.cu
   packet_frame_action_vjp.cu
   packet_frame_descriptor_vjp.cu

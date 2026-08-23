@@ -233,6 +233,7 @@ class SolveDelta(nn.Module):
                 erase, write, skew, strength.float(),
                 initial_state=operator_initial,
                 output_final_state=return_final_state,
+                skew_enabled=skew_enabled,
             )
         else:
             reference_dtype = u.dtype

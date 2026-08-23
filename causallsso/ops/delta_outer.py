@@ -228,15 +228,15 @@ def solvedelta_fused(
     initial_state: SolveDeltaState | None = None,
     output_final_state: bool = False,
     outer_dtype: torch.dtype = torch.float16,
+    skew_enabled: bool = True,
 ) -> tuple[torch.Tensor, SolveDeltaState | None]:
     """Run the selected differentiable r=128, K=1 fused CUDA schedule.
 
-    Geometry summaries use a fixed 16-token Triton chunk scan. Exact packet
-    frame actions are split across Triton prefix/radial tiles and dedicated
-    CUDA primal/dual kernels without materializing tokenwise frames. The
-    associative recurrence uses FLA's mature DPLR implementation. Geometry and
-    frame accumulation are FP32; only transformed vectors and the outer
-    recurrence are stored in ``outer_dtype``.
+    With skew structurally disabled, geometry summaries and frame actions use
+    the dedicated C32 panel path. Skew-enabled execution retains the exact C16
+    path until the component ablation is complete. Both feed FLA's mature C16
+    DPLR/WY exterior. Geometry and frame accumulation are FP32; only transformed
+    vectors and the outer recurrence are stored in ``outer_dtype``.
 
     Backward recomputes chunk summaries and local frame actions from saved
     vector inputs. This establishes the complete gradient contract without
@@ -290,33 +290,49 @@ def solvedelta_fused(
 
     # Local imports keep the independently testable staging operators free of
     # an import cycle while this function owns only their composition.
+    from .panel_frame import panel_frame128
     from .packet_frame import packet_frame128
     from .triton_geometry import triton_geometry_chunk_scan
 
     normalized_u = F.normalize(u, p=2, dim=-1)
     normalized_query = F.normalize(query, p=2, dim=-1)
     normalized_keys = F.normalize(keys, p=2, dim=-1)
+    frame_chunk = 16 if skew_enabled else 32
     boundaries, final_geometry = triton_geometry_chunk_scan(
         normalized_u,
         h,
         geometry_log_decay,
         initial_state=initial_state,
-        chunk_size=16,
+        chunk_size=frame_chunk,
         input_precision="ieee",
     )
-    d, e, chi = packet_frame128(
-        boundaries.m,
-        boundaries.J,
-        boundaries.D,
-        normalized_u,
-        h,
-        geometry_log_decay,
-        normalized_keys,
-        erase,
-        normalized_query,
-        skew,
-        geometry_strength,
-    )
+    if skew_enabled:
+        d, e, chi = packet_frame128(
+            boundaries.m,
+            boundaries.J,
+            boundaries.D,
+            normalized_u,
+            h,
+            geometry_log_decay,
+            normalized_keys,
+            erase,
+            normalized_query,
+            skew,
+            geometry_strength,
+        )
+    else:
+        d, e, chi = panel_frame128(
+            boundaries.m,
+            boundaries.J,
+            boundaries.D,
+            normalized_u,
+            h,
+            geometry_log_decay,
+            normalized_keys,
+            erase,
+            normalized_query,
+            geometry_strength,
+        )
     initial_associative = None
     if initial_state is not None:
         initial_associative = initial_state.S.to(outer_dtype)
