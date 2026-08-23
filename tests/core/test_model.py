@@ -3,7 +3,6 @@ import pytest
 
 from causallsso import SolveDelta, SolveDeltaConfig
 from causallsso.model import _CausalShortConvolution
-from causallsso.ops import mathdx_available
 
 
 def test_model_owns_projections_and_supports_non_128_reference_width() -> None:
@@ -212,31 +211,3 @@ def test_masks_and_resets_apply_to_complete_layer_state() -> None:
         torch.testing.assert_close(actual, expected)
     for expected, actual in zip(suffix_state[1:], reset_state[1:]):
         torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not mathdx_available(),
-    reason="CUDA and built MathDx extension required",
-)
-def test_r128_cuda_model_dispatch_has_complete_backward() -> None:
-    config = SolveDeltaConfig(
-        hidden_size=256,
-        num_heads=2,
-        head_k_dim=128,
-        head_v_dim=64,
-        num_edits=1,
-    )
-    model = SolveDelta(config).cuda().to(torch.bfloat16)
-    hidden = torch.randn(
-        1, 3, config.hidden_size,
-        device="cuda", dtype=torch.bfloat16, requires_grad=True,
-    )
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        output, state = model(hidden, return_final_state=True)
-        loss = output.float().square().mean() + state.operator.S.float().square().mean()
-    loss.backward()
-    assert output.shape == hidden.shape
-    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
-    for parameter in model.parameters():
-        assert parameter.grad is not None
-        assert torch.isfinite(parameter.grad).all()

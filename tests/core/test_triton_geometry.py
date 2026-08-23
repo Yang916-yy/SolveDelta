@@ -4,7 +4,6 @@ import torch.nn.functional as F
 
 from causallsso import SolveDeltaState, solvedelta_reference
 from causallsso.ops import triton_geometry_chunk_scan
-from causallsso.ops.triton_geometry import _geometry_scan_recompute
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -15,6 +14,50 @@ def _rho(reference: torch.Tensor, actual: torch.Tensor) -> torch.Tensor:
     actual = actual.double()
     return (actual - reference).square().mean().sqrt() / (
         reference.square().mean().sqrt() + 1e-8
+    )
+
+
+def _geometry_scan_recompute(
+    u: torch.Tensor,
+    h: torch.Tensor,
+    geometry_log_decay: torch.Tensor,
+    initial_m: torch.Tensor,
+    initial_J: torch.Tensor,
+    initial_D: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, ...]:
+    current_m, current_J, current_D = initial_m, initial_J, initial_D
+    boundary_m, boundary_J, boundary_D = [], [], []
+    for start in range(0, u.shape[1], chunk_size):
+        end = min(start + chunk_size, u.shape[1])
+        boundary_m.append(current_m)
+        boundary_J.append(current_J)
+        boundary_D.append(current_D)
+        logs = geometry_log_decay[:, start:end].permute(0, 2, 1)
+        suffix = torch.flip(
+            torch.cumsum(torch.flip(logs, dims=(-1,)), dim=-1), dims=(-1,)
+        )
+        weights = torch.exp(suffix - logs)
+        local_u = u[:, start:end].permute(0, 2, 1, 3)
+        local_h = h[:, start:end].permute(0, 2, 1, 3)
+        weighted_u = local_u * weights[..., None]
+        chunk_lambda = torch.exp(logs.sum(-1))
+        current_m = chunk_lambda * current_m + weights.sum(-1)
+        current_J = (
+            chunk_lambda[..., None, None] * current_J
+            + weighted_u.transpose(-1, -2) @ local_u
+        )
+        current_D = (
+            chunk_lambda[..., None, None] * current_D
+            + weighted_u.transpose(-1, -2) @ local_h
+        )
+    return (
+        torch.stack(boundary_m, dim=2),
+        torch.stack(boundary_J, dim=2),
+        torch.stack(boundary_D, dim=2),
+        current_m,
+        current_J,
+        current_D,
     )
 
 

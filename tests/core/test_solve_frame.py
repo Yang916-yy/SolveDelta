@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from causallsso import apply_dual_reference, apply_primal_reference
-from causallsso.ops import mathdx_available, mathdx_solve_frame128
+from causallsso.oracle import mathdx_available, mathdx_solve_frame128
 
 
 pytestmark = pytest.mark.skipif(

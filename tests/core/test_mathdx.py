@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from causallsso.ops import mathdx_available, mathdx_trsm128
+from causallsso.oracle import mathdx_available, mathdx_trsm128
 
 
 pytestmark = pytest.mark.skipif(

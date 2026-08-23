@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import SolveDeltaConfig
-from .ops import solvedelta_fused
 from .reference import SolveDeltaState, solvedelta_reference
 
 
@@ -174,28 +173,6 @@ class SolveDelta(nn.Module):
             key_raw = F.silu(key_raw)
             value_raw = F.silu(value_raw)
 
-        optimized = (
-            hidden_states.device.type == "cuda"
-            and r == 128
-            and edits == 1
-            and valid_mask is None
-            and reset_mask is None
-        )
-        if optimized:
-            # The native geometry/frame contract evaluates projections and
-            # gates in FP32; the FLA exterior performs its own selected FP16
-            # storage conversion after the frame transformation.
-            u_raw = u_raw.float()
-            h_raw = h_raw.float()
-            q_raw = q_raw.float()
-            key_raw = key_raw.float()
-            # Values go directly to the selected FP16 outer. Avoid widening
-            # this large value-side projection only to narrow it again.
-            erase_raw = erase_raw.float()
-            write_raw = write_raw.float()
-            skew_raw = skew_raw.float()
-            geometry_raw = geometry_raw.float()
-            associative_raw = associative_raw.float()
         u = view_head(u_raw, r)
         h = view_head(h_raw, r)
         q = view_head(q_raw, r)
@@ -226,33 +203,23 @@ class SolveDelta(nn.Module):
         if not geometry_enabled:
             strength = torch.zeros_like(strength)
 
-        if optimized:
-            outputs, final_state = solvedelta_fused(
-                u, h, q, keys, values,
-                geometry_log_decay.float(), associative_log_decay.float(),
-                erase, write, skew, strength.float(),
-                initial_state=operator_initial,
-                output_final_state=return_final_state,
-                skew_enabled=skew_enabled,
-            )
-        else:
-            reference_dtype = u.dtype
-            outputs, final_state = solvedelta_reference(
-                u,
-                h,
-                q,
-                keys,
-                values,
-                geometry_log_decay.to(reference_dtype),
-                associative_log_decay.to(reference_dtype),
-                erase.to(reference_dtype),
-                write.to(reference_dtype),
-                skew.to(reference_dtype),
-                strength.to(reference_dtype),
-                initial_state=operator_initial,
-                valid_mask=valid_mask,
-                reset_mask=reset_mask,
-            )
+        reference_dtype = u.dtype
+        outputs, final_state = solvedelta_reference(
+            u,
+            h,
+            q,
+            keys,
+            values,
+            geometry_log_decay.to(reference_dtype),
+            associative_log_decay.to(reference_dtype),
+            erase.to(reference_dtype),
+            write.to(reference_dtype),
+            skew.to(reference_dtype),
+            strength.to(reference_dtype),
+            initial_state=operator_initial,
+            valid_mask=valid_mask,
+            reset_mask=reset_mask,
+        )
         outputs = outputs.reshape(batch, length, h_count * v_dim)
         outputs = self.output_proj(outputs.to(hidden_states.dtype))
         if not return_final_state:

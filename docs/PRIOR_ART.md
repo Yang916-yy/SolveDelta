@@ -255,52 +255,27 @@ full-sequence `T x r x r` states.
 - Hogg, *A Fast Dense Triangular Solve in CUDA*,
   [DOI:10.1137/12088358X](https://doi.org/10.1137/12088358X).
 
-Decision: strict masking destroys ordinary low rank, but it retains a
-sequentially semiseparable generator. For one geometry chunk, the exact affine
-prefix decomposition writes each token's strict factor as one dense boundary
-triangle plus masked outer products from the at most `C` local sources. A
-rank-coordinate solve therefore carries two `C x C` packets of prefix inner
-products instead of materializing `C x r x r` factors. Boundary work is a
-panel action and local work is a generator scan, giving
-`O(C r^2 + C^2 r)` per chunk and exact lower, upper, transpose, and skew
-actions. These sources informed the generator interpretation and GPU solve
-schedule. SolveDelta's two-axis affine coefficients, separate radial maps,
-stable cancellation treatment, primal/dual pairing, and combined
-`d/e/chi` packet are project-specific derivations.
+Decision: strict masking destroys ordinary low rank, but retains a
+sequentially semiseparable generator. For one geometry chunk, every token's
+strict factor is a dense boundary triangle plus masked outer products from at
+most `C` local sources. This supports exact `O(C r^2 + C^2 r)` lower, upper,
+transpose, and skew actions without materializing `C x r x r` factors.
 
-The selected skew-action tile pairing is also a project-specific derivation;
-no external kernel or algorithm was copied for it. The semiseparable sources
-above justify retaining masked local outer products as generators, but do not
-give this packet specialization. SolveDelta partitions the 128 coordinates
-into eight 16-coordinate tiles. For each unordered tile pair it reads the two
-directed boundary blocks once, forms both blocks related by
-`Omega^T=-Omega`, and applies them to all 16 token RHS. Fixed twofold-FP32
-partials carry boundary contributions into a second kernel, where they are
-reduced in fixed order together with the exact local generator action. This is
-algebraically the same dense `Omega=1/2(E-E^T)` action; it neither compresses
-`J/D` nor changes frame update frequency. The decision it informed was to
-replace the repeated-RHS boundary traversal in the C16 forward. A direct
-primal-kernel fusion and a lower-workspace row-tile schedule were measured and
-rejected as slower exact schedules. Applying the same identity to the skew VJP
-as `grad_direct-Omega grad_omega` is valid, but its fully compensated prototype
-was slower than the selected contract-passing backward action and therefore
-was not adopted.
+The deleted C16 packet and C32 panel prototypes established useful facts but
+are not maintained implementations. In particular, coordinate blocking can
+turn cross-block generator contractions into wide-RHS matrix products; only
+the diagonal coordinate block needs a strict prefix/suffix scan. The identity
+`Omega^T=-Omega` also allows paired directed blocks to share work. These are
+algebraic inputs to the replacement chunk operator, not compatibility
+requirements for its ABI.
 
 The generic quasiseparable order of a dense continuation can still grow to
-`floor(r/2)`. The packet algorithm is consequently an exact chunk execution,
-not evidence that the full chart has constant rank or permission to replace
-`J,D` with a compressed state. A plain IEEE-FP32 Gram expansion of the radial
-norm remains rejected: legal cancellation between a dense boundary and a local
-outer product loses the residual and can reconstruct a negative squared norm.
-The selected radial pass instead uses four independent channels
-`(J_lower,D_lower,J_upper,D_upper)`. For each channel it evaluates the exact
-affine-prefix quadratic from boundary norms, boundary/local contractions, and
-local outer-product Grams. Large contractions use one fixed twofold FP32 path,
-and the small `C x C` quadratic is composed in FP64. This retains arbitrary
-asymmetric `J,D` boundaries, costs `O(C r^2 + C^2 r)`, and introduces no clamp,
-fallback, or saved training statistics. Independent `2^12` cancellation probes
-for both `J` and `D`, including ordinary asymmetric tails, remain finite and
-match the direct FP64 matrix oracle within the bounded-chart ceiling.
+`floor(r/2)`. The generator algorithm is therefore not evidence that the full
+chart has constant ordinary rank or permission to compress `J` or `D`. A plain
+IEEE-FP32 Gram expansion remains rejected because legal boundary/local
+cancellation can lose the residual or reconstruct a negative squared norm.
+The replacement must preserve four independent radial channels and pass the
+same `2^12` cancellation cases using fixed, deterministic compensation.
 
 - Seeger, *Low Rank Updates for the Cholesky Decomposition*,
   [EPFL technical report](https://infoscience.epfl.ch/entities/publication/00ba309a-d155-4e21-acc2-153702c4605c).
@@ -328,21 +303,18 @@ MathDx supports a CUDA block cooperating on one triangular solve, with input
 and overwritten output staged in shared memory. MathDx 25.12 exposes this
 operation through cuSolverDx, while MathDx 26.06 moves it to cuBLASDx. These
 device-library paths require CUDA C++ compilation/device linking and are not
-directly callable from an ordinary Triton JIT kernel. The selected engineering
-boundary keeps the mature Delta-family chunk scan and Delta/WY work in Triton,
-uses MathDx for the standalone exact solve oracle, and inserts a CUDA C++
-operator for chunk-local prefix reconstruction, bounded factor generation,
-coordinate-packet primal actions, and direct dual products. The local first target is
+directly callable from an ordinary Triton JIT kernel. The engineering boundary
+keeps the geometry boundary scan in Triton, MathDx as an optional exact oracle,
+FLA as the generalized Delta/WY owner, and one project-owned CUDA operator for
+chunk-local frame forward and VJP. The local first target is
 PyTorch 2.13.0+cu130, Triton 3.7.1, CUDA 13.0 Update 2, and MathDx 26.06
 cuBLASDx 0.7.0. An isolated official block-TRSM example has compiled, linked
 through `libcublasdx.fatbin`, dispatched on SM120, and returned zero reported
 L2 error; this validates the exact toolchain boundary rather than the
 performance of the fused training operator. The chunk boundary avoids
-materializing `T x r x r` prefix states while
-retaining the established outer schedule. The selected C16 forward and its
-transposed packet VJP use exact FP32 coordinate substitution. The earlier
-degree-four Neumann implementation remains an independently validated
-approximation only. MathDx remains the exact comparison boundary.
+materializing `T x r x r` prefix states while retaining the established outer
+schedule. MathDx remains the exact comparison boundary and is not linked into
+the production training target.
 
 The backend screen also considered handwritten recursive/block TRSM in Triton,
 CuTe DSL, TileLang, or CUDA tile libraries; host-level batched cuBLAS;
@@ -351,23 +323,15 @@ coupling, or hierarchical nilpotent-shear factors. The first
 group duplicates architecture-specific solver work already owned by MathDx,
 host batched TRSM forces dynamic factors through global memory, and changing
 factor families would make backend convenience alter the model mathematics.
-The polynomial candidate was initially rejected as an unbounded general solve,
-then adopted only after the selected chart supplied a global nilpotent-factor
-bound and empirical error stayed well below the composed-frame budget. MathDx
-therefore owns exact factor-action validation while Triton/CUDA/FLA own the
-bounded training schedule.
+The polynomial candidate and its standalone chunk path were deleted. A bounded
+remainder and good ordinary-case measurements were insufficient reason to keep
+a second solve contract. MathDx owns exact factor-action validation while
+Triton/CUDA/FLA own the training schedule.
 
-Decision: an SM120 Triton VJP for the isolated bounded LDU chart is retained as
-a numerical validation unit, not as the production backward boundary. Its
-factor-coordinate gradients agree with FP64 autograd to roughly `3e-7`
-relative RMS, but a direct integration materialized full factor cotangents and
-raised both complete-layer time and peak allocation. Folding moment
-normalization into the same kernel recovered a small same-run speedup while
-still adding about 91 MiB of peak allocation and failing to beat the retained
-stable endpoint. The next production experiment must consume the low-rank
-action cotangents inside the chart reduction and avoid writing full
-`grad_lower/grad_upper`; optimizing the isolated chart again is not an accepted
-work reduction.
+An isolated SM120 chart VJP prototype matched FP64 closely but materialized
+full factor cotangents and increased end-to-end time and workspace. It was
+deleted. The replacement backward must consume compact action cotangents inside
+the chart reduction without writing tokenwise `grad_lower/grad_upper`.
 
 Decision: a narrow-RHS audit found no free reparameterization that preserves
 the current dense chart, its full `r^2` ambient differential rank, and the
@@ -383,15 +347,13 @@ batched cuBLAS over exactly the same generated factors. They require
 end-to-end traffic and workspace measurements before adoption and do not alter
 the canonical chart.
 
-Decision: ordinary temporal compact WY cannot be applied a second time inside
-the frame. Frames are independently generated dense LDU systems rather than a
-product of rank-one time transitions, and a generic strictly masked outer
-product already has rank `r-1`. The admissible analogue is a rank-coordinate
-blocked semiseparable packet algorithm. With coordinate tile `b=C=16`, shared
-boundary panels, local generators, and all token right-hand sides form one
-augmented panel product; only the `C` exact `16 x 16` diagonal-tile solves stay
-serial inside a stage. This retains dense `J,D`, tokenwise frame updates, and
-the fixed ambient associative state.
+Decision: ordinary temporal compact WY cannot simply be applied a second time
+inside the frame. Frames are independently generated dense LDU systems rather
+than a product of rank-one temporal transitions, and a generic strictly masked
+outer product already has rank `r-1`. The admissible analogue is blocked
+semiseparable action over the finite chunk: shared boundary blocks and local
+generators form broad RHS products, while exact diagonal-block substitution
+retains tokenwise frame updates and dense `J,D`.
 
 Decision: the complete per-token factor cotangent has masked outer-product
 rank at most five for `K=1`: one primal-solve term, two erase/read terms, and
@@ -403,21 +365,16 @@ two-sided split restored accuracy but took `2.207 ms` and added about
 local, radial, or prefix reverse. Any compensated product must therefore live
 inside the eventual fused blocked kernel.
 
-Decision: linearity across those five descriptors is also the selected qbar
-algorithm. The primal, two dual, and two skew masked outers are first summed in
-fixed FloatFloat arithmetic for each strict entry and are then contracted once
-against each dense boundary. The local semiseparable pass already sums all five
-slots, so the transpose solve need not reproduce a second compensated qbar
-contraction. This is an exact VJP reassociation, not a new chart or a temporal
-WY approximation.
+Decision: linearity across those descriptors permits one exact qbar
+reassociation. The primal, dual, and skew masked outers can be summed in fixed
+compensated arithmetic before contraction with each dense boundary, while the
+local semiseparable pass consumes the same descriptor bundle. This result is
+retained for the new backward, not as an old kernel interface.
 
 Decision: a projected radial reverse can recover each affine-prefix norm and
-its scalar VJP from `<A_t,B>` and `<A_t,L_s>` projections and removes the
-full action workspace. The fastest fixed-precision source reverse that passed
-the driven `2^12` cancellation contract remained about 4--5% slower than the
-current radial VJP, while the faster plain-FP32 form failed that contract. It
-is therefore a useful derivation for a future fused algorithm but is not the
-selected production path.
+its scalar VJP from `<A_t,B>` and `<A_t,L_s>` projections without a full action
+workspace. Earlier standalone schedules were not competitive, but the
+derivation remains relevant when fused into the replacement chunk backward.
 
 ## Explicitly closed directions
 

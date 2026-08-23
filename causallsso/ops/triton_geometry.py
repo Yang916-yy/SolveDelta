@@ -817,53 +817,6 @@ def _triton_geometry_chunk_scan_backward(
     )
 
 
-def _geometry_scan_recompute(
-    u: torch.Tensor,
-    h: torch.Tensor,
-    geometry_log_decay: torch.Tensor,
-    initial_m: torch.Tensor,
-    initial_J: torch.Tensor,
-    initial_D: torch.Tensor,
-    chunk_size: int,
-) -> tuple[torch.Tensor, ...]:
-    """Differentiable chunk-summary form used as the native backward oracle."""
-    _, length, _, _ = u.shape
-    current_m, current_J, current_D = initial_m, initial_J, initial_D
-    boundary_m, boundary_J, boundary_D = [], [], []
-    for start in range(0, length, chunk_size):
-        end = min(start + chunk_size, length)
-        boundary_m.append(current_m)
-        boundary_J.append(current_J)
-        boundary_D.append(current_D)
-        logs = geometry_log_decay[:, start:end].permute(0, 2, 1)
-        suffix = torch.flip(torch.cumsum(torch.flip(logs, dims=(-1,)), dim=-1), dims=(-1,))
-        weights = torch.exp(suffix - logs)
-        local_u = u[:, start:end].permute(0, 2, 1, 3)
-        local_h = h[:, start:end].permute(0, 2, 1, 3)
-        weighted_u = local_u * weights[..., None]
-        summary_J = weighted_u.transpose(-1, -2) @ local_u
-        summary_D = weighted_u.transpose(-1, -2) @ local_h
-        chunk_lambda = torch.exp(logs.sum(-1))
-        current_m = chunk_lambda * current_m + weights.sum(-1)
-        current_J = chunk_lambda[..., None, None] * current_J + summary_J
-        current_D = chunk_lambda[..., None, None] * current_D + summary_D
-    return (
-        torch.stack(boundary_m, dim=2),
-        torch.stack(boundary_J, dim=2),
-        torch.stack(boundary_D, dim=2),
-        current_m,
-        current_J,
-        current_D,
-    )
-
-
-_compiled_geometry_scan_recompute = torch.compile(
-    _geometry_scan_recompute,
-    fullgraph=True,
-    dynamic=False,
-)
-
-
 class _TritonGeometryChunkScan(torch.autograd.Function):
     @staticmethod
     def forward(

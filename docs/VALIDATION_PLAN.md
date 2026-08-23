@@ -156,37 +156,22 @@ FP32 factorwise execution against FP64 produced about `1.0e-7` primal and
 supports the order of the budgets but does not validate MathDx; the actual
 custom operator must pass them independently.
 
-The selected dense fixed-length `r=128,K=1` forward uses exact FP32 C16
-coordinate-packet substitution for the two unit-triangular solves. Its legal
-`2^12` cancellation probe currently gives approximately
-`1.24e-5--1.37e-5` composed `d,e,chi` relative RMS, `1.67e-5` maximum
-normalized solve residual, and `6.52e-6` maximum pairing drift. Random
-asymmetric cases are around `4.3e-8--5.8e-8` relative RMS.
+The chunk-owned frame path must be checked before the FLA exterior. It must
+remain finite without a norm clamp for independent `2^12` boundary/local
+cancellation in both `J` and `D`, including an ordinary asymmetric tail. It
+must preserve valid tokens when affine coefficients underflow to zero, emit
+exact identity-chart outputs for structurally invalid tail slots, and retain
+the valid diagonal auxiliaries required by the strength VJP at identity. Random
+and cancellation chart coordinates use the `2e-4` forward ceiling in the table;
+NaN, a negative reconstructed norm, or inferring validity from an underflowed
+coefficient is an unconditional failure.
 
-The radial parameter pass is also checked before factor actions. Its fixed
-four-channel twofold implementation must remain finite without a norm clamp for
-independent `2^12` boundary/local cancellation in both `J` and `D`, including an
-ordinary asymmetric tail. It must preserve valid tokens when affine
-coefficients underflow to zero, emit exact `(coefficient=0, diagonal=1)` for
-structurally invalid tail slots, and keep the unscaled valid diagonal
-auxiliaries at the identity-strength point for the strength VJP. Random and
-cancellation chart coordinates use the `2e-4` forward ceiling in the table;
-NaN, a negative reconstructed norm, or inferring validity from `alpha` is an
-unconditional failure.
-
-The independently retained `cuda_chunk_solve_frame128` validation forward uses
-a fourth-order Neumann action. This is not algebraically exact: for `||N||<1`,
-truncation after degree four has the operator remainder `N^5(I+N)^-1`. The
-fixed chart bound `||N||_2 <= ||N||_F < 1/4` gives the conservative operator
-bound `1/768`; actual composed `d,e,chi` must still pass the stricter `5e-4`
-empirical row above. The deterministic Neumann kernel, including FP16
-`J`/factor storage and BF16 `D` storage with FP32 accumulation, measures
-approximately `3.5e-5--3.7e-5`. Production packet backward instead transposes
-the exact coordinate-packet actions and contracts the five masked-outer
-descriptors directly. Its merged qbar contraction, complete frame VJP, and all
-component gradients are independently compared with the FP64 recurrence and
-must satisfy the `1e-3` internal backward ceiling, including the legal `2^12`
-cancellation case.
+No standalone polynomial or truncated inverse is a validation boundary. The
+new frame forward and VJP are compared directly with the FP64 recurrence and
+the optional exact MathDx factor-action oracle. Every component gradient must
+satisfy the `1e-3` internal backward ceiling, including legal `2^12`
+cancellation. A proposed approximation remains an experiment until its
+algebraic error and empirical envelope are separately accepted.
 
 Here
 
@@ -342,22 +327,16 @@ Only after both stages pass may the composition be called exact chunkwise
 SolveDelta. A chunk-end adapter reused for earlier tokens or a reversed micro-edit
 order fails this gate.
 
-## Phase 4: hybrid Triton--CUDA--FLA backend
+## Phase 4: Triton--CUDA--FLA backend
 
-Validate the exact MathDx block-TRSM oracle, the bounded polynomial CUDA
-training candidate, and their Triton scan/FLA-WY exterior
-against both explicit dense `M` solves and the complete token recurrence over
-the normal envelope:
+Validate the exact MathDx block-TRSM oracle, the chunk-owned CUDA frame forward
+and VJP, and their Triton scan/FLA-WY exterior against explicit dense `M` solves
+and the complete token recurrence over the normal envelope.
 
-The local environment gate is already satisfied for PyTorch `2.13.0+cu130`,
-Triton `3.7.1`, CUDA 13.0 Update 2, and MathDx 26.06/cuBLASDx 0.7.0: CUDA and
-Triton smoke kernels pass, FLA GatedDeltaNet2 and BF16 GatedDeltaProduct pass
-forward/backward, a PyTorch CUDA C++ extension compiles and runs for SM120, and
-the official cuBLASDx block-TRSM sample passes on SM120. The dense fixed-length
-`r=128,K=1` fused forward, state, VJP, initial-state, and model-parameter gates
-now pass. The list below remains the full release checklist; masks/resets,
-packed sequences, generic native shapes, long training drift, and architecture
-dispatch are still open.
+The local environment gate has been exercised for PyTorch `2.13.0+cu130`,
+Triton `3.7.1`, CUDA 13.0 Update 2, MathDx 26.06/cuBLASDx 0.7.0, and FLA 0.5.2
+on SM120. This establishes toolchain feasibility only. The replacement native
+frame backend has not passed the release gate yet.
 
 - lower/upper residual and complete solve-action relative error;
 - all `K` `(d,e)` pairs, `chi`, outputs, and recurrent states;
@@ -366,22 +345,19 @@ dispatch are still open.
 - radial and diagonal saturation fractions plus their gradient magnitudes;
 - realized `||M||`, `||M^-1||`, `cond(M)`, and edit transition singular values;
 - pairing drift `|e^T d-b_tilde^T a|`, especially at pairing zero and two;
-- reuse of one factor load for all packed primal and dual right-hand sides;
+- reuse of boundary/chart data across all local primal and dual right-hand sides;
 - no full-sequence `T x r x r` geometry or factor materialization;
-- MathDx provider/architecture dispatch fails explicitly when unsupported and
-  never silently selects a handwritten alternative solve chart;
+- native provider/architecture dispatch fails explicitly when unsupported;
 - irregular masks, resets, chunk sizes, and single-token decoding;
 - complete-layer wall time and workspace, not only isolated TRSM latency;
 - compare against the official sample's warning signal that an isolated small
   block TRSM can lose to batched cuBLAS; accept the hybrid route only when
   fusion-level traffic savings survive end-to-end measurement.
 
-The first native contract remains FP32 for factors and solve accumulation.
-The isolated solve-frame tests also cover BF16 and FP16 direct-dual operands;
-they pass the `5e-3` forward envelope, but are slower than FP32 in the current
-unfused wrapper because of conversion traffic. They therefore remain explicit
-experiments and may not silently change the system, add iterative correction
-semantics, or fall back to a dense chart.
+The first native contract remains FP32 for chart-sensitive accumulation.
+Tensor Core products may use split BF16/FP16 operands only where the complete
+internal error table passes. They may not silently change the system, add
+iterative correction semantics, or fall back to another chart.
 
 ## Phase 5: model evaluation
 
