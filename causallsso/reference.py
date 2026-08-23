@@ -24,6 +24,55 @@ def _radial_bound(x: torch.Tensor, radius: float) -> torch.Tensor:
     return radius * x / torch.sqrt(x.new_tensor(radius * radius) + norm_sq)
 
 
+def _bounded_ldu_untied_strength_reference(
+    H: torch.Tensor,
+    R: torch.Tensor,
+    geometry_strength_channels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expose the six existing chart channels for gradient diagnostics only."""
+    if H.shape != R.shape or H.ndim < 2 or H.shape[-1] != H.shape[-2]:
+        raise ValueError("H and R must have equal [..., r, r] shapes")
+    if (
+        geometry_strength_channels.ndim < 1
+        or geometry_strength_channels.shape[0] != 6
+    ):
+        raise ValueError("geometry_strength_channels must have leading size 6")
+
+    r = H.shape[-1]
+    eye = torch.eye(r, dtype=H.dtype, device=H.device)
+    strengths = []
+    for channel_strength in geometry_strength_channels.unbind(dim=0):
+        while channel_strength.ndim < H.ndim - 2:
+            channel_strength = channel_strength.unsqueeze(0)
+        strengths.append(channel_strength.unsqueeze(-1).unsqueeze(-1))
+
+    centered_h = H - eye / r
+    lower_h = _radial_bound(
+        torch.tril(strengths[0] * centered_h, diagonal=-1), C_H
+    )
+    lower_r = _radial_bound(
+        torch.tril(strengths[1] * R, diagonal=-1), C_R
+    )
+    upper_h = _radial_bound(
+        torch.triu(strengths[2] * centered_h, diagonal=1), C_H
+    )
+    upper_r = _radial_bound(
+        torch.triu(strengths[3] * R, diagonal=1), C_R
+    )
+
+    diag_h = torch.diagonal(
+        strengths[4] * centered_h, dim1=-2, dim2=-1
+    )
+    diag_r = torch.diagonal(strengths[5] * R, dim1=-2, dim2=-1)
+    log_diagonal = S_H * torch.tanh(diag_h / S_H)
+    log_diagonal = log_diagonal + S_R * torch.tanh(diag_r / S_R)
+    diagonal = torch.exp(log_diagonal)
+
+    lower = eye + (lower_h + lower_r)
+    upper = eye + (upper_h + upper_r)
+    return lower, diagonal, upper
+
+
 def bounded_ldu_reference(
     H: torch.Tensor,
     R: torch.Tensor,
@@ -34,31 +83,10 @@ def bounded_ldu_reference(
     Returns ``(lower, diagonal, upper)`` with ``lower`` and ``upper`` unit
     triangular and ``diagonal`` stored as a vector.
     """
-    if H.shape != R.shape or H.ndim < 2 or H.shape[-1] != H.shape[-2]:
-        raise ValueError("H and R must have equal [..., r, r] shapes")
-    r = H.shape[-1]
-    eye = torch.eye(r, dtype=H.dtype, device=H.device)
-    strength = geometry_strength
-    while strength.ndim < H.ndim - 2:
-        strength = strength.unsqueeze(0)
-    strength = strength.unsqueeze(-1).unsqueeze(-1)
-
-    x_h = strength * (H - eye / r)
-    x_r = strength * R
-    n_lower = _radial_bound(torch.tril(x_h, diagonal=-1), C_H)
-    n_lower = n_lower + _radial_bound(torch.tril(x_r, diagonal=-1), C_R)
-    n_upper = _radial_bound(torch.triu(x_h, diagonal=1), C_H)
-    n_upper = n_upper + _radial_bound(torch.triu(x_r, diagonal=1), C_R)
-
-    diag_h = torch.diagonal(x_h, dim1=-2, dim2=-1)
-    diag_r = torch.diagonal(x_r, dim1=-2, dim2=-1)
-    log_diagonal = S_H * torch.tanh(diag_h / S_H)
-    log_diagonal = log_diagonal + S_R * torch.tanh(diag_r / S_R)
-    diagonal = torch.exp(log_diagonal)
-
-    lower = eye + n_lower
-    upper = eye + n_upper
-    return lower, diagonal, upper
+    tied_strength = geometry_strength.unsqueeze(0).expand(
+        6, *geometry_strength.shape
+    )
+    return _bounded_ldu_untied_strength_reference(H, R, tied_strength)
 
 
 def apply_primal_reference(

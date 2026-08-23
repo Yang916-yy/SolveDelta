@@ -1,9 +1,27 @@
-import torch
+import importlib.util
+
 import pytest
+import torch
 
 from causallsso import SolveDelta, SolveDeltaConfig
 import causallsso.model as model_module
 from causallsso.model import _CausalShortConvolution
+
+
+_NATIVE_AVAILABLE = (
+    torch.cuda.is_available() and importlib.util.find_spec("fla") is not None
+)
+
+
+def _prepare_native_model(config: SolveDeltaConfig) -> SolveDelta:
+    model = SolveDelta(config).cuda()
+    model.in_proj.to(torch.bfloat16)
+    model.output_proj.to(torch.bfloat16)
+    if config.use_short_conv:
+        model.q_conv1d.to(torch.bfloat16)
+        model.k_conv1d.to(torch.bfloat16)
+        model.v_conv1d.to(torch.bfloat16)
+    return model
 
 
 def test_model_owns_projections_and_supports_non_128_reference_width() -> None:
@@ -230,3 +248,108 @@ def test_masks_and_resets_apply_to_complete_layer_state() -> None:
         torch.testing.assert_close(actual, expected)
     for expected, actual in zip(suffix_state[1:], reset_state[1:]):
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not _NATIVE_AVAILABLE, reason="CUDA and FLA required")
+def test_cuda_bf16_complete_layer_uses_native_forward_and_backward(
+    monkeypatch,
+) -> None:
+    captured_inputs = None
+    original_chunk_wy = model_module.chunk_wy_solvedelta
+
+    def reject_reference(*args, **kwargs):
+        raise AssertionError("CUDA BF16 execution must not call the reference")
+
+    def capture_chunk_wy(*args, **kwargs):
+        nonlocal captured_inputs
+        captured_inputs = args
+        return original_chunk_wy(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "solvedelta_reference", reject_reference)
+    monkeypatch.setattr(model_module, "chunk_wy_solvedelta", capture_chunk_wy)
+    torch.manual_seed(20260911)
+    config = SolveDeltaConfig(
+        128,
+        1,
+        head_k_dim=128,
+        head_v_dim=32,
+    )
+    model = _prepare_native_model(config)
+    hidden = torch.randn(
+        1,
+        3,
+        128,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+
+    output, state = model(hidden, return_final_state=True)
+    assert captured_inputs is not None
+    assert all(
+        captured_inputs[index].dtype == torch.bfloat16
+        for index in (0, 1, 2, 3, 4, 7, 8)
+    )
+    assert all(
+        captured_inputs[index].dtype == torch.float32
+        for index in (5, 6, 9)
+    )
+    assert output.shape == hidden.shape
+    assert output.dtype == torch.bfloat16
+    assert all(tensor.dtype == torch.float32 for tensor in state.operator)
+    assert state.conv_q.dtype == torch.bfloat16
+    assert state.conv_k.dtype == torch.bfloat16
+    assert state.conv_v.dtype == torch.bfloat16
+
+    loss = output.float().square().mean()
+    loss = loss + sum(tensor.square().mean() for tensor in state.operator)
+    loss.backward()
+    assert hidden.grad is not None
+    assert hidden.grad.dtype == torch.bfloat16
+    assert torch.isfinite(hidden.grad).all()
+    for parameter in (
+        model.in_proj.weight,
+        model.output_proj.weight,
+        model.geometry_log_rate,
+        model.associative_log_rate,
+        model.geometry_strength_logit,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("rank", "edits", "mask_name", "message"),
+    [
+        (64, 1, None, "requires r=128 and K=1"),
+        (128, 2, None, "requires r=128 and K=1"),
+        (128, 1, "valid", "does not yet support"),
+        (128, 1, "reset", "does not yet support"),
+    ],
+)
+def test_cuda_bf16_unsupported_native_profiles_fail_explicitly(
+    rank: int,
+    edits: int,
+    mask_name: str | None,
+    message: str,
+) -> None:
+    config = SolveDeltaConfig(
+        128,
+        1,
+        head_k_dim=rank,
+        head_v_dim=16,
+        num_edits=edits,
+        use_short_conv=False,
+    )
+    model = SolveDelta(config).cuda()
+    hidden = torch.zeros(
+        1, 2, 128, device="cuda", dtype=torch.bfloat16
+    )
+    kwargs = {}
+    if mask_name is not None:
+        kwargs[f"{mask_name}_mask"] = torch.ones(
+            1, 2, device="cuda", dtype=torch.bool
+        )
+    with pytest.raises(NotImplementedError, match=message):
+        model(hidden, **kwargs)

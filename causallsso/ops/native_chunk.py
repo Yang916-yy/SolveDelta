@@ -5,13 +5,19 @@ from pathlib import Path
 import torch
 from torch.autograd.function import once_differentiable
 
+from causallsso.ops.triton_geometry import (
+    _triton_geometry_chunk_scan_backward,
+    _triton_geometry_chunk_scan_forward,
+)
+from causallsso.reference import SolveDeltaState
+
 
 _CHUNK_SIZE = 32
 _RANK = 128
 _EDITS = 1
 _LOADED = False
 
-_INPUT_NAMES = (
+_GEOMETRY_INPUT_NAMES = (
     "u",
     "h",
     "geometry_log_decay",
@@ -19,9 +25,9 @@ _INPUT_NAMES = (
     "erase",
     "query",
     "geometry_strength",
-    "boundary_m",
-    "boundary_J",
-    "boundary_D",
+    "initial_m",
+    "initial_J",
+    "initial_D",
 )
 
 
@@ -34,12 +40,14 @@ def _library_candidates() -> tuple[Path, ...]:
 
 
 def _ops_registered() -> bool:
-    try:
-        torch.ops.causallsso.c32_frame_forward
-        torch.ops.causallsso.c32_frame_backward
-    except AttributeError:
-        return False
-    return True
+    required = (
+        "c32_frame_resident_forward",
+        "c32_frame_resident_action_backward",
+        "c32_frame_compact_pair",
+        "c32_frame_compact_coefficients",
+        "c32_frame_compact_leaf",
+    )
+    return all(hasattr(torch.ops.causallsso, name) for name in required)
 
 
 def _load_chunk_library() -> None:
@@ -57,8 +65,7 @@ def _load_chunk_library() -> None:
         torch.ops.load_library(str(path))
         if not _ops_registered():
             raise RuntimeError(
-                f"{path} does not register c32_frame_forward and "
-                "c32_frame_backward"
+                f"{path} does not register the resident C32 forward/reverse ABI"
             )
         _LOADED = True
         return
@@ -70,120 +77,75 @@ def _load_chunk_library() -> None:
     )
 
 
-def _validate_native_chunk_inputs(
-    u: torch.Tensor,
-    h: torch.Tensor,
-    geometry_log_decay: torch.Tensor,
-    key: torch.Tensor,
-    erase: torch.Tensor,
-    query: torch.Tensor,
-    geometry_strength: torch.Tensor,
-    boundary_m: torch.Tensor,
-    boundary_J: torch.Tensor,
-    boundary_D: torch.Tensor,
-) -> None:
-    inputs = (
-        u,
-        h,
-        geometry_log_decay,
-        key,
-        erase,
-        query,
-        geometry_strength,
-        boundary_m,
-        boundary_J,
-        boundary_D,
-    )
-    for name, tensor in zip(_INPUT_NAMES, inputs):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-
-    if u.ndim != 4:
-        raise ValueError("u must have shape [B,T,H,128]")
-    batch, length, heads, rank = u.shape
-    if batch < 1 or length < 1 or heads < 1:
-        raise ValueError("B, T, and H must be positive")
-    if rank != _RANK:
-        raise ValueError("the native chunk frame requires r=128")
-
-    chunks = (length + _CHUNK_SIZE - 1) // _CHUNK_SIZE
-    expected_shapes = {
-        "h": (batch, length, heads, rank),
-        "geometry_log_decay": (batch, length, heads),
-        "key": (batch, length, heads, _EDITS, rank),
-        "erase": (batch, length, heads, _EDITS, rank),
-        "query": (batch, length, heads, rank),
-        "geometry_strength": (heads,),
-        "boundary_m": (batch, heads, chunks),
-        "boundary_J": (batch, heads, chunks, rank, rank),
-        "boundary_D": (batch, heads, chunks, rank, rank),
-    }
-    named_inputs = dict(zip(_INPUT_NAMES, inputs))
-    for name, shape in expected_shapes.items():
-        if named_inputs[name].shape != shape:
-            raise ValueError(f"{name} must have shape {shape}")
-
-    bad_dtypes = [
-        f"{name}={tensor.dtype}"
-        for name, tensor in zip(_INPUT_NAMES, inputs)
-        if tensor.dtype != torch.float32
-    ]
-    if bad_dtypes:
-        raise TypeError(
-            "the native C32 geometry/frame ABI requires FP32 inputs; got "
-            + ", ".join(bad_dtypes)
-        )
-
-    device = u.device
-    if any(tensor.device != device for tensor in inputs):
-        raise ValueError("all native chunk frame inputs must share one device")
-    if device.type != "cuda":
-        raise ValueError("the native chunk frame requires CUDA tensors")
-
-
 def _validate_forward_outputs(
     outputs: object,
     inputs: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 11:
         raise RuntimeError(
-            "c32_frame_forward must return "
-            "(d,e,chi,lower_primal,lower_dual_scaled)"
+            "c32_frame_resident_forward must return 3 public tensors and "
+            "8 compact saved tensors"
         )
     tensors = tuple(outputs)
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
-        raise RuntimeError("c32_frame_forward returned a non-Tensor value")
+        raise RuntimeError("resident forward returned a non-Tensor value")
 
     u, _, _, key, _, query, _, _, _, _ = inputs
     batch, length, heads, rank = u.shape
-    expected_shapes = (
-        key.shape,
-        key.shape,
-        query.shape,
-        (batch, length, heads, _EDITS, rank),
-        (batch, length, heads, 2, rank),
+    chunks = (length + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+    panels = batch * heads * chunks
+    expected = (
+        ("d", key.shape, torch.bfloat16),
+        ("e", key.shape, torch.bfloat16),
+        ("chi", query.shape, torch.bfloat16),
+        ("lower_primal", u.shape, torch.float32),
+        (
+            "lower_dual_scaled",
+            (batch, length, heads, 2, rank),
+            torch.float32,
+        ),
+        ("write_fp32", u.shape, torch.float32),
+        (
+            "inverse_mass",
+            (batch, heads, chunks, _CHUNK_SIZE),
+            torch.float32,
+        ),
+        ("radial_scale", (panels, _CHUNK_SIZE, 4), torch.float32),
+        ("radial_q2", (panels, _CHUNK_SIZE, 4), torch.float32),
+        ("diagonal", (panels, _CHUNK_SIZE, rank), torch.float32),
+        ("alpha0", (panels,), torch.float32),
     )
-    names = (
-        "d",
-        "e",
-        "chi",
-        "lower_primal",
-        "lower_dual_scaled",
-    )
-    for name, tensor, shape in zip(names, tensors, expected_shapes):
+    for (name, shape, dtype), tensor in zip(expected, tensors):
         if tensor.shape != shape:
             raise RuntimeError(
-                f"c32_frame_forward returned {name} with shape "
+                f"resident forward returned {name} with shape "
                 f"{tuple(tensor.shape)}; expected {shape}"
             )
-        if tensor.dtype != torch.float32 or tensor.device != u.device:
+        if tensor.dtype != dtype or tensor.device != u.device:
             raise RuntimeError(
-                f"c32_frame_forward returned {name} outside the FP32 CUDA ABI"
+                f"resident forward returned {name} outside its dtype/device ABI"
             )
     return tensors
 
 
-def _validate_output_cotangent(
+def _output_cotangent(
+    name: str,
+    gradient: torch.Tensor | None,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    if gradient is None:
+        return torch.zeros_like(reference)
+    if gradient.shape != reference.shape:
+        raise RuntimeError(
+            f"{name} has shape {tuple(gradient.shape)}; "
+            f"expected {tuple(reference.shape)}"
+        )
+    if gradient.dtype != torch.bfloat16 or gradient.device != reference.device:
+        raise RuntimeError(f"{name} must match the BF16 resident output")
+    return gradient.contiguous()
+
+
+def _fp32_cotangent(
     name: str,
     gradient: torch.Tensor | None,
     reference: torch.Tensor,
@@ -196,36 +158,79 @@ def _validate_output_cotangent(
             f"expected {tuple(reference.shape)}"
         )
     if gradient.dtype != torch.float32 or gradient.device != reference.device:
-        raise RuntimeError(f"{name} must match the FP32 CUDA frame output")
+        raise RuntimeError(f"{name} must match the FP32 geometry state")
     return gradient.contiguous()
 
 
-def _validate_backward_outputs(
-    outputs: object,
-    inputs: tuple[torch.Tensor, ...],
+def _validate_native_geometry_inputs(
+    u: torch.Tensor,
+    h: torch.Tensor,
+    geometry_log_decay: torch.Tensor,
+    key: torch.Tensor,
+    erase: torch.Tensor,
+    query: torch.Tensor,
+    geometry_strength: torch.Tensor,
+    initial_m: torch.Tensor,
+    initial_J: torch.Tensor,
+    initial_D: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
-    if not isinstance(outputs, (tuple, list)) or len(outputs) != len(inputs):
-        raise RuntimeError(
-            "c32_frame_backward must return one gradient for each forward tensor "
-            "input"
-        )
-    gradients = tuple(outputs)
-    if not all(isinstance(gradient, torch.Tensor) for gradient in gradients):
-        raise RuntimeError("c32_frame_backward returned a non-Tensor value")
-    for name, gradient, reference in zip(_INPUT_NAMES, gradients, inputs):
-        if gradient.shape != reference.shape:
-            raise RuntimeError(
-                f"c32_frame_backward returned d{name} with shape "
-                f"{tuple(gradient.shape)}; expected {tuple(reference.shape)}"
-            )
-        if gradient.dtype != torch.float32 or gradient.device != reference.device:
-            raise RuntimeError(
-                f"c32_frame_backward returned d{name} outside the FP32 CUDA ABI"
-            )
-    return gradients
+    inputs = (
+        u,
+        h,
+        geometry_log_decay,
+        key,
+        erase,
+        query,
+        geometry_strength,
+        initial_m,
+        initial_J,
+        initial_D,
+    )
+    for name, tensor in zip(_GEOMETRY_INPUT_NAMES, inputs):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+    if u.ndim != 4:
+        raise ValueError("u must have shape [B,T,H,128]")
+    batch, length, heads, rank = u.shape
+    if min(batch, length, heads) < 1:
+        raise ValueError("B, T, and H must be positive")
+    if rank != _RANK:
+        raise ValueError("the native geometry/frame requires r=128")
+    expected_shapes = {
+        "h": u.shape,
+        "geometry_log_decay": (batch, length, heads),
+        "key": (batch, length, heads, _EDITS, rank),
+        "erase": (batch, length, heads, _EDITS, rank),
+        "query": u.shape,
+        "geometry_strength": (heads,),
+        "initial_m": (batch, heads),
+        "initial_J": (batch, heads, rank, rank),
+        "initial_D": (batch, heads, rank, rank),
+    }
+    named_inputs = dict(zip(_GEOMETRY_INPUT_NAMES, inputs))
+    for name, shape in expected_shapes.items():
+        if named_inputs[name].shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+    for name in ("u", "h", "key", "erase", "query"):
+        if named_inputs[name].dtype != torch.bfloat16:
+            raise TypeError(f"{name} must be BF16")
+    for name in (
+        "geometry_log_decay",
+        "geometry_strength",
+        "initial_m",
+        "initial_J",
+        "initial_D",
+    ):
+        if named_inputs[name].dtype != torch.float32:
+            raise TypeError(f"{name} must be FP32")
+    if u.device.type != "cuda":
+        raise ValueError("the native geometry/frame requires CUDA tensors")
+    if any(tensor.device != u.device for tensor in inputs):
+        raise ValueError("all native geometry/frame tensors must share one device")
+    return tuple(tensor.contiguous() for tensor in inputs)
 
 
-class _NativeChunkFrame(torch.autograd.Function):
+class _NativeGeometryFrame(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -236,11 +241,125 @@ class _NativeChunkFrame(torch.autograd.Function):
         erase: torch.Tensor,
         query: torch.Tensor,
         geometry_strength: torch.Tensor,
-        boundary_m: torch.Tensor,
-        boundary_J: torch.Tensor,
-        boundary_D: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _validate_native_chunk_inputs(
+        initial_m: torch.Tensor,
+        initial_J: torch.Tensor,
+        initial_D: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        inputs = _validate_native_geometry_inputs(
+            u,
+            h,
+            geometry_log_decay,
+            key,
+            erase,
+            query,
+            geometry_strength,
+            initial_m,
+            initial_J,
+            initial_D,
+        )
+        (
+            u,
+            h,
+            geometry_log_decay,
+            key,
+            erase,
+            query,
+            geometry_strength,
+            initial_m,
+            initial_J,
+            initial_D,
+        ) = inputs
+        empty_s = torch.empty(0, device=u.device, dtype=torch.float32)
+        boundary, final = _triton_geometry_chunk_scan_forward(
+            u,
+            h,
+            geometry_log_decay,
+            initial_state=SolveDeltaState(
+                initial_m,
+                initial_J,
+                initial_D,
+                empty_s,
+            ),
+            chunk_size=_CHUNK_SIZE,
+            input_precision="ieee",
+        )
+        frame_inputs = (
+            u,
+            h,
+            geometry_log_decay,
+            key,
+            erase,
+            query,
+            geometry_strength,
+            boundary.m,
+            boundary.J,
+            boundary.D,
+        )
+        _load_chunk_library()
+        frame_outputs = _validate_forward_outputs(
+            torch.ops.causallsso.c32_frame_resident_forward(*frame_inputs),
+            frame_inputs,
+        )
+        ctx.save_for_backward(
+            *inputs,
+            boundary.m,
+            boundary.J,
+            boundary.D,
+            *frame_outputs[3:],
+        )
+        ctx.set_materialize_grads(False)
+        return (
+            *frame_outputs[:3],
+            final.m,
+            final.J,
+            final.D,
+        )
+
+    @staticmethod
+    @once_differentiable
+    def backward(
+        ctx,
+        grad_d,
+        grad_e,
+        grad_chi,
+        grad_final_m,
+        grad_final_J,
+        grad_final_D,
+    ) -> tuple[torch.Tensor | None, ...]:
+        from causallsso.ops.resident_frame import resident_c32_frame_backward
+
+        saved = ctx.saved_tensors
+        inputs = saved[: len(_GEOMETRY_INPUT_NAMES)]
+        boundary_m, boundary_J, boundary_D = saved[
+            len(_GEOMETRY_INPUT_NAMES) : len(_GEOMETRY_INPUT_NAMES) + 3
+        ]
+        auxiliaries = saved[len(_GEOMETRY_INPUT_NAMES) + 3 :]
+        (
+            u,
+            h,
+            geometry_log_decay,
+            key,
+            erase,
+            query,
+            geometry_strength,
+            initial_m,
+            initial_J,
+            initial_D,
+        ) = inputs
+        grad_d = _output_cotangent("grad_d", grad_d, key)
+        grad_e = _output_cotangent("grad_e", grad_e, key)
+        grad_chi = _output_cotangent("grad_chi", grad_chi, query)
+        grad_final_m = _fp32_cotangent(
+            "grad_final_m", grad_final_m, initial_m
+        )
+        grad_final_J = _fp32_cotangent(
+            "grad_final_J", grad_final_J, initial_J
+        )
+        grad_final_D = _fp32_cotangent(
+            "grad_final_D", grad_final_D, initial_D
+        )
+
+        frame_gradients = resident_c32_frame_backward(
             u,
             h,
             geometry_log_decay,
@@ -251,59 +370,38 @@ class _NativeChunkFrame(torch.autograd.Function):
             boundary_m,
             boundary_J,
             boundary_D,
+            *auxiliaries,
+            grad_d,
+            grad_e,
+            grad_chi,
+            retain_fp32_vector_partials=True,
         )
-        _load_chunk_library()
-
-        inputs = tuple(
-            tensor.contiguous()
-            for tensor in (
-                u,
-                h,
-                geometry_log_decay,
-                key,
-                erase,
-                query,
-                geometry_strength,
-                boundary_m,
-                boundary_J,
-                boundary_D,
-            )
+        scan_gradients = _triton_geometry_chunk_scan_backward(
+            u,
+            h,
+            geometry_log_decay,
+            boundary_m,
+            boundary_J,
+            boundary_D,
+            frame_gradients[7],
+            frame_gradients[8],
+            frame_gradients[9],
+            grad_final_m,
+            grad_final_J,
+            grad_final_D,
+            _CHUNK_SIZE,
         )
-        outputs = _validate_forward_outputs(
-            torch.ops.causallsso.c32_frame_forward(*inputs),
-            inputs,
-        )
-        d, e, chi, lower_primal, lower_dual_scaled = outputs
-        ctx.save_for_backward(
-            *inputs,
-            lower_primal,
-            lower_dual_scaled,
-            d,
-        )
-        ctx.set_materialize_grads(False)
-        return d, e, chi
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, grad_d, grad_e, grad_chi):
-        saved = ctx.saved_tensors
-        inputs = saved[: len(_INPUT_NAMES)]
-        lower_primal, lower_dual_scaled, d = saved[len(_INPUT_NAMES) :]
-
-        grad_d = _validate_output_cotangent("grad_d", grad_d, d)
-        grad_e = _validate_output_cotangent("grad_e", grad_e, inputs[3])
-        grad_chi = _validate_output_cotangent("grad_chi", grad_chi, inputs[5])
-        gradients = _validate_backward_outputs(
-            torch.ops.causallsso.c32_frame_backward(
-                *inputs,
-                lower_primal,
-                lower_dual_scaled,
-                d,
-                grad_d,
-                grad_e,
-                grad_chi,
-            ),
-            inputs,
+        gradients = (
+            (frame_gradients[0] + scan_gradients[0]).to(u.dtype),
+            (frame_gradients[1] + scan_gradients[1]).to(h.dtype),
+            frame_gradients[2] + scan_gradients[2],
+            frame_gradients[3],
+            frame_gradients[4],
+            frame_gradients[5],
+            frame_gradients[6],
+            scan_gradients[3],
+            scan_gradients[4],
+            scan_gradients[5],
         )
         return tuple(
             gradient if needed else None
@@ -311,7 +409,7 @@ class _NativeChunkFrame(torch.autograd.Function):
         )
 
 
-def native_chunk_frame(
+def native_geometry_frame(
     u: torch.Tensor,
     h: torch.Tensor,
     geometry_log_decay: torch.Tensor,
@@ -319,12 +417,28 @@ def native_chunk_frame(
     erase: torch.Tensor,
     query: torch.Tensor,
     geometry_strength: torch.Tensor,
-    boundary_m: torch.Tensor,
-    boundary_J: torch.Tensor,
-    boundary_D: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the exact CUDA C32, K=1, r=128 frame specialization."""
-    return _NativeChunkFrame.apply(
+    *,
+    initial_state: SolveDeltaState | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, SolveDeltaState]:
+    """Run the fixed C32 geometry scan and resident frame as one VJP owner."""
+    if u.ndim != 4:
+        raise ValueError("u must have shape [B,T,H,128]")
+    batch, _, heads, rank = u.shape
+    if initial_state is None:
+        initial_m = torch.zeros(
+            batch, heads, device=u.device, dtype=torch.float32
+        )
+        initial_J = torch.zeros(
+            batch, heads, rank, rank, device=u.device, dtype=torch.float32
+        )
+        initial_D = torch.zeros_like(initial_J)
+    else:
+        if not isinstance(initial_state, SolveDeltaState):
+            raise TypeError("initial_state must be a SolveDeltaState or None")
+        initial_m = initial_state.m
+        initial_J = initial_state.J
+        initial_D = initial_state.D
+    outputs = _NativeGeometryFrame.apply(
         u,
         h,
         geometry_log_decay,
@@ -332,10 +446,13 @@ def native_chunk_frame(
         erase,
         query,
         geometry_strength,
-        boundary_m,
-        boundary_J,
-        boundary_D,
+        initial_m,
+        initial_J,
+        initial_D,
     )
+    empty_s = torch.empty(0, device=u.device, dtype=torch.float32)
+    final = SolveDeltaState(outputs[3], outputs[4], outputs[5], empty_s)
+    return outputs[0], outputs[1], outputs[2], final
 
 
-__all__ = ["native_chunk_frame"]
+__all__ = ["native_geometry_frame"]

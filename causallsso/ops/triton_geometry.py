@@ -525,9 +525,9 @@ def _triton_geometry_chunk_scan_forward(
 ) -> tuple[SolveDeltaState, SolveDeltaState]:
     """Compute chunk-start and final geometry states without tokenwise matrices.
 
-    ``u`` must already be normalized. Boundary ``S`` tensors are empty because
-    this operation owns only ``m,J,D``. The function is currently a forward
-    kernel used to validate the geometry schedule before fused backward.
+    ``u`` must already be normalized. Vector operands ``u,h`` use FP32, BF16,
+    or FP16 while log-decay and all boundary states are FP32. Boundary ``S``
+    tensors are empty because this operation owns only ``m,J,D``.
     """
     if not torch.cuda.is_available() or u.device.type != "cuda":
         raise ValueError("Triton geometry scan requires CUDA tensors")
@@ -537,8 +537,10 @@ def _triton_geometry_chunk_scan_forward(
         raise ValueError("geometry_log_decay must have shape [B, T, H]")
     if u.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise TypeError("Triton geometry scan supports FP32, BF16, or FP16 inputs")
-    if h.dtype != u.dtype or geometry_log_decay.dtype != u.dtype:
-        raise TypeError("u, h, and geometry_log_decay must share one dtype")
+    if h.dtype != u.dtype:
+        raise TypeError("u and h must share one vector dtype")
+    if geometry_log_decay.dtype != torch.float32:
+        raise TypeError("geometry_log_decay must be FP32")
     if chunk_size not in (16, 32, 64):
         raise ValueError("Triton geometry chunk_size must be one of 16, 32, 64")
     if input_precision not in ("ieee", "tf32"):
@@ -602,10 +604,19 @@ def _triton_geometry_chunk_scan_forward(
         initial_J = torch.zeros(batch, heads, rank, rank, device=u.device, dtype=state_dtype)
         initial_D = torch.zeros_like(initial_J)
     else:
-        initial_m = initial_state.m.float().contiguous()
-        initial_J = initial_state.J.float().contiguous()
-        initial_D = initial_state.D.float().contiguous()
-        if initial_m.shape != (batch, heads) or initial_J.shape != (batch, heads, rank, rank) or initial_D.shape != initial_J.shape:
+        for name, tensor in zip(SolveDeltaState._fields, initial_state):
+            if tensor.device != u.device:
+                raise ValueError(f"initial_state.{name} must share the input device")
+            if tensor.dtype != state_dtype:
+                raise TypeError(f"initial_state.{name} must be FP32")
+        initial_m = initial_state.m.contiguous()
+        initial_J = initial_state.J.contiguous()
+        initial_D = initial_state.D.contiguous()
+        if (
+            initial_m.shape != (batch, heads)
+            or initial_J.shape != (batch, heads, rank, rank)
+            or initial_D.shape != initial_J.shape
+        ):
             raise ValueError("initial geometry state shapes do not match inputs")
 
     boundary_m = torch.empty(batch, heads, chunks, device=u.device, dtype=state_dtype)
@@ -658,7 +669,7 @@ def _triton_geometry_chunk_scan_backward(
     grad_final_D: torch.Tensor,
     chunk_size: int,
 ) -> tuple[torch.Tensor, ...]:
-    """Exact affine-scan adjoint for geometry boundaries and chunk summaries."""
+    """Return FP32 affine-scan partials for a surrounding composed backward."""
     batch, length, heads, rank = u.shape
     chunks = triton.cdiv(length, chunk_size)
     panels = batch * heads * chunks
@@ -747,8 +758,11 @@ def _triton_geometry_chunk_scan_backward(
         num_stages=1,
     )
 
-    grad_u = torch.empty_like(u)
-    grad_h = torch.empty_like(h)
+    # ``u`` and ``h`` may be BF16 contraction operands. Keep their scan
+    # partials in FP32 so a composed owner can add frame partials before the
+    # single activation-gradient cast at its outer boundary.
+    grad_u = torch.empty(u.shape, device=u.device, dtype=torch.float32)
+    grad_h = torch.empty(h.shape, device=h.device, dtype=torch.float32)
     row_blocks = rank // 32
     grad_weight_partial = torch.empty(
         panels,
@@ -784,7 +798,11 @@ def _triton_geometry_chunk_scan_backward(
         num_warps=8,
         num_stages=1,
     )
-    grad_log_decay = torch.empty_like(geometry_log_decay)
+    grad_log_decay = torch.empty(
+        geometry_log_decay.shape,
+        device=geometry_log_decay.device,
+        dtype=torch.float32,
+    )
     _chunk_summary_scalar_vjp_kernel[(panels,)](
         weights,
         chunk_lambda,
@@ -838,7 +856,7 @@ class _TritonGeometryChunkScan(torch.autograd.Function):
             initial_m,
             initial_J,
             initial_D,
-            torch.empty(0, device=u.device, dtype=u.dtype),
+            torch.empty(0, device=u.device, dtype=torch.float32),
         )
         boundary, final = _triton_geometry_chunk_scan_forward(
             u,
@@ -875,7 +893,17 @@ class _TritonGeometryChunkScan(torch.autograd.Function):
             *(gradient.contiguous() for gradient in grad_outputs),
             ctx.chunk_size,
         )
-        return (*gradients, None, None)
+        # This standalone autograd boundary owns the public activation dtype.
+        # A fused geometry/frame owner calls the lower-level adjoint directly
+        # and therefore receives the unrounded FP32 partials above.
+        grad_u, grad_h, *state_gradients = gradients
+        return (
+            grad_u.to(u.dtype),
+            grad_h.to(h.dtype),
+            *state_gradients,
+            None,
+            None,
+        )
 
 
 def triton_geometry_chunk_scan(
@@ -887,7 +915,7 @@ def triton_geometry_chunk_scan(
     chunk_size: int = 64,
     input_precision: Literal["ieee", "tf32"] = "ieee",
 ) -> tuple[SolveDeltaState, SolveDeltaState]:
-    """Autograd-capable chunk-boundary geometry scan."""
+    """Autograd-capable mixed-precision chunk-boundary geometry scan."""
     if u.ndim != 4:
         raise ValueError("u must have shape [B,T,H,r]")
     batch, _, heads, rank = u.shape
@@ -896,9 +924,14 @@ def triton_geometry_chunk_scan(
         initial_J = torch.zeros(batch, heads, rank, rank, device=u.device, dtype=torch.float32)
         initial_D = torch.zeros_like(initial_J)
     else:
-        initial_m = initial_state.m.float()
-        initial_J = initial_state.J.float()
-        initial_D = initial_state.D.float()
+        for name, tensor in zip(SolveDeltaState._fields, initial_state):
+            if tensor.device != u.device:
+                raise ValueError(f"initial_state.{name} must share the input device")
+            if tensor.dtype != torch.float32:
+                raise TypeError(f"initial_state.{name} must be FP32")
+        initial_m = initial_state.m
+        initial_J = initial_state.J
+        initial_D = initial_state.D
     outputs = _TritonGeometryChunkScan.apply(
         u,
         h,

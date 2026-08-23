@@ -107,15 +107,39 @@ Check both unit-triangular solve residuals, finite forward values, and finite in
 gradients over the declared training envelope. The pairing result is an
 eigenvalue certificate; tests must not relabel it as a Euclidean norm bound.
 
-## Native precision contract
+## Native BF16/FP32 precision contract
 
-The FP64 token recurrence is the sole numerical oracle. To compare a runtime
-dtype fairly, generate deterministic master inputs, quantize every runtime
-input and parameter once to that dtype, and promote those exact quantized
-values to FP64 for the oracle. The native path receives the quantized values.
-This isolates kernel arithmetic from input quantization. Gate formulas that the
-model contract explicitly evaluates in FP32 are evaluated from the same
-quantized logits in FP32 on both paths before the oracle promotes their results.
+The first advertised training path is mixed precision, not an FP32 kernel with
+a low-precision output wrapper:
+
+| Quantity | Required native representation |
+|---|---|
+| projected activations; conv4 inputs/outputs; normalized `u,q,k`; edit values and bounded erase/write operands | BF16 |
+| Tensor Core matrix operands, including a factor tile when an action packs one | BF16, packed once at its declared contraction boundary |
+| dot/GEMM/TRSM partials and backward partials | FP32 accumulation; reduced-precision accumulation is forbidden |
+| log-decay, `exp`/`softplus`/`sigmoid`, norm and radial reductions, geometry strength, and sensitive scalar reverse | FP32 |
+| continuation and chunk-boundary `m,J,D,S` | FP32, with no BF16 round trip between chunks or recurrent calls |
+| public token activations, `d,e,chi`, and returned activation gradients | BF16; gradients are cast only after their FP32 reduction is complete |
+
+The FP64 token recurrence remains the sole mathematical oracle. Generate
+deterministic master tensors, round every BF16 runtime operand once, promote
+those exact BF16 values to FP64, and run the oracle at that point. FP32-defined
+preprocessing is evaluated from the same quantized logits or vectors on both
+paths; the resulting FP32 values are promoted without another BF16 rounding.
+The native path receives the same BF16 operands and FP32 scalars/states. Apply
+the same rule to upstream cotangents: public activation cotangents are rounded
+once to BF16 and state/scalar cotangents remain FP32. The VJP target is the
+continuous FP64 operator at the quantized point, not the derivative of the
+master-to-BF16 rounding operation.
+
+Normalization is an explicit mixed boundary: reduce the squared norm in FP32
+and round the normalized vector once to BF16. Gate nonlinearities and
+log-decay remain FP32 even though their projected logits came from BF16 model
+activations. If a Tensor Core action packs LDU factors to BF16, primal and
+transpose-dual actions must consume exactly the same packed bits. A separate
+same-packed-factor oracle isolates action arithmetic from factor representation
+error. Rounding `J`, `D`, or `S` at a chunk boundary would instead create a
+split-dependent rounded recurrence and is outside this contract.
 
 For any reference tensor `x` and native tensor `x_hat`, report
 
@@ -127,24 +151,70 @@ For any reference tensor `x` and native tensor `x_hat`, report
 a_\infty(x,\widehat x)=\|\widehat x-x\|_\infty.
 \]
 
-A tensor passes when `a_inf <= 1e-6` or its declared `rho` ceiling passes.
+A FP32 internal tensor passes when `a_inf <= 1e-6` or its declared `rho`
+ceiling passes. A BF16 public or packed tensor uses `a_inf <= 2e-4` instead.
 The absolute branch handles exact or near-zero references; it is not added to
 the relative allowance. NaN or infinity always fails. Tests must log both
 metrics even when the absolute branch passes. No warning-only gradient class,
-CI relaxation, sequence-length multiplier, or architecture-specific tolerance
-is allowed.
+CI relaxation, sequence-length multiplier, cancellation multiplier, or
+architecture-specific tolerance is allowed.
 
-The pure FP64 reference, its algebraic reductions, and equivalent unfused
-reference expressions use `rtol=1e-10, atol=1e-12`. The optimized FP32
-geometry adapter has the following stricter internal budgets:
+The pure FP64 reference, algebraic reductions, and equivalent unfused reference
+expressions use `rtol=1e-10, atol=1e-12`. For a single contraction with the
+same packed operands define
 
-| Boundary, always against FP64 | Forward `rho` | Backward `rho` | Additional gate |
+\[
+\tau(A,B,\widehat C)=
+\frac{\|\widehat C-AB\|_F}
+{\|A\|_F\|B\|_F+10^{-12}}.
+\]
+
+The mixed implementation must pass all of these internal budgets before the
+looser composed-layer budget is considered:
+
+| Boundary | Forward ceiling | Backward ceiling | Additional gate |
 |---|---:|---:|---|
-| Triton chunk-boundary `m,J,D,H,R` | `2e-4` | `5e-4` | every boundary, not only the final state |
-| bounded chart coordinates and generated LDU factors | `2e-4` | `1e-3` | analytic bounds must also pass |
-| MathDx primal triangular/complete solve, given the same FP32 factors | `5e-5` | `2e-4` | normalized residual `eta <= 2e-5` for each triangular solve |
-| direct dual products, given the same FP32 factors | `5e-5` | `2e-4` | compare each packed right-hand side separately |
-| composed `d,e,chi` from prefix inputs | `5e-4` | `1e-3` | normalized pairing drift `pi <= 5e-5` |
+| one resident BF16-operand/FP32-accumulated tile result against FP64 of the same packed operands | `tau <= 2e-4` | `tau <= 2e-4` | measure before any BF16 output store; Tensor Core and FP32 accumulator modes must be explicit where claimed |
+| resident FP32 fixed-tree/twofold long triangular reduction of the same operands | `tau <= 5e-4` | `tau <= 5e-4` | deterministic order; no data-dependent path |
+| FP32 chunk-boundary `m,J,D,H,R` against the quantized-input FP64 oracle | `rho <= 5e-3` | `rho <= 5e-3` | every boundary and final state; initial-state VJP additionally `rho <= 5e-4` |
+| FP32 radial scalars and pre-pack chart, given the same FP32 moments | `rho <= 1e-3` | `rho <= 3e-3` | analytic chart bounds and nonnegative reconstructed norm must pass |
+| BF16 packed factors against the exact FP64 chart | `rho <= 6e-3` | `rho <= 1e-2` | identity, strict masks, and unit diagonal remain exact |
+| FP32-accumulated action, given the same BF16 factors and BF16 RHS | `rho <= 5e-3` | `rho <= 1e-2` | each RHS separately; every triangular `eta <= 2e-5` |
+| composed BF16 `d,e,chi` from prefix inputs | `rho <= 6e-3` | use the end-to-end VJP classes below | pre-cast `pi <= 5e-4`; BF16 `pi <= 8e-3` |
+
+If the action packs factor coordinates to BF16, round-to-nearest with
+`u_b=2^-8` gives the certified packed bounds
+
+\[
+\|N_H^\pm\|_F,\|N_R^\pm\|_F
+\le (1+u_b)/8=0.12548828125,
+\qquad
+\|N^\pm\|_F\le0.2509765625,
+\]
+
+and diagonal entries in `[0.7757586, 1.2890411]`; the resulting declared
+`cond_2(M)` ceiling is `4.635`. A frame that keeps factors FP32 retains the
+exact `1/8`, `1/4`, and original condition bounds. Both forms keep the identity
+point exact.
+
+The geometry row is calibrated for the actual Tensor Core scan rather than an
+ideal FP32 outer product. On the local SM120 GPU, BF16 operands with FP32
+boundaries gave about `0.7e-3--1.46e-3` `J` error and
+`1.97e-3--2.32e-3` `D` error for `T=130,1024,8192`; BF16 leaf VJPs were about
+`1.54e-3--1.67e-3`, while FP32 initial-state VJPs stayed below `8.1e-7`.
+A mixed-frame proxy with FP32 chart construction, one BF16 factor pack, and
+FP32 action accumulation produced factor/action error below `1.9e-3`, raw VJP
+error below `3.0e-3`, and simulated BF16-leaf VJP error below `5.1e-3` at
+`r=128`. These probes justified the frozen internal orders but do not
+substitute for the selected resident-operator tests.
+
+The standalone FP32 MathDx oracle retains its independent tighter budgets:
+
+| Exact-oracle boundary, given the same FP32 factors | Forward `rho` | Backward `rho` | Additional gate |
+|---|---:|---:|---|
+| MathDx primal triangular/complete solve | `5e-5` | `2e-4` | normalized residual `eta <= 2e-5` for each triangular solve |
+| direct dual products | `5e-5` | `2e-4` | compare each packed right-hand side separately |
+| composed FP32 `d,e,chi` | `5e-4` | `1e-3` | normalized pairing drift `pi <= 5e-5` |
 
 The standalone exact MathDx oracle validates both `K=1` and `K=2`. Its current
 device-library specialization has `nrhs=2`; K1 pads the second primal RHS with
@@ -159,22 +229,67 @@ FP32 factorwise execution against FP64 produced about `1.0e-7` primal and
 supports the order of the budgets but does not validate MathDx; the actual
 custom operator must pass them independently.
 
-The chunk-owned frame path must be checked before the FLA exterior. It must
-remain finite without a norm clamp for independent `2^12` boundary/local
-cancellation in both `J` and `D`, including an ordinary asymmetric tail. It
-must preserve valid tokens when affine coefficients underflow to zero, emit
-exact identity-chart outputs for structurally invalid tail slots, and retain
-the valid diagonal auxiliaries required by the strength VJP at identity. Random
-and cancellation chart coordinates use the `2e-4` forward ceiling in the table;
-NaN, a negative reconstructed norm, or inferring validity from an underflowed
-coefficient is an unconditional failure.
+The chunk-owned frame path must be checked before the FLA exterior. Deep
+cancellation remains a production requirement because BF16 products can carry
+more residual bits than one BF16 input. For example, the exactly representable
+BF16 pair `(0.6953125, 0.71875)` has product
+`0.499755859375 = 0.5 - 2^-12`. Combining that local product with the FP32
+boundary entry `-0.5` gives a real post-quantization cancellation ratio of
+`4095`; it is not a residual that disappeared when inputs were rounded.
+
+For every cancellation fixture, first quantize the runtime operands, then
+promote them and recompute
+
+\[
+\kappa=
+\frac{|\alpha|\|B\|_F+\sum_s |w_s|\|L_s\|_F}
+{\|\alpha B+\sum_s w_sL_s\|_F+10^{-30}}.
+\]
+
+Only then assign it to one of the fixed bins `exact zero`, `[1,16]`,
+`[2^7,2^8]`, or `[2^11,2^12]`. Cover `J` and `D`, lower and upper coordinates,
+and an ordinary asymmetric tail. The deepest bin uses `rho <= 2e-3` for the
+radial forward and `rho <= 5e-3` for its VJP, without multiplying either bound
+by `kappa`; exact zero must emit an exact zero radial component. A legal PSD
+`J` boundary is required for the production witness. The former
+`4096 + (-4096 + 0.01)` FP32 fixture is not a BF16 gate because `0.01` is lost
+before execution.
+
+The frame must remain finite without a norm clamp, preserve valid tokens when
+affine coefficients underflow to zero, emit exact identity-chart outputs for
+structurally invalid tail slots, and retain the valid diagonal auxiliaries
+required by the strength VJP at identity. A negative reconstructed squared
+norm, NaN, infinity, a data-dependent precision fallback, or inferring
+validity from an underflowed coefficient is an unconditional failure. If a
+Tensor Core tile consumes a large FP32 boundary contribution, it must keep the
+sensitive residual in FP32 or use a fixed high/low representation; directly
+rounding that boundary to BF16 is not allowed.
+
+The shared geometry strength ties six chart-channel cotangents by the fixed
+linear map `g=1^T g_6`. In the declared deepest-cancellation fixtures only,
+report
+
+\[
+\rho_{\mathrm{tie}}
+=\frac{|\widehat g-\mathbf 1^Tg_6|}
+{\sqrt{6}\,\|g_6\|_2+10^{-8}}
+\le 2.5\times10^{-2}.
+\]
+
+The denominator is the induced scale `||1||_2 ||g_6||_2` of the six-to-one
+tying map. It is fixed by parameter sharing, not multiplied by the observed
+cancellation ratio. The fixture passes when `a_inf <= 1e-6` or the displayed
+`rho_tie` ceiling passes; the absolute branch is reserved for a near-zero
+six-channel reference norm and is not added to the relative allowance.
+All ordinary geometry-strength fixtures continue to use the standard
+total-gradient metric and ceiling. An FP64 final scalar addition does not
+resolve the observed discrepancy and is not a substitute for this test.
 
 No standalone polynomial or truncated inverse is a validation boundary. The
-new frame forward and VJP are compared directly with the FP64 recurrence and
-the optional exact MathDx factor-action oracle. Every component gradient must
-satisfy the `1e-3` internal backward ceiling, including legal `2^12`
-cancellation. A proposed approximation remains an experiment until its
-algebraic error and empirical envelope are separately accepted.
+frame forward and VJP are compared directly with the quantized-input FP64
+recurrence and the optional exact MathDx factor-action oracle. A proposed
+approximation remains an experiment until its algebraic error and empirical
+envelope are separately accepted.
 
 Here
 
@@ -192,14 +307,11 @@ and for every primal/dual pair
 {\|e\|_2\|d\|_2+\|\bar b\|_2\|a\|_2+10^{-12}}.
 \]
 
-The complete Triton--CUDA--FLA layer then uses these end-to-end ceilings:
+The complete Triton--CUDA--FLA layer has one advertised runtime row:
 
-| Advertised runtime path | outputs, every chunk state, final state | `q,k,v,S0,Cq0,Ck0,Cv0` gradients | `u,h,J0,D0` and gate/geometry parameter gradients |
+| Advertised runtime path | BF16 outputs and FP32 `S` state | `q,k,v,S0,Cq0,Ck0,Cv0` gradients | `u,h,J0,D0` and gate/geometry parameter gradients |
 |---|---:|---:|---:|
-| FP32 | `2e-3` | `2e-3` | `5e-3` |
-| FP16 outer, dense/fixed length | `5e-3` | `1e-2` | `2e-2` |
-| BF16 outer, dense/fixed length | `6e-3` | `1.5e-2` | `2.5e-2` |
-| FP16 or BF16 outer, packed/varlen | `6e-3` | `1.5e-2` | `2.5e-2` |
+| native `r=128,K=1,C=32`, BF16 operands/factors and FP32 accumulation/state/scalars | `6e-3` | `1.5e-2` | `2.5e-2` |
 
 `S0` includes the associative initial state. `J0,D0` include any exposed
 geometry continuation state. `Cq0,Ck0,Cv0` are the raw projected-input conv4
@@ -207,42 +319,45 @@ caches; their final-state cotangents must reach both the initial caches and the
 four contributing projected tokens. All gate logits and static gate parameters are in
 the last gradient class. Geometry boundary states must additionally satisfy
 their stricter internal row above; the end-to-end state allowance cannot hide
-a failed scan or solve.
+a failed scan, chart, or action. FP32 and FP16 execution may remain reference
+diagnostics, but they are not alternate advertised training contracts.
 
-The FP32 layer ceiling was calibrated against the installed mature GDN2 outer
-kernel on the local SM120 GPU. For `B=1,T=128,H=2,d_k=d_v=64`, its chunk path
-against the same quantized inputs promoted through its FP64 naive recurrence
-produced about `1.03e-3` output and `1.14e-3`
-final-state `rho`; main vector gradients were about `0.70e-3--1.18e-3` and the
-largest erase-gate gradient was about `2.47e-3`. The corresponding BF16 probe
-gave about `3.19e-3` output and `2.23e-3` state `rho`, with gradients below
-`4.5e-3`. The `2e-3` FP32 state/output ceiling therefore admits the mature
-Delta exterior on this hardware while remaining tighter than GDN2's general
-`5e-3` ceiling. It is not evidence that SolveDelta itself passes.
+The end-to-end row was calibrated against both the installed mature GDN2 BF16
+path and an earlier SolveDelta staging composition on the local SM120 GPU.
+For `B=1,T=128,H=2,d_k=d_v=64`, GDN2 against its quantized-input FP64 naive
+recurrence produced about `3.19e-3` output and `2.23e-3` final-state `rho`, with
+gradients below `4.5e-3`. The earlier SolveDelta path with an FP32 frame and WY
+exterior rounded to BF16 produced about `5.34e-3` output, `4.45e-3` final-state,
+`1.25e-2` main-vector VJP, and `2.25e-2` geometry-strength VJP in the frozen
+cross-chunk probes. Those historical measurements justify the envelope but do
+not validate the current `r=128` resident path or grant a further tolerance
+increase.
 
-Use the same random upstream cotangents for FP64 and native paths and compare
+Use the same random upstream cotangents for FP64 and optimized paths and compare
 vector-Jacobian products, including losses on both token outputs and returned
-states. Required cases include `K=1,2,4`; identity and active geometry; weak,
-ordinary, and near-boundary gates; zero and nonzero initial states; chunk sizes
-one, 64, irregular tails, and full sequence; packed resets; `t<r`, `t=r`, and
-`t>r`; convolution enabled and structurally disabled; nonzero initial conv
-caches with losses on returned caches; and the longest declared training/decode envelope. Tolerances do not
+states. The reference/unfused contract covers `K=1,2,4`, non-128 widths, masks,
+resets, and arbitrary recurrent splits. The current native gate covers only
+`r=128,K=1,C=32`, with identity and active geometry; weak, ordinary, and
+near-boundary gates; zero and nonzero initial states; lengths straddling 32 and
+multiple chunks; `t<r`, `t=r`, and `t>r`; convolution enabled and structurally
+disabled; and nonzero initial convolution caches with losses on returned
+caches. Native masks, resets, packed sequences, other edit counts, and other
+ranks must fail explicitly until implemented and validated. Tolerances do not
 grow with `T`.
 
-These numbers are release ceilings, not expected errors. They may be tightened
-after implementation evidence. Loosening one requires a reproduced normal-
-envelope failure, localization to a named boundary, comparison with the GDN2
-baseline on the same hardware/dtype, and an explicit contract revision; a
-performance gain alone is insufficient.
+The first declared long-prefix envelope is training at
+`T in {1,31,32,33,1024,8192}` and no-grad recurrent decode through `T=65536`.
+It covers `lambda=1`, effective memories of 32, 512, and 4096 tokens,
+alternating-sign `D`, repeated and orthogonal `u`, log-decays `-110` and
+`-1000`, irregular resets, and arbitrary recurrent splits. Compare every raw
+FP32 boundary `m,J,D,S` and normalized `H,R`, not only the final state. The
+ceilings do not grow with length.
 
-The BF16 row is the one explicit revision made during backward bring-up. On a
-deterministic cross-chunk `T=65,r=128` VJP, BF16 produced approximately
-`5.34e-3` output and `4.45e-3` final-state `rho`, with the largest input
-main-vector gradient near `1.25e-2`; a second nonzero-initial-state case placed
-the scalar geometry-strength gradient at `2.25e-2`. FP16 produced about
-`8.49e-4`, `6.78e-4`, and `3.20e-3`, respectively. FP16 is therefore the
-selected outer dtype. BF16 is retained under its separately stated ceiling
-rather than consuming the FP16 budget.
+These numbers are release ceilings, not expected errors. They may be tightened
+after implementation evidence. Loosening one requires a reproduced
+normal-envelope failure, localization to a named boundary, comparison with the
+GDN2 baseline on the same hardware and BF16/FP32 contract, and an explicit
+contract revision; a performance gain alone is insufficient.
 
 ## Phase 1: exact Delta-family reductions
 
@@ -343,22 +458,25 @@ order fails this gate.
 
 ## Phase 4: Triton--CUDA--FLA backend
 
-Validate the exact MathDx block-TRSM oracle, the chunk-owned CUDA frame forward
-and VJP, and their Triton scan/FLA-WY exterior against explicit dense `M` solves
-and the complete token recurrence over the normal envelope.
+Validate the exact MathDx block-TRSM oracle, the resident chunk-owned CUDA frame
+forward and compact reverse, and their Triton scan/direct-`e` FLA-WY exterior
+against explicit dense `M` solves and the complete token recurrence over the
+normal envelope.
 
 The local environment gate has been exercised for PyTorch `2.13.0+cu130`,
 Triton `3.7.1`, CUDA 13.0 Update 2, MathDx 26.06/cuBLASDx 0.7.0, and FLA 0.5.2
 on SM120. The dense `r=128`, `K=1` scan/frame/FLA-WY composition now passes its
-current forward, final-state, joint-VJP, and repeatability tests. This is a
-validated implementation checkpoint, not the full release gate: masks,
-resets, packed sequences, complete frontend dispatch, the stricter internal
-numerical table, and matched-baseline performance remain open.
+current forward, final-state, joint-VJP, repeatability, and tying-aware
+deep-cancellation tests. This is a validated implementation checkpoint, not
+the full release gate: masks, resets, packed sequences, non-128 native widths,
+larger native `K`, complete frontend dispatch, the remaining stricter internal
+table, and matched-baseline performance remain open. The frame still emits
+explicit `d,e,chi` before WY; no full Solve-to-WY fusion is claimed.
 
 - lower/upper residual and complete solve-action relative error;
 - all `K` `(d,e)` pairs, `chi`, outputs, and recurrent states;
 - input and parameter gradient error;
-- FP32 factor/action finiteness and long-rollout drift;
+- BF16 factor/action finiteness with FP32 state and long-rollout drift;
 - radial and diagonal saturation fractions plus their gradient magnitudes;
 - realized `||M||`, `||M^-1||`, `cond(M)`, and edit transition singular values;
 - pairing drift $|e^T d-\bar b^T a|$, especially at pairing zero and two;
@@ -371,10 +489,12 @@ numerical table, and matched-baseline performance remain open.
   block TRSM can lose to batched cuBLAS; accept the hybrid route only when
   fusion-level traffic savings survive end-to-end measurement.
 
-The first native contract remains FP32 for chart-sensitive accumulation.
-Tensor Core products may use split BF16/FP16 operands only where the complete
-internal error table passes. They may not silently change the system, add
-iterative correction semantics, or fall back to another chart.
+The first native contract requires BF16 Tensor Core operands with FP32
+accumulation and FP32 continuation state. Fixed high/low decomposition or
+compensated reduction is allowed where the cancellation gates require it, but
+it must be part of one deterministic schedule. It may not silently change the
+system, add iterative correction semantics, round recurrent state to BF16, or
+fall back to another chart.
 
 ## Phase 5: model evaluation
 

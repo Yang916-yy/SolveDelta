@@ -1,7 +1,7 @@
 # Prior Work and Decision Ledger
 
 This file records primary sources that changed the single SolveDelta design. A
-source is not a second project direction. Access and review date: 2026-08-22.
+source is not a second project direction. Access and review date: 2026-08-24.
 
 ## Delta recurrence and parallel algebra
 
@@ -40,16 +40,14 @@ The FLA GDN2 suite treats a pure PyTorch token recurrence as ground truth and
 uses RMS error relative to reference RMS. Its dense tests allow about `0.005`
 for outputs/final state, `0.01` for main vector gradients, and `0.02` for gate
 gradients; packed tests use about `0.006`, `0.012`, and `0.02`. It covers
-forward and backward, FP32/FP16, irregular lengths, initial/final states,
-packed resets, normalization and gate fusion. SolveDelta adopts that end-to-end
-low-precision envelope but compares against an FP64 oracle built from the same
-quantized inputs. It adds stricter independent budgets for the Triton geometry
-scan, MathDx residual/actions, dual pairing, and FP32 complete layer. This
-prevents a locally inaccurate solve from consuming the full recurrent-layer
-tolerance while remaining hidden by output scale. A local SM120 calibration of
-the installed GDN2 chunk path measured roughly `1.0e-3--1.2e-3` FP32
-output/state relative error, so SolveDelta's complete FP32 output/state ceiling is
-`2e-3`; the solve-specific ceilings remain orders of magnitude tighter.
+forward and backward, mixed dtypes, irregular lengths, initial/final states,
+packed resets, normalization, and gate fusion. SolveDelta adopts one BF16/FP32
+end-to-end envelope but compares against an FP64 oracle built from the same
+quantized inputs. It adds stricter independent budgets for each Tensor Core
+contraction, the Triton geometry scan, chart/radial construction, MathDx
+residual/actions, and dual pairing. This prevents a locally inaccurate frame
+from consuming the full recurrent-layer tolerance while remaining hidden by
+output scale.
 
 Decision: mature Delta implementations recompute chunk-local structure in
 backward rather than retaining tokenwise recurrent states. SolveDelta follows
@@ -64,9 +62,13 @@ Decision: the generalized DPLR exterior admits the finite equivalent mapping
 installed FLA implementation and its backward were tested bitwise under both
 mappings for `K=1,2`, including output and final-state cotangents. The selected
 mapping aliases `b` with `k` and removes the redundant signed write-direction
-allocation. It does not change the operator or claim a new WY algorithm;
-eliminating materialized `a` would require a separately validated direct-`e`
-FLA specialization.
+allocation. The checked-in direct-`e` specialization adapts FLA 0.5.2's
+MIT-licensed intra-chunk generalized-Delta staging: it generates the same BF16
+`a=-e*exp(g)` bits at use and folds the backward into `e` and `g`, while FLA
+continues to own the mature WY/state/output kernels. Output, final-state, input,
+and state-cotangent tests validate the specialization. It removes
+materialization, saving, and replay of `a`; it does not change the operator or
+claim a new WY algorithm.
 
 Decision: the installed FLA 0.5.2 GDN2 and GatedDeltaProduct layers establish
 three independent depthwise causal `conv4`, bias-free, SiLU branches over the
@@ -80,6 +82,58 @@ but a cotangent on the returned final cache omits part of
 output and constructs the exact four-token final cache by slicing
 `concat(initial_cache, x)`; the CUDA parity test covers output, cache, input,
 initial-cache, and weight gradients.
+
+## Mixed precision and Tensor Core arithmetic
+
+- Kalamkar et al., *A Study of BFLOAT16 for Deep Learning Training*,
+  [arXiv:1905.12322](https://arxiv.org/abs/1905.12322).
+- Henry, Tang, and Heinecke, *Leveraging the bfloat16 Artificial Intelligence
+  Datatype For Higher-Precision Computations*,
+  [arXiv:1904.06376](https://arxiv.org/abs/1904.06376).
+- Ootomo and Yokota, *Recovering Single Precision Accuracy from Tensor Cores
+  While Surpassing the FP32 Theoretical Peak Performance*,
+  [DOI:10.1177/10943420221090256](https://doi.org/10.1177/10943420221090256).
+- Ogita, Rump, and Oishi, *Accurate Sum and Dot Product*,
+  [DOI:10.1137/030601818](https://doi.org/10.1137/030601818).
+- FLA 0.5.2
+  [GDN2 layer](https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/layers/gdn2.py)
+  and
+  [chunk operator](https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/gdn2/chunk.py).
+
+Decision: BF16 is SolveDelta's first native activation and contraction operand
+dtype. Tensor Core products accumulate in FP32; normalization, radial norms,
+log-decay and gate nonlinearities, backward partials, and continuation states
+`m,J,D,S` also remain FP32. Public activation results and leaf gradients return
+to BF16 only after their FP32 reductions. This follows the established mixed
+training boundary while preserving the full FP32 exponent range for recurrent
+state. Rounding state at each chunk is rejected because it makes the numerical
+recurrence depend on the chosen split.
+
+Decision: the installed GDN2 layer leaves `q,k,v,b,w` in model dtype, evaluates
+its log-decay in FP32, requires an FP32 initial recurrent state, uses low-
+precision `tl.dot` operands with FP32 accumulators, accumulates major backward
+partials in FP32, and casts returned activation gradients to their input dtype.
+Its public example uses BF16. SolveDelta adopts those boundaries rather than
+the former FP16-outer/FP32-frame staging choice. A local GDN2 BF16 audit against
+the same-quantized-input FP64 recurrence measured about `3.19e-3` output,
+`2.23e-3` state, and less than `4.5e-3` gradient error.
+
+Decision: low-precision multiplication does not justify deleting deep
+cancellation tests. Two BF16 significands can produce a product with a residual
+well below one BF16 input ulp, and that product is exactly representable in an
+FP32 accumulator over the normal range. Cancellation fixtures are therefore
+quantized first and classified by their recomputed condition ratio. Fixed
+twofold/high-low contractions may be used where an ordinary product fails, as
+supported by the accurate-dot and Tensor Core decomposition literature, but
+they must be fused, deterministic, and measured. They do not permit iterative
+correction semantics, BF16 state storage, or a data-dependent fallback.
+
+Decision: a fixed high/low Tensor Core representation of an FP32 boundary is
+one continuous state, not two independently differentiated parameters. Its
+VJP returns the mathematical boundary adjoint once; the RHS adjoint consumes
+the exact high and low bits used by the forward. Tensor Core packing occurs
+inside the contraction primitive so an FP32 source receives an FP32 partial,
+while a public BF16 activation leaf receives BF16 only after reduction.
 
 ## Preconditioned and regression memories
 
@@ -299,8 +353,10 @@ The generic quasiseparable order of a dense continuation can still grow to
 chart has constant ordinary rank or permission to compress `J` or `D`. A plain
 IEEE-FP32 Gram expansion remains rejected because legal boundary/local
 cancellation can lose the residual or reconstruct a negative squared norm.
-The replacement must preserve four independent radial channels and pass the
-same `2^12` cancellation cases using fixed, deterministic compensation.
+The selected resident path preserves four independent radial channels and a
+fixed high/low representation for FP32 boundary products. The same `2^12`
+cancellation cases remain mandatory; mixed precision does not turn them into
+warning-only diagnostics.
 
 - Seeger, *Low Rank Updates for the Cholesky Decomposition*,
   [EPFL technical report](https://infoscience.epfl.ch/entities/publication/00ba309a-d155-4e21-acc2-153702c4605c).
@@ -399,37 +455,67 @@ CUDA realization restored the `2^12` cancellation gradient but raised the
 target-profile frame forward-plus-backward time to roughly `194 ms`; it was
 therefore rejected. Precision compensation was not carried into the rewrite.
 
-The replacement reverse first removed the old stack-heavy replay, then removed
-duplicate arithmetic. With eight coordinate tiles, the complete graph of
-off-diagonal tile pairs decomposes into seven perfect matchings. One additional
-phase owns all diagonal tiles. Within a phase the blocks update disjoint
-coordinate groups, so both matrix orientations are handled once without
-atomics; the phase sequence and final 36-part scalar reduction are
-deterministic. On the local SM120 target profile this reduced the moment replay
-from `12.654 ms` to `4.883 ms`, raw frame backward from `19.029 ms` to
-`11.303 ms`, and the dense scan/frame/FLA-WY forward-plus-backward from
-`22.262 ms` to `14.622 ms`. The full dense composition VJP and repeatability
-tests pass. The remaining local cancellation diagnostic and the still-large
-gap to matched GDN2 remain explicit gates; the result is an accepted repository
-checkpoint, not a performance-complete backend.
+Decision: the selected reverse no longer preserves the earlier packet/panel or
+all-FP32 replay schedules. The resident action backward applies the transpose
+of the forward primal/dual block action, then contracts the rank-three
+primal/erase/read descriptor bundle with local generators and dense boundaries.
+BF16 descriptor and factor operands feed FP32-accumulated products; FP32
+boundary products use one fixed high/low packing. Compact pair, coefficient,
+and leaf primitives return FP32 partials to the composed geometry/frame
+autograd owner, which joins them with the Triton affine scan adjoint before
+casting BF16 activation leaves. This keeps dense `J,D`, four radial channels,
+and exact LDU actions without tokenwise dense factor cotangents.
 
-A multi-panel determinism audit exposed a shared-memory write-after-read race
-in the common radial reduction, not in the perfect-matching schedule. Its warp
-partials and broadcast results had reused four slots across consecutive token
-reductions. Assigning the results separate slots restored bitwise repeatability
-for multiple batches, heads, and chunks without changing the reduction order or
-the measured `11.300 ms` raw backward median.
-
-The same audit found that the Triton scalar adjoint zeroed invalid tail values
-but had not masked their store addresses. On multi-batch tails those lanes could
-cross the batch stride and overwrite valid decay gradients. An explicit valid
-store mask and `B=2,T=35` FP64/repeatability regressions now enforce the packed
-address boundary.
+A multi-panel audit remains part of the selected path's provenance. It found a
+shared-memory write-after-read race in an earlier radial reduction and an
+address-mask omission in the Triton scalar adjoint's invalid tail stores.
+Separate reduction/broadcast slots and an explicit valid store mask restored
+bitwise repeatability for multiple batches, heads, chunks, and irregular tails;
+the regressions remain mandatory even though the responsible old kernels are
+gone.
 
 Decision: a projected radial reverse can recover each affine-prefix norm and
 its scalar VJP from `<A_t,B>` and `<A_t,L_s>` projections without a full action
-workspace. Earlier standalone schedules were not competitive, but the
-derivation remains relevant when fused into the replacement chunk backward.
+workspace. For
+`Z_t=beta_t Z_{t-1}+r_tL_t`, the exact recurrence is
+`n_t=beta_t^2 n_{t-1}+2 beta_t r_t <Z_{t-1},L_t>+r_t^2<L_t,L_t>`.
+Its reverse closes over the same projections and descriptor bundle. Dense
+boundary work remains `O(C r^2)` and cannot be removed without restricting the
+chart, but local work can use the finite `O(C^2 r)` chunk algebra.
+
+Decision: the deep-cancellation audit exposed an ambiguity in validating a
+shared `geometry_strength` scalar, not a missing VJP term. The parameter ties
+six chart-channel contributions by the fixed linear map `g=1^T g_6`. One `J`
+witness has expected/actual `1.814816e-3/1.892893e-3`, and one `D` witness has
+`-6.437174e-5/-4.876703e-4`; the latter's L1-to-total ratio is about `4350`.
+Accumulating only the final scalar addition in FP64 does not cure the error.
+For these declared deep-cancellation fixtures, validation now measures the
+tying map at its induced scale:
+`rho_tie=|g_hat-1^T g_6|/(sqrt(6)||g_6||_2+1e-8) <= 2.5e-2`, with
+the existing `abs <= 1e-6` alternative retained when `||g_6||_2` itself is
+near zero. Ordinary fixtures still use the standard total-gradient metric.
+Unlike multiplying tolerance by the observed cancellation ratio, this ceiling
+is fixed by the six-to-one map's operator norm and cannot vary with the data.
+
+On the local SM120 profile
+`B=1,T=1024,H=8,r=d_v=128,K=1,C=32`, the selected path measures
+`1.669/7.740 ms` forward/forward-plus-backward versus `0.358/1.154 ms` for the
+matched GDN2 operator. Both rows exclude projections and conv4. The split is
+geometry scan `0.119/0.695 ms`, resident frame
+`1.243/6.174 ms`, and direct-`e` WY `0.234/0.936 ms`; resident frame backward is
+about `4.93 ms`. The WY core is already close to matched GDN2's
+`0.244/0.941 ms`, localizing the remaining performance and workspace gap to
+the frame, especially its reverse. Explicit `d,e,chi` still cross the frame/WY
+boundary, so this checkpoint is not a complete Solve-to-WY fusion.
+
+A SASS audit of the loaded native library found no MMA instruction in its nine
+custom resident kernels. Tensor Core work currently comes from the Triton
+scan/WY contractions and the reverse's broad BF16 `bmm`s; resident forward and
+the compact action-adjoint/pair/leaf/coefficient kernels remain scalar-FMA
+code. This is why the BF16/FP32 ABI and lower precision alone do not close the
+GDN2 gap. The next performance rewrite must express common boundary actions as
+wide GEMMs and local terms as the exact `O(C^2r)` semiseparable action, with the
+corresponding transpose schedule in backward.
 
 ## Explicitly closed directions
 

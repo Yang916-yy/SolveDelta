@@ -25,26 +25,6 @@ constexpr int kEntriesPerThread = 16;
 constexpr int kStrictEntries = kRank * (kRank - 1) / 2;
 constexpr double kRadius = 1.0 / 8.0;
 
-struct FactorShared {
-    float primal[kChunk * kRank];
-    float u_column[kChunk * kTile];
-    float h_column[kChunk * kTile];
-    float u_row[kChunk * kTile];
-    float boundary_j[kTile * kTile];
-    float boundary_d[kTile * kTile];
-    float inverse_mass[kChunk];
-    float coefficient[kChunk * kComponents];
-    float factor[kChunk * kTile * kTile];
-};
-
-struct FrameShared {
-    FactorShared factor;
-    float dual[kDualRhs * kChunk * kRank];
-    float dual_accumulator[kDualRhs * kChunk * kTile];
-};
-
-static_assert(sizeof(FrameShared) == 94848);
-
 __device__ __forceinline__ int vector_index(
     int batch_index,
     int token,
@@ -87,9 +67,10 @@ __device__ __forceinline__ void reduce_warp(float& value) {
     }
 }
 
+template <typename vector_t>
 __global__ __launch_bounds__(kThreads, 1) void radial_kernel(
-    const float* __restrict__ u,
-    const float* __restrict__ h,
+    const vector_t* __restrict__ u,
+    const vector_t* __restrict__ h,
     const float* __restrict__ geometry_log_decay,
     const float* __restrict__ geometry_strength,
     const float* __restrict__ boundary_m,
@@ -98,6 +79,7 @@ __global__ __launch_bounds__(kThreads, 1) void radial_kernel(
     float* __restrict__ alpha0,
     float* __restrict__ inverse_mass_output,
     float* __restrict__ coefficient,
+    float* __restrict__ radial_q2,
     float* __restrict__ diagonal,
     int length,
     int heads,
@@ -137,7 +119,8 @@ __global__ __launch_bounds__(kThreads, 1) void radial_kernel(
                 coordinate,
                 length,
                 heads);
-            value = which == 0 ? u[source_index] : h[source_index];
+            value = static_cast<float>(
+                which == 0 ? u[source_index] : h[source_index]);
         }
         vectors[which][local] = value;
     }
@@ -274,24 +257,29 @@ __global__ __launch_bounds__(kThreads, 1) void radial_kernel(
                 const double scaled_d = valid
                     ? strength_squared * static_cast<double>(block_d)
                     : 0.0;
+                const double q2_j = kRadius * kRadius + scaled_j;
+                const double q2_d = kRadius * kRadius + scaled_d;
                 coefficient[output] = valid
                     ? static_cast<float>(
                         static_cast<double>(strength) * kRadius
-                        / sqrt(kRadius * kRadius + scaled_j))
+                        / sqrt(q2_j))
                     : 0.0f;
                 coefficient[output + 1] = valid
                     ? static_cast<float>(
                         static_cast<double>(strength) * kRadius
-                        / sqrt(kRadius * kRadius + scaled_d))
+                        / sqrt(q2_d))
                     : 0.0f;
+                radial_q2[output] = static_cast<float>(q2_j);
+                radial_q2[output + 1] = static_cast<float>(q2_d);
             }
         }
         __syncthreads();
     }
 }
 
+template <typename scalar_t>
 __device__ __forceinline__ float load_chunk_vector(
-    const float* source,
+    const scalar_t* source,
     int batch_index,
     int token_start,
     int target,
@@ -310,9 +298,41 @@ __device__ __forceinline__ float load_chunk_vector(
         heads)];
 }
 
+__device__ __forceinline__ int dual_vector_index(
+    int batch_index,
+    int token,
+    int head,
+    int route,
+    int coordinate,
+    int length,
+    int heads) {
+    return ((((batch_index * length + token) * heads + head) * kDualRhs
+             + route) * kRank) + coordinate;
+}
+
+struct MixedFactorShared {
+    float primal[kChunk * kRank];
+    at::BFloat16 u_column[kChunk * kTile];
+    at::BFloat16 h_column[kChunk * kTile];
+    at::BFloat16 u_row[kChunk * kTile];
+    float boundary_j[kTile * kTile];
+    float boundary_d[kTile * kTile];
+    float inverse_mass[kChunk];
+    float coefficient[kChunk * kComponents];
+    at::BFloat16 factor[kChunk * kTile * kTile];
+};
+
+struct MixedFrameShared {
+    MixedFactorShared factor;
+    float dual[kDualRhs * kChunk * kRank];
+    float dual_accumulator[kDualRhs * kChunk * kTile];
+};
+
+static_assert(sizeof(MixedFrameShared) == 75392);
+
 template <bool Upper>
-__device__ __forceinline__ void reconstruct_factor(
-    FactorShared& shared,
+__device__ __forceinline__ void reconstruct_mixed_factor(
+    MixedFactorShared& shared,
     const float* __restrict__ alpha0,
     int panel) {
     constexpr int component = Upper ? 2 : 0;
@@ -324,15 +344,20 @@ __device__ __forceinline__ void reconstruct_factor(
         float moment_j = fmaf(
             alpha0[panel],
             shared.boundary_j[tid],
-            weight0 * shared.u_row[row] * shared.u_column[column]);
+            weight0
+                * static_cast<float>(shared.u_row[row])
+                * static_cast<float>(shared.u_column[column]));
         float moment_d = fmaf(
             alpha0[panel],
             shared.boundary_d[tid],
-            weight0 * shared.u_row[row] * shared.h_column[column]);
-        shared.factor[tid] = fmaf(
+            weight0
+                * static_cast<float>(shared.u_row[row])
+                * static_cast<float>(shared.h_column[column]));
+        float factor = fmaf(
             shared.coefficient[component],
             moment_j,
             shared.coefficient[component + 1] * moment_d);
+        shared.factor[tid] = at::BFloat16(factor);
 #pragma unroll 1
         for (int target = 1; target < kChunk; ++target) {
             const float weight = shared.inverse_mass[target];
@@ -341,27 +366,34 @@ __device__ __forceinline__ void reconstruct_factor(
                 retain,
                 moment_j,
                 weight
-                    * shared.u_row[target * kTile + row]
-                    * shared.u_column[target * kTile + column]);
+                    * static_cast<float>(
+                        shared.u_row[target * kTile + row])
+                    * static_cast<float>(
+                        shared.u_column[target * kTile + column]));
             moment_d = fmaf(
                 retain,
                 moment_d,
                 weight
-                    * shared.u_row[target * kTile + row]
-                    * shared.h_column[target * kTile + column]);
-            shared.factor[target * kTile * kTile + tid] = fmaf(
-                shared.coefficient[target * kComponents + component],
+                    * static_cast<float>(
+                        shared.u_row[target * kTile + row])
+                    * static_cast<float>(
+                        shared.h_column[target * kTile + column]));
+            factor = fmaf(
+                shared.coefficient[
+                    target * kComponents + component],
                 moment_j,
-                shared.coefficient[target * kComponents + component + 1]
-                    * moment_d);
+                shared.coefficient[
+                    target * kComponents + component + 1] * moment_d);
+            shared.factor[target * kTile * kTile + tid] =
+                at::BFloat16(factor);
         }
     }
     __syncthreads();
 }
 
 template <bool Upper, bool DiagonalBlock>
-__device__ __forceinline__ void accumulate_dual(
-    FrameShared& shared,
+__device__ __forceinline__ void accumulate_mixed_dual(
+    MixedFrameShared& shared,
     int row_start) {
     const int target = threadIdx.x / kTile;
     const int column = threadIdx.x % kTile;
@@ -376,8 +408,8 @@ __device__ __forceinline__ void accumulate_dual(
             }
             if (active) {
                 action = fmaf(
-                    shared.factor.factor[
-                        target * kTile * kTile + row * kTile + column],
+                    static_cast<float>(shared.factor.factor[
+                        target * kTile * kTile + row * kTile + column]),
                     shared.dual[
                         (rhs * kChunk + target) * kRank + row_start + row],
                     action);
@@ -389,12 +421,12 @@ __device__ __forceinline__ void accumulate_dual(
 }
 
 template <bool Upper>
-__device__ __forceinline__ void frame_step(
-    FrameShared& shared,
+__device__ __forceinline__ void mixed_frame_step(
+    MixedFrameShared& shared,
     const float* __restrict__ boundary_j,
     const float* __restrict__ boundary_d,
-    const float* __restrict__ u,
-    const float* __restrict__ h,
+    const at::BFloat16* __restrict__ u,
+    const at::BFloat16* __restrict__ h,
     const float* __restrict__ alpha0,
     int panel,
     int tile,
@@ -441,7 +473,7 @@ __device__ __forceinline__ void frame_step(
             + column_start + coordinate];
     }
     __syncthreads();
-    reconstruct_factor<Upper>(factor, alpha0, panel);
+    reconstruct_mixed_factor<Upper>(factor, alpha0, panel);
 
 #pragma unroll
     for (int target_group = 0; target_group < 2; ++target_group) {
@@ -459,9 +491,9 @@ __device__ __forceinline__ void frame_step(
                 : lane > pivot && lane < kTile;
             if (active) {
                 residual = fmaf(
-                    -factor.factor[
+                    -static_cast<float>(factor.factor[
                         local_target * kTile * kTile
-                        + lane * kTile + pivot],
+                        + lane * kTile + pivot]),
                     solved,
                     residual);
             }
@@ -471,7 +503,7 @@ __device__ __forceinline__ void frame_step(
                 local_target * kRank + column_start + lane] = residual;
         }
     }
-    accumulate_dual<Upper, true>(shared, column_start);
+    accumulate_mixed_dual<Upper, true>(shared, column_start);
     __syncthreads();
 
     const int row_begin = Upper ? 0 : tile + 1;
@@ -497,21 +529,22 @@ __device__ __forceinline__ void frame_step(
                 boundary_d[matrix_base + row * kRank + column];
         }
         __syncthreads();
-        reconstruct_factor<Upper>(factor, alpha0, panel);
+        reconstruct_mixed_factor<Upper>(factor, alpha0, panel);
 
         float action = 0.0f;
 #pragma unroll
         for (int column = 0; column < kTile; ++column) {
             action = fmaf(
-                factor.factor[
+                static_cast<float>(factor.factor[
                     target * kTile * kTile
-                    + local_coordinate * kTile + column],
+                    + local_coordinate * kTile + column]),
                 factor.primal[
                     target * kRank + column_start + column],
                 action);
         }
-        factor.primal[target * kRank + row_start + local_coordinate] -= action;
-        accumulate_dual<Upper, false>(shared, row_start);
+        factor.primal[
+            target * kRank + row_start + local_coordinate] -= action;
+        accumulate_mixed_dual<Upper, false>(shared, row_start);
         __syncthreads();
     }
 
@@ -529,21 +562,22 @@ __device__ __forceinline__ void frame_step(
     __syncthreads();
 }
 
-__global__ __launch_bounds__(kThreads, 1) void frame_kernel(
-    const float* __restrict__ u,
-    const float* __restrict__ h,
-    const float* __restrict__ key,
-    const float* __restrict__ erase,
-    const float* __restrict__ query,
+__global__ __launch_bounds__(kThreads, 1) void mixed_frame_kernel(
+    const at::BFloat16* __restrict__ u,
+    const at::BFloat16* __restrict__ h,
+    const at::BFloat16* __restrict__ key,
+    const at::BFloat16* __restrict__ erase,
+    const at::BFloat16* __restrict__ query,
     const float* __restrict__ boundary_j,
     const float* __restrict__ boundary_d,
     const float* __restrict__ alpha0,
     const float* __restrict__ inverse_mass,
     const float* __restrict__ coefficient,
     const float* __restrict__ diagonal,
-    float* __restrict__ write_direction,
-    float* __restrict__ erase_direction,
-    float* __restrict__ solved_query,
+    at::BFloat16* __restrict__ write_direction,
+    float* __restrict__ write_direction_fp32,
+    at::BFloat16* __restrict__ erase_direction,
+    at::BFloat16* __restrict__ solved_query,
     float* __restrict__ lower_primal,
     float* __restrict__ lower_dual_scaled,
     int length,
@@ -551,7 +585,7 @@ __global__ __launch_bounds__(kThreads, 1) void frame_kernel(
     int chunks,
     int panels) {
     extern __shared__ __align__(16) unsigned char storage[];
-    auto& shared = *reinterpret_cast<FrameShared*>(storage);
+    auto& shared = *reinterpret_cast<MixedFrameShared*>(storage);
     auto& factor = shared.factor;
     const int panel = blockIdx.x;
     if (panel >= panels) return;
@@ -612,7 +646,7 @@ __global__ __launch_bounds__(kThreads, 1) void frame_kernel(
 
 #pragma unroll 1
     for (int tile = 0; tile < kTiles; ++tile) {
-        frame_step<false>(
+        mixed_frame_step<false>(
             shared,
             boundary_j,
             boundary_d,
@@ -634,7 +668,8 @@ __global__ __launch_bounds__(kThreads, 1) void frame_kernel(
          index += blockDim.x) {
         const int target = index / kRank;
         const int coordinate = index % kRank;
-        const float scale = diagonal[(panel * kChunk + target) * kRank + coordinate];
+        const float scale = diagonal[
+            (panel * kChunk + target) * kRank + coordinate];
         if (target < valid_count) {
             const int output_index = vector_index(
                 batch_index,
@@ -645,9 +680,10 @@ __global__ __launch_bounds__(kThreads, 1) void frame_kernel(
                 heads);
             lower_primal[output_index] = factor.primal[index];
         }
-        factor.primal[index] /= scale;
-        shared.dual[index] *= scale;
-        shared.dual[kChunk * kRank + index] *= scale;
+        factor.primal[index] /= static_cast<float>(at::BFloat16(scale));
+        shared.dual[index] *= static_cast<float>(at::BFloat16(scale));
+        shared.dual[kChunk * kRank + index] *=
+            static_cast<float>(at::BFloat16(scale));
         if (target < valid_count) {
             const int dual_base = (
                 ((batch_index * length + token_start + target) * heads + head)
@@ -661,7 +697,7 @@ __global__ __launch_bounds__(kThreads, 1) void frame_kernel(
 
 #pragma unroll 1
     for (int tile = kTiles - 1; tile >= 0; --tile) {
-        frame_step<true>(
+        mixed_frame_step<true>(
             shared,
             boundary_j,
             boundary_d,
@@ -691,9 +727,365 @@ __global__ __launch_bounds__(kThreads, 1) void frame_kernel(
             coordinate,
             length,
             heads);
-        write_direction[output_index] = factor.primal[index];
-        erase_direction[output_index] = shared.dual[index];
-        solved_query[output_index] = shared.dual[kChunk * kRank + index];
+        write_direction_fp32[output_index] = factor.primal[index];
+        write_direction[output_index] = at::BFloat16(factor.primal[index]);
+        erase_direction[output_index] = at::BFloat16(shared.dual[index]);
+        solved_query[output_index] =
+            at::BFloat16(shared.dual[kChunk * kRank + index]);
+    }
+}
+
+template <bool Upper, bool DiagonalBlock>
+__device__ __forceinline__ void accumulate_mixed_direct_dual(
+    MixedFrameShared& shared,
+    int source_start) {
+    const int target = threadIdx.x / kTile;
+    const int row = threadIdx.x % kTile;
+#pragma unroll
+    for (int rhs = 0; rhs < kDualRhs; ++rhs) {
+        float action = 0.0f;
+#pragma unroll
+        for (int column = 0; column < kTile; ++column) {
+            bool active = true;
+            if constexpr (DiagonalBlock) {
+                active = Upper ? column > row : column < row;
+            }
+            if (active) {
+                action = fmaf(
+                    static_cast<float>(shared.factor.factor[
+                        target * kTile * kTile + row * kTile + column]),
+                    shared.dual[
+                        (rhs * kChunk + target) * kRank
+                        + source_start + column],
+                    action);
+            }
+        }
+        shared.dual_accumulator[
+            (rhs * kChunk + target) * kTile + row] += action;
+    }
+}
+
+template <bool Upper>
+__device__ __forceinline__ void mixed_frame_adjoint_step(
+    MixedFrameShared& shared,
+    const float* __restrict__ boundary_j,
+    const float* __restrict__ boundary_d,
+    const at::BFloat16* __restrict__ u,
+    const at::BFloat16* __restrict__ h,
+    const float* __restrict__ alpha0,
+    int panel,
+    int tile,
+    int batch_index,
+    int head,
+    int token_start,
+    int valid_count,
+    int length,
+    int heads) {
+    auto& factor = shared.factor;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int matrix_base = panel * kRank * kRank;
+    const int row_start = tile * kTile;
+    const int target = tid / kTile;
+    const int local_coordinate = tid % kTile;
+
+    factor.u_row[tid] = load_chunk_vector(
+        u, batch_index, token_start, target, head,
+        row_start + local_coordinate, valid_count, length, heads);
+    factor.u_column[tid] = factor.u_row[tid];
+    factor.h_column[tid] = load_chunk_vector(
+        h, batch_index, token_start, target, head,
+        row_start + local_coordinate, valid_count, length, heads);
+    if (tid < kTile * kTile) {
+        const int row = row_start + tid / kTile;
+        const int column = row_start + tid % kTile;
+        factor.boundary_j[tid] =
+            boundary_j[matrix_base + row * kRank + column];
+        factor.boundary_d[tid] =
+            boundary_d[matrix_base + row * kRank + column];
+    }
+    for (int index = tid;
+         index < kDualRhs * kChunk * kTile;
+         index += blockDim.x) {
+        const int rhs = index / (kChunk * kTile);
+        const int local = index % (kChunk * kTile);
+        const int local_target = local / kTile;
+        const int row = local % kTile;
+        shared.dual_accumulator[index] = shared.dual[
+            (rhs * kChunk + local_target) * kRank + row_start + row];
+    }
+    __syncthreads();
+    reconstruct_mixed_factor<Upper>(factor, alpha0, panel);
+
+#pragma unroll
+    for (int target_group = 0; target_group < 2; ++target_group) {
+        const int local_target = target_group * 16 + warp;
+        float residual = lane < kTile
+            ? factor.primal[
+                local_target * kRank + row_start + lane]
+            : 0.0f;
+#pragma unroll
+        for (int step = 0; step < kTile; ++step) {
+            constexpr bool solve_lower = Upper;
+            const int pivot = solve_lower ? step : kTile - 1 - step;
+            const float solved = __shfl_sync(0xffffffffu, residual, pivot);
+            const bool active = solve_lower
+                ? lane > pivot && lane < kTile
+                : lane < pivot;
+            if (active) {
+                residual = fmaf(
+                    -static_cast<float>(factor.factor[
+                        local_target * kTile * kTile
+                        + pivot * kTile + lane]),
+                    solved,
+                    residual);
+            }
+        }
+        if (lane < kTile) {
+            factor.primal[
+                local_target * kRank + row_start + lane] = residual;
+        }
+    }
+    accumulate_mixed_direct_dual<Upper, true>(shared, row_start);
+    __syncthreads();
+
+    const int column_begin = Upper ? tile + 1 : 0;
+    const int column_end = Upper ? kTiles : tile;
+    for (int column_tile = column_begin;
+         column_tile < column_end;
+         ++column_tile) {
+        const int column_start = column_tile * kTile;
+        factor.u_column[tid] = load_chunk_vector(
+            u,
+            batch_index,
+            token_start,
+            target,
+            head,
+            column_start + local_coordinate,
+            valid_count,
+            length,
+            heads);
+        factor.h_column[tid] = load_chunk_vector(
+            h,
+            batch_index,
+            token_start,
+            target,
+            head,
+            column_start + local_coordinate,
+            valid_count,
+            length,
+            heads);
+        if (tid < kTile * kTile) {
+            const int row = row_start + tid / kTile;
+            const int column = column_start + tid % kTile;
+            factor.boundary_j[tid] =
+                boundary_j[matrix_base + row * kRank + column];
+            factor.boundary_d[tid] =
+                boundary_d[matrix_base + row * kRank + column];
+        }
+        __syncthreads();
+        reconstruct_mixed_factor<Upper>(factor, alpha0, panel);
+
+        float transpose_action = 0.0f;
+#pragma unroll
+        for (int row = 0; row < kTile; ++row) {
+            transpose_action = fmaf(
+                static_cast<float>(factor.factor[
+                    target * kTile * kTile
+                    + row * kTile + local_coordinate]),
+                factor.primal[
+                    target * kRank + row_start + row],
+                transpose_action);
+        }
+        factor.primal[
+            target * kRank + column_start + local_coordinate]
+            -= transpose_action;
+        accumulate_mixed_direct_dual<Upper, false>(shared, column_start);
+        __syncthreads();
+    }
+
+    for (int index = tid;
+         index < kDualRhs * kChunk * kTile;
+         index += blockDim.x) {
+        const int rhs = index / (kChunk * kTile);
+        const int local = index % (kChunk * kTile);
+        const int local_target = local / kTile;
+        const int row = local % kTile;
+        shared.dual[
+            (rhs * kChunk + local_target) * kRank + row_start + row]
+            = shared.dual_accumulator[index];
+    }
+    __syncthreads();
+}
+
+__global__ __launch_bounds__(kThreads, 1)
+void mixed_frame_adjoint_kernel(
+    const at::BFloat16* __restrict__ u,
+    const at::BFloat16* __restrict__ h,
+    const at::BFloat16* __restrict__ key,
+    const at::BFloat16* __restrict__ erase,
+    const float* __restrict__ boundary_j,
+    const float* __restrict__ boundary_d,
+    const float* __restrict__ lower_primal,
+    const float* __restrict__ lower_dual_scaled,
+    const float* __restrict__ inverse_mass,
+    const float* __restrict__ coefficient,
+    const float* __restrict__ diagonal,
+    const float* __restrict__ alpha0,
+    const at::BFloat16* __restrict__ grad_write_direction,
+    const at::BFloat16* __restrict__ grad_erase_direction,
+    const at::BFloat16* __restrict__ grad_solved_query,
+    at::BFloat16* __restrict__ grad_key,
+    at::BFloat16* __restrict__ grad_erase,
+    at::BFloat16* __restrict__ grad_query,
+    float* __restrict__ upper_primal,
+    float* __restrict__ upper_dual_output,
+    float* __restrict__ lower_rhs,
+    float* __restrict__ lower_dual_input,
+    float* __restrict__ grad_log_diagonal,
+    int length,
+    int heads,
+    int chunks,
+    int panels) {
+    extern __shared__ __align__(16) unsigned char storage[];
+    auto& shared = *reinterpret_cast<MixedFrameShared*>(storage);
+    auto& factor = shared.factor;
+    const int panel = blockIdx.x;
+    if (panel >= panels) return;
+    int batch_index;
+    int head;
+    int chunk;
+    decode_panel(panel, heads, chunks, batch_index, head, chunk);
+    const int token_start = chunk * kChunk;
+    const int valid_count = min(kChunk, length - token_start);
+
+    for (int index = threadIdx.x;
+         index < kChunk * kRank;
+         index += blockDim.x) {
+        const int target = index / kRank;
+        const int coordinate = index % kRank;
+        const bool valid = target < valid_count;
+        const int vector = vector_index(
+            batch_index,
+            token_start + target,
+            head,
+            coordinate,
+            length,
+            heads);
+        factor.primal[index] = valid
+            ? static_cast<float>(grad_write_direction[vector])
+            : 0.0f;
+        shared.dual[index] = valid
+            ? static_cast<float>(grad_erase_direction[vector])
+            : 0.0f;
+        shared.dual[kChunk * kRank + index] = valid
+            ? static_cast<float>(grad_solved_query[vector])
+            : 0.0f;
+    }
+    if (threadIdx.x < kChunk) {
+        factor.inverse_mass[threadIdx.x] =
+            inverse_mass[panel * kChunk + threadIdx.x];
+    }
+    if (threadIdx.x < kChunk * kComponents) {
+        factor.coefficient[threadIdx.x] =
+            coefficient[panel * kChunk * kComponents + threadIdx.x];
+    }
+    __syncthreads();
+
+#pragma unroll 1
+    for (int tile = 0; tile < kTiles; ++tile) {
+        mixed_frame_adjoint_step<true>(
+            shared,
+            boundary_j,
+            boundary_d,
+            u,
+            h,
+            alpha0,
+            panel,
+            tile,
+            batch_index,
+            head,
+            token_start,
+            valid_count,
+            length,
+            heads);
+    }
+
+    for (int index = threadIdx.x;
+         index < kChunk * kRank;
+         index += blockDim.x) {
+        const int target = index / kRank;
+        const int coordinate = index % kRank;
+        const float scale = static_cast<float>(at::BFloat16(diagonal[
+            (panel * kChunk + target) * kRank + coordinate]));
+        const float primal = factor.primal[index];
+        const float direct0 = shared.dual[index];
+        const float direct1 = shared.dual[kChunk * kRank + index];
+        if (target < valid_count) {
+            const int token = token_start + target;
+            const int vector = vector_index(
+                batch_index, token, head, coordinate, length, heads);
+            const int dual0 = dual_vector_index(
+                batch_index, token, head, 0, coordinate, length, heads);
+            const int dual1 = dual0 + kRank;
+            upper_primal[vector] = primal;
+            upper_dual_output[dual0] = direct0;
+            upper_dual_output[dual1] = direct1;
+            lower_dual_input[dual0] = direct0 * scale;
+            lower_dual_input[dual1] = direct1 * scale;
+            grad_log_diagonal[vector] =
+                -primal * (lower_primal[vector] / scale)
+                + lower_dual_scaled[dual0] * direct0
+                + lower_dual_scaled[dual1] * direct1;
+        }
+        factor.primal[index] = primal / scale;
+        shared.dual[index] = direct0 * scale;
+        shared.dual[kChunk * kRank + index] = direct1 * scale;
+    }
+    __syncthreads();
+
+#pragma unroll 1
+    for (int tile = kTiles - 1; tile >= 0; --tile) {
+        mixed_frame_adjoint_step<false>(
+            shared,
+            boundary_j,
+            boundary_d,
+            u,
+            h,
+            alpha0,
+            panel,
+            tile,
+            batch_index,
+            head,
+            token_start,
+            valid_count,
+            length,
+            heads);
+    }
+
+    for (int index = threadIdx.x;
+         index < kChunk * kRank;
+         index += blockDim.x) {
+        const int target = index / kRank;
+        if (target >= valid_count) continue;
+        const int coordinate = index % kRank;
+        const int vector = vector_index(
+            batch_index,
+            token_start + target,
+            head,
+            coordinate,
+            length,
+            heads);
+        const float grad_b = shared.dual[index];
+        lower_rhs[vector] = factor.primal[index];
+        grad_key[vector] = at::BFloat16(
+            factor.primal[index]
+            + static_cast<float>(erase[vector]) * grad_b);
+        grad_erase[vector] = at::BFloat16(
+            static_cast<float>(key[vector]) * grad_b);
+        grad_query[vector] = at::BFloat16(
+            shared.dual[kChunk * kRank + index]);
     }
 }
 
@@ -712,7 +1104,7 @@ void check_fp32_cuda_contiguous(
 
 }  // namespace
 
-C32ForwardResult c32_frame_forward_cuda(
+C32ResidentForwardResult c32_frame_resident_forward_cuda(
     const at::Tensor& u,
     const at::Tensor& h,
     const at::Tensor& geometry_log_decay,
@@ -723,36 +1115,50 @@ C32ForwardResult c32_frame_forward_cuda(
     const at::Tensor& boundary_m,
     const at::Tensor& boundary_j,
     const at::Tensor& boundary_d) {
-    TORCH_CHECK(u.is_cuda(), "u must be CUDA");
     TORCH_CHECK(
-        u.scalar_type() == at::kFloat && u.is_contiguous(),
-        "u must be contiguous FP32");
-    TORCH_CHECK(u.dim() == 4 && u.size(3) == kRank, "u must be [B,T,H,128]");
+        u.is_cuda() && u.scalar_type() == at::kBFloat16 && u.is_contiguous(),
+        "u must be contiguous BF16 CUDA");
+    TORCH_CHECK(
+        u.dim() == 4 && u.size(3) == kRank,
+        "u must be [B,T,H,128]");
     const int64_t batch = u.size(0);
     const int64_t length = u.size(1);
     const int64_t heads = u.size(2);
-    TORCH_CHECK(batch > 0 && length > 0 && heads > 0, "B, T, and H must be positive");
+    TORCH_CHECK(batch > 0 && length > 0 && heads > 0,
+                "B, T, and H must be positive");
     const int64_t chunks = (length - 1) / kChunk + 1;
     for (const auto& named : {
              std::pair<const at::Tensor*, const char*>{&h, "h"},
-             {&geometry_log_decay, "geometry_log_decay"},
              {&key, "key"},
              {&erase, "erase"},
-             {&query, "query"},
+             {&query, "query"}}) {
+        TORCH_CHECK(
+            named.first->is_cuda()
+                && named.first->get_device() == u.get_device()
+                && named.first->scalar_type() == at::kBFloat16
+                && named.first->is_contiguous(),
+            named.second,
+            " must be contiguous BF16 on the u device");
+    }
+    TORCH_CHECK(h.sizes() == u.sizes() && query.sizes() == u.sizes(),
+                "h/query shape mismatch");
+    TORCH_CHECK(
+        key.sizes() == at::IntArrayRef({batch, length, heads, 1, kRank})
+            && erase.sizes() == key.sizes(),
+        "key/erase must be [B,T,H,1,128]");
+    for (const auto& named : {
+             std::pair<const at::Tensor*, const char*>{
+                 &geometry_log_decay, "geometry_log_decay"},
              {&geometry_strength, "geometry_strength"},
              {&boundary_m, "boundary_m"},
              {&boundary_j, "boundary_J"},
              {&boundary_d, "boundary_D"}}) {
         check_fp32_cuda_contiguous(*named.first, u, named.second);
     }
-    TORCH_CHECK(h.sizes() == u.sizes() && query.sizes() == u.sizes(), "h/query shape mismatch");
     TORCH_CHECK(
-        geometry_log_decay.sizes() == at::IntArrayRef({batch, length, heads}),
+        geometry_log_decay.sizes()
+            == at::IntArrayRef({batch, length, heads}),
         "geometry_log_decay must be [B,T,H]");
-    TORCH_CHECK(
-        key.sizes() == at::IntArrayRef({batch, length, heads, 1, kRank})
-            && erase.sizes() == key.sizes(),
-        "key/erase must be [B,T,H,1,128]");
     TORCH_CHECK(
         geometry_strength.sizes() == at::IntArrayRef({heads}),
         "geometry_strength must be [H]");
@@ -760,50 +1166,56 @@ C32ForwardResult c32_frame_forward_cuda(
         boundary_m.sizes() == at::IntArrayRef({batch, heads, chunks}),
         "boundary_m must be [B,H,N]");
     TORCH_CHECK(
-        boundary_j.sizes() == at::IntArrayRef({batch, heads, chunks, kRank, kRank})
+        boundary_j.sizes()
+                == at::IntArrayRef(
+                    {batch, heads, chunks, kRank, kRank})
             && boundary_d.sizes() == boundary_j.sizes(),
         "boundary_J/D must be [B,H,N,128,128]");
     constexpr int64_t max_index = std::numeric_limits<int>::max();
     TORCH_CHECK(
         length <= max_index && heads <= max_index && chunks <= max_index,
-        "length, heads, and chunks must fit the native int32 launch ABI");
+        "length, heads, and chunks must fit the resident int32 launch ABI");
     TORCH_CHECK(
         boundary_m.numel() <= max_index,
-        "panel count must fit the native int32 index space");
+        "panel count must fit the resident int32 index space");
     TORCH_CHECK(
         u.numel() <= max_index / kDualRhs,
-        "vector tensors exceed the native int32 index space");
+        "vector tensors exceed the resident int32 index space");
     TORCH_CHECK(
         boundary_j.numel() <= max_index,
-        "boundary matrices exceed the native int32 index space");
+        "boundary matrices exceed the resident int32 index space");
 
     c10::cuda::CUDAGuard guard(u.device());
     cudaDeviceProp properties{};
     C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, u.get_device()));
     TORCH_CHECK(
         properties.major == 12 && properties.minor == 0,
-        "the native C32 frame contains only the SM120 specialization; got SM",
+        "the resident mixed frame contains only the SM120 specialization; got SM",
         properties.major,
         properties.minor);
+    const int64_t panels64 = boundary_m.numel();
+    const int panels = static_cast<int>(panels64);
+    const auto fp32_options = u.options().dtype(at::kFloat);
     auto write_direction = at::empty_like(key);
     auto erase_direction = at::empty_like(key);
     auto solved_query = at::empty_like(query);
-    auto inverse_mass = at::empty(
-        {batch, heads, chunks, kChunk}, u.options());
-    auto lower_primal = at::empty_like(key);
+    auto lower_primal = at::empty(u.sizes(), fp32_options);
     auto lower_dual_scaled = at::empty(
-        {batch, length, heads, kDualRhs, kRank}, u.options());
-
-    const int panels = static_cast<int>(batch * heads * chunks);
-    auto alpha0 = at::empty({panels}, u.options());
+        {batch, length, heads, kDualRhs, kRank}, fp32_options);
+    auto write_direction_fp32 = at::empty(u.sizes(), fp32_options);
+    auto inverse_mass = at::empty(
+        {batch, heads, chunks, kChunk}, fp32_options);
     auto coefficient = at::empty(
-        {panels, kChunk, kComponents}, u.options());
-    auto diagonal = at::empty({panels, kChunk, kRank}, u.options());
+        {panels64, kChunk, kComponents}, fp32_options);
+    auto radial_q2 = at::empty_like(coefficient);
+    auto diagonal = at::empty(
+        {panels64, kChunk, kRank}, fp32_options);
+    auto alpha0 = at::empty({panels64}, fp32_options);
     const auto stream = at::cuda::getCurrentCUDAStream();
 
-    radial_kernel<<<dim3(panels, 2), kThreads, 0, stream>>>(
-        u.data_ptr<float>(),
-        h.data_ptr<float>(),
+    radial_kernel<at::BFloat16><<<dim3(panels, 2), kThreads, 0, stream>>>(
+        u.data_ptr<at::BFloat16>(),
+        h.data_ptr<at::BFloat16>(),
         geometry_log_decay.data_ptr<float>(),
         geometry_strength.data_ptr<float>(),
         boundary_m.data_ptr<float>(),
@@ -812,6 +1224,7 @@ C32ForwardResult c32_frame_forward_cuda(
         alpha0.data_ptr<float>(),
         inverse_mass.data_ptr<float>(),
         coefficient.data_ptr<float>(),
+        radial_q2.data_ptr<float>(),
         diagonal.data_ptr<float>(),
         static_cast<int>(length),
         static_cast<int>(heads),
@@ -820,24 +1233,26 @@ C32ForwardResult c32_frame_forward_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        frame_kernel,
+        mixed_frame_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(sizeof(FrameShared))));
-    frame_kernel<<<panels, kThreads, sizeof(FrameShared), stream>>>(
-        u.data_ptr<float>(),
-        h.data_ptr<float>(),
-        key.data_ptr<float>(),
-        erase.data_ptr<float>(),
-        query.data_ptr<float>(),
+        static_cast<int>(sizeof(MixedFrameShared))));
+    mixed_frame_kernel<<<
+        panels, kThreads, sizeof(MixedFrameShared), stream>>>(
+        u.data_ptr<at::BFloat16>(),
+        h.data_ptr<at::BFloat16>(),
+        key.data_ptr<at::BFloat16>(),
+        erase.data_ptr<at::BFloat16>(),
+        query.data_ptr<at::BFloat16>(),
         boundary_j.data_ptr<float>(),
         boundary_d.data_ptr<float>(),
         alpha0.data_ptr<float>(),
         inverse_mass.data_ptr<float>(),
         coefficient.data_ptr<float>(),
         diagonal.data_ptr<float>(),
-        write_direction.data_ptr<float>(),
-        erase_direction.data_ptr<float>(),
-        solved_query.data_ptr<float>(),
+        write_direction.data_ptr<at::BFloat16>(),
+        write_direction_fp32.data_ptr<float>(),
+        erase_direction.data_ptr<at::BFloat16>(),
+        solved_query.data_ptr<at::BFloat16>(),
         lower_primal.data_ptr<float>(),
         lower_dual_scaled.data_ptr<float>(),
         static_cast<int>(length),
@@ -851,14 +1266,194 @@ C32ForwardResult c32_frame_forward_cuda(
         erase_direction,
         solved_query,
         lower_primal,
-        lower_dual_scaled};
+        lower_dual_scaled,
+        write_direction_fp32,
+        inverse_mass,
+        coefficient,
+        radial_q2,
+        diagonal,
+        alpha0};
+}
+
+
+C32ResidentActionBackwardResult c32_frame_resident_action_backward_cuda(
+    const at::Tensor& u,
+    const at::Tensor& h,
+    const at::Tensor& key,
+    const at::Tensor& erase,
+    const at::Tensor& boundary_j,
+    const at::Tensor& boundary_d,
+    const at::Tensor& lower_primal,
+    const at::Tensor& lower_dual_scaled,
+    const at::Tensor& inverse_mass,
+    const at::Tensor& coefficient,
+    const at::Tensor& diagonal,
+    const at::Tensor& alpha0,
+    const at::Tensor& grad_write_direction,
+    const at::Tensor& grad_erase_direction,
+    const at::Tensor& grad_solved_query) {
+    TORCH_CHECK(
+        u.is_cuda() && u.scalar_type() == at::kBFloat16 && u.is_contiguous(),
+        "u must be contiguous BF16 CUDA");
+    TORCH_CHECK(
+        u.dim() == 4 && u.size(3) == kRank,
+        "u must be [B,T,H,128]");
+    const int64_t batch = u.size(0);
+    const int64_t length = u.size(1);
+    const int64_t heads = u.size(2);
+    TORCH_CHECK(batch > 0 && length > 0 && heads > 0,
+                "B, T, and H must be positive");
+    const int64_t chunks = (length - 1) / kChunk + 1;
+    const int64_t panels64 = batch * heads * chunks;
+    for (const auto& named : {
+             std::pair<const at::Tensor*, const char*>{&h, "h"},
+             {&key, "key"},
+             {&erase, "erase"},
+             {&grad_write_direction, "grad_write_direction"},
+             {&grad_erase_direction, "grad_erase_direction"},
+             {&grad_solved_query, "grad_solved_query"}}) {
+        TORCH_CHECK(
+            named.first->is_cuda()
+                && named.first->get_device() == u.get_device()
+                && named.first->scalar_type() == at::kBFloat16
+                && named.first->is_contiguous(),
+            named.second,
+            " must be contiguous BF16 on the u device");
+    }
+    TORCH_CHECK(h.sizes() == u.sizes(), "h shape mismatch");
+    TORCH_CHECK(
+        key.sizes()
+                == at::IntArrayRef({batch, length, heads, 1, kRank})
+            && erase.sizes() == key.sizes()
+            && grad_write_direction.sizes() == key.sizes()
+            && grad_erase_direction.sizes() == key.sizes(),
+        "key/erase and their cotangents must be [B,T,H,1,128]");
+    TORCH_CHECK(
+        grad_solved_query.sizes() == u.sizes(),
+        "grad_solved_query must be [B,T,H,128]");
+    for (const auto& named : {
+             std::pair<const at::Tensor*, const char*>{
+                 &boundary_j, "boundary_J"},
+             {&boundary_d, "boundary_D"},
+             {&lower_primal, "lower_primal"},
+             {&lower_dual_scaled, "lower_dual_scaled"},
+             {&inverse_mass, "inverse_mass"},
+             {&coefficient, "radial_scale"},
+             {&diagonal, "diagonal"},
+             {&alpha0, "alpha0"}}) {
+        check_fp32_cuda_contiguous(*named.first, u, named.second);
+    }
+    TORCH_CHECK(
+        boundary_j.sizes()
+                == at::IntArrayRef(
+                    {batch, heads, chunks, kRank, kRank})
+            && boundary_d.sizes() == boundary_j.sizes(),
+        "boundary_J/D must be [B,H,N,128,128]");
+    TORCH_CHECK(
+        lower_primal.sizes() == u.sizes(),
+        "lower_primal must be [B,T,H,128]");
+    TORCH_CHECK(
+        lower_dual_scaled.sizes()
+                == at::IntArrayRef(
+                    {batch, length, heads, kDualRhs, kRank}),
+        "lower_dual_scaled must be [B,T,H,2,128]");
+    TORCH_CHECK(
+        inverse_mass.sizes()
+                == at::IntArrayRef({batch, heads, chunks, kChunk}),
+        "inverse_mass must be [B,H,N,32]");
+    TORCH_CHECK(
+        coefficient.sizes()
+                == at::IntArrayRef({panels64, kChunk, kComponents}),
+        "radial_scale must be [P,32,4]");
+    TORCH_CHECK(
+        diagonal.sizes()
+                == at::IntArrayRef({panels64, kChunk, kRank}),
+        "diagonal must be [P,32,128]");
+    TORCH_CHECK(
+        alpha0.sizes() == at::IntArrayRef({panels64}),
+        "alpha0 must be [P]");
+    constexpr int64_t max_index = std::numeric_limits<int>::max();
+    TORCH_CHECK(
+        length <= max_index && heads <= max_index && chunks <= max_index
+            && panels64 <= max_index,
+        "resident action dimensions must fit int32");
+    TORCH_CHECK(
+        u.numel() <= max_index / kDualRhs
+            && boundary_j.numel() <= max_index,
+        "resident action tensors exceed the int32 index space");
+
+    c10::cuda::CUDAGuard guard(u.device());
+    cudaDeviceProp properties{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, u.get_device()));
+    TORCH_CHECK(
+        properties.major == 12 && properties.minor == 0,
+        "the resident action backward contains only the SM120 specialization; got SM",
+        properties.major,
+        properties.minor);
+    const int panels = static_cast<int>(panels64);
+    auto grad_key = at::empty_like(key);
+    auto grad_erase = at::empty_like(erase);
+    auto grad_query = at::empty_like(u);
+    const auto fp32_options = u.options().dtype(at::kFloat);
+    auto upper_primal = at::empty(u.sizes(), fp32_options);
+    auto upper_dual_output = at::empty(
+        {batch, length, heads, kDualRhs, kRank}, fp32_options);
+    auto lower_rhs = at::empty_like(upper_primal);
+    auto lower_dual_input = at::empty_like(upper_dual_output);
+    auto grad_log_diagonal = at::empty_like(upper_primal);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        mixed_frame_adjoint_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(sizeof(MixedFrameShared))));
+    mixed_frame_adjoint_kernel<<<
+        panels, kThreads, sizeof(MixedFrameShared), stream>>>(
+        u.data_ptr<at::BFloat16>(),
+        h.data_ptr<at::BFloat16>(),
+        key.data_ptr<at::BFloat16>(),
+        erase.data_ptr<at::BFloat16>(),
+        boundary_j.data_ptr<float>(),
+        boundary_d.data_ptr<float>(),
+        lower_primal.data_ptr<float>(),
+        lower_dual_scaled.data_ptr<float>(),
+        inverse_mass.data_ptr<float>(),
+        coefficient.data_ptr<float>(),
+        diagonal.data_ptr<float>(),
+        alpha0.data_ptr<float>(),
+        grad_write_direction.data_ptr<at::BFloat16>(),
+        grad_erase_direction.data_ptr<at::BFloat16>(),
+        grad_solved_query.data_ptr<at::BFloat16>(),
+        grad_key.data_ptr<at::BFloat16>(),
+        grad_erase.data_ptr<at::BFloat16>(),
+        grad_query.data_ptr<at::BFloat16>(),
+        upper_primal.data_ptr<float>(),
+        upper_dual_output.data_ptr<float>(),
+        lower_rhs.data_ptr<float>(),
+        lower_dual_input.data_ptr<float>(),
+        grad_log_diagonal.data_ptr<float>(),
+        static_cast<int>(length),
+        static_cast<int>(heads),
+        static_cast<int>(chunks),
+        panels);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {
+        grad_key,
+        grad_erase,
+        grad_query,
+        upper_primal,
+        upper_dual_output,
+        lower_rhs,
+        lower_dual_input,
+        grad_log_diagonal};
 }
 
 
 TORCH_LIBRARY(causallsso, m) {
-    m.def("c32_frame_forward(Tensor u, Tensor h, Tensor geometry_log_decay, Tensor key, Tensor erase, Tensor query, Tensor geometry_strength, Tensor boundary_m, Tensor boundary_J, Tensor boundary_D) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("c32_frame_resident_forward(Tensor u, Tensor h, Tensor geometry_log_decay, Tensor key, Tensor erase, Tensor query, Tensor geometry_strength, Tensor boundary_m, Tensor boundary_J, Tensor boundary_D) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("c32_frame_resident_action_backward(Tensor u, Tensor h, Tensor key, Tensor erase, Tensor boundary_J, Tensor boundary_D, Tensor lower_primal, Tensor lower_dual_scaled, Tensor inverse_mass, Tensor radial_scale, Tensor diagonal, Tensor alpha0, Tensor grad_write_direction, Tensor grad_erase_direction, Tensor grad_solved_query) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(causallsso, CUDA, m) {
-    m.impl("c32_frame_forward", &c32_frame_forward_cuda);
+    m.impl("c32_frame_resident_forward", &c32_frame_resident_forward_cuda);
+    m.impl("c32_frame_resident_action_backward", &c32_frame_resident_action_backward_cuda);
 }

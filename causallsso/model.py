@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import SolveDeltaConfig
+from .ops.chunk_wy import chunk_wy_solvedelta
 from .reference import SolveDeltaState, solvedelta_reference
 
 
@@ -139,6 +140,19 @@ class SolveDelta(nn.Module):
         r = self.config.resolved_head_k_dim
         v_dim = self.config.resolved_head_v_dim
         edits = self.config.num_edits
+        use_native = (
+            hidden_states.device.type == "cuda"
+            and hidden_states.dtype == torch.bfloat16
+        )
+        if use_native and (r != 128 or edits != 1):
+            raise NotImplementedError(
+                "the native BF16 SolveDelta path requires r=128 and K=1"
+            )
+        if use_native and (valid_mask is not None or reset_mask is not None):
+            raise NotImplementedError(
+                "the native BF16 SolveDelta path does not yet support "
+                "valid_mask or reset_mask"
+            )
 
         def view_head(x: torch.Tensor, dim: int) -> torch.Tensor:
             return x.view(batch, length, h_count, dim)
@@ -177,44 +191,103 @@ class SolveDelta(nn.Module):
         q = view_head(q_raw, r)
         keys = key_raw.view(batch, length, h_count, edits, r)
         values = value_raw.view(batch, length, h_count, edits, v_dim)
-        erase = 2.0 * torch.sigmoid(
-            erase_raw.view(batch, length, h_count, edits, r)
-        )
-        write = 2.0 * torch.sigmoid(
-            write_raw.view(batch, length, h_count, edits, v_dim)
-        )
-
-        geometry_log_decay = -torch.exp(self.geometry_log_rate).view(1, 1, h_count)
-        geometry_log_decay = geometry_log_decay * torch.nn.functional.softplus(
-            geometry_raw + self.geometry_decay_bias.view(1, 1, h_count)
-        )
-        associative_raw = view_head(associative_raw, r)
-        associative_log_decay = -torch.exp(self.associative_log_rate).view(1, 1, h_count, r)
-        associative_log_decay = associative_log_decay * torch.nn.functional.softplus(
-            associative_raw + self.associative_decay_bias.view(1, 1, h_count, r)
-        )
+        if use_native:
+            u = u.to(torch.bfloat16)
+            h = h.to(torch.bfloat16)
+            q = q.to(torch.bfloat16)
+            keys = keys.to(torch.bfloat16)
+            values = values.to(torch.bfloat16)
+            erase = (
+                2.0
+                * torch.sigmoid(
+                    erase_raw.view(batch, length, h_count, edits, r).float()
+                )
+            ).to(torch.bfloat16)
+            write = (
+                2.0
+                * torch.sigmoid(
+                    write_raw.view(
+                        batch, length, h_count, edits, v_dim
+                    ).float()
+                )
+            ).to(torch.bfloat16)
+            geometry_log_decay = -torch.exp(
+                self.geometry_log_rate.float()
+            ).view(1, 1, h_count)
+            geometry_log_decay = geometry_log_decay * F.softplus(
+                geometry_raw.float()
+                + self.geometry_decay_bias.float().view(1, 1, h_count)
+            )
+            associative_raw = view_head(associative_raw.float(), r)
+            associative_log_decay = -torch.exp(
+                self.associative_log_rate.float()
+            ).view(1, 1, h_count, r)
+            associative_log_decay = associative_log_decay * F.softplus(
+                associative_raw
+                + self.associative_decay_bias.float().view(
+                    1, 1, h_count, r
+                )
+            )
+            strength = torch.sigmoid(self.geometry_strength_logit.float())
+        else:
+            erase = 2.0 * torch.sigmoid(
+                erase_raw.view(batch, length, h_count, edits, r)
+            )
+            write = 2.0 * torch.sigmoid(
+                write_raw.view(batch, length, h_count, edits, v_dim)
+            )
+            geometry_log_decay = -torch.exp(self.geometry_log_rate).view(
+                1, 1, h_count
+            )
+            geometry_log_decay = geometry_log_decay * F.softplus(
+                geometry_raw
+                + self.geometry_decay_bias.view(1, 1, h_count)
+            )
+            associative_raw = view_head(associative_raw, r)
+            associative_log_decay = -torch.exp(
+                self.associative_log_rate
+            ).view(1, 1, h_count, r)
+            associative_log_decay = associative_log_decay * F.softplus(
+                associative_raw
+                + self.associative_decay_bias.view(1, 1, h_count, r)
+            )
+            strength = torch.sigmoid(self.geometry_strength_logit)
         if not associative_decay_enabled:
             associative_log_decay = torch.zeros_like(associative_log_decay)
-        strength = torch.sigmoid(self.geometry_strength_logit)
         if not geometry_enabled:
             strength = torch.zeros_like(strength)
 
-        reference_dtype = u.dtype
-        outputs, final_state = solvedelta_reference(
-            u,
-            h,
-            q,
-            keys,
-            values,
-            geometry_log_decay.to(reference_dtype),
-            associative_log_decay.to(reference_dtype),
-            erase.to(reference_dtype),
-            write.to(reference_dtype),
-            strength.to(reference_dtype),
-            initial_state=operator_initial,
-            valid_mask=valid_mask,
-            reset_mask=reset_mask,
-        )
+        if use_native:
+            outputs, final_state = chunk_wy_solvedelta(
+                u,
+                h,
+                q,
+                keys,
+                values,
+                geometry_log_decay,
+                associative_log_decay,
+                erase,
+                write,
+                strength,
+                initial_state=operator_initial,
+            )
+        else:
+            reference_dtype = u.dtype
+            outputs, final_state = solvedelta_reference(
+                u,
+                h,
+                q,
+                keys,
+                values,
+                geometry_log_decay.to(reference_dtype),
+                associative_log_decay.to(reference_dtype),
+                erase.to(reference_dtype),
+                write.to(reference_dtype),
+                strength.to(reference_dtype),
+                initial_state=operator_initial,
+                valid_mask=valid_mask,
+                reset_mask=reset_mask,
+            )
         outputs = outputs.reshape(batch, length, h_count * v_dim)
         outputs = self.output_proj(outputs.to(hidden_states.dtype))
         if not return_final_state:

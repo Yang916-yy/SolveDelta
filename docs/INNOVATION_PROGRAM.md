@@ -75,7 +75,13 @@ m_t\in\mathbb R,
 \qquad S_t\in\mathbb R^{r\times d_v},
 \]
 
-initialized to zero. Every valid token executes exactly this order:
+initialized to zero. The equations are real-valued operator semantics and the
+executable oracle is FP64. In the first native training contract,
+projection/conv caches and vector operands are BF16, while `m,J,D,S` are FP32
+continuation states and are never rounded at chunk or recurrent-call
+boundaries.
+
+Every valid token executes exactly this order:
 
 1. update geometry once;
 2. construct one current transpose-dual solve adapter;
@@ -458,7 +464,7 @@ g_t^{(s)}
 \alpha_t=\exp(g_t^{(s)}),
 \]
 
-evaluated in FP32 before the declared state-dtype conversion.
+evaluated and retained in FP32 for the FP32 associative-state update.
 
 and apply it once:
 

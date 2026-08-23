@@ -32,6 +32,11 @@ the decision it informed.
   compression study, not part of the base model.
 - Prefer the simplest engineering form that is algebraically equivalent to the
   reference and measurably better for the intended workload.
+- The first native training contract uses BF16 activation/contraction operands
+  with FP32 accumulation. Geometry and associative continuation states,
+  log-decay and gate evaluation, normalization and radial reductions, and
+  backward partials remain FP32. FP64 remains the mathematical oracle; it is
+  not the production execution dtype.
 - Stable means finite, correct, and trainable throughout the declared dtype,
   rank, sequence-length, gate, and optimizer envelope.
 - Report residual limitations plainly. Do not hide them behind clipping,
@@ -47,6 +52,9 @@ the decision it informed.
   implementations.
 - Every state must declare shape, orientation, initialization, update order,
   dtype, padding/reset behavior, and gradient contract.
+- Native continuation states `(m,J,D,S)` are FP32 and are never rounded to BF16
+  at chunk boundaries. Such rounding would make recurrent splits change the
+  numerical recurrence rather than merely its implementation.
 - The current token updates geometry once, constructs one shared
   transpose-dual solve adapter, performs `num_edits = K` ordered associative
   micro-edits, and is read after edit `K`. `K` is a positive, static model
@@ -118,6 +126,11 @@ the decision it informed.
   layer passes its looser end-to-end ceiling. Do not add warning-only failures,
   CI relaxations, architecture-specific tolerances, or sequence-length-scaled
   allowances.
+- Runtime-oracle comparisons quantize activation operands once to BF16, promote
+  those exact values to FP64, and compare against that oracle. Tensor Core
+  contractions use BF16 multiplicands and FP32 accumulators; reduced-precision
+  accumulation is outside the contract. Primal and transpose-dual actions must
+  consume the same packed factor bits.
 - An optimized solve must state its algebraic equivalence before adoption.
   Approximate solves are experiments until forward, state, and gradient error
   are bounded over the normal training envelope.
@@ -153,8 +166,9 @@ the decision it informed.
 4. add masks, resets, packed sequences, and recurrent decoding semantics;
 5. derive exact geometry-prefix and associative chunk algebra;
 6. compare every optimized forward and gradient with the token oracle;
-7. benchmark the complete layer at the resolved `r = d_k`, including the first
-   native `r = 128` target profile and at least one non-128 reference width;
+7. benchmark the complete BF16/FP32 layer at the resolved `r = d_k`, including
+   the first native `r = 128` target profile and at least one non-128 reference
+   width;
 8. only then integrate the selected Triton--CUDA--FLA path: Triton owns prefix
    boundaries, the chunk-owned CUDA operator owns bounded frame actions, FLA
    owns the mature scan/WY exterior, and MathDx remains the exact triangular

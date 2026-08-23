@@ -4,6 +4,10 @@ import torch.nn.functional as F
 
 from causallsso import SolveDeltaState, solvedelta_reference
 from causallsso.ops import triton_geometry_chunk_scan
+from causallsso.ops.triton_geometry import (
+    _triton_geometry_chunk_scan_backward,
+    _triton_geometry_chunk_scan_forward,
+)
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -74,7 +78,7 @@ def test_triton_chunk_geometry_matches_fp64_reference(dtype, precision, ceiling)
     batch, length, heads, rank, edits, value_dim = 1, 130, 2, 64, 1, 8
     u = F.normalize(torch.randn(batch, length, heads, rank, device="cuda"), dim=-1).to(dtype)
     h = (0.2 * torch.randn_like(u.float())).to(dtype)
-    log_decay = (-0.05 * torch.rand(batch, length, heads, device="cuda")).to(dtype)
+    log_decay = -0.05 * torch.rand(batch, length, heads, device="cuda")
     boundary, final = triton_geometry_chunk_scan(
         u, h, log_decay, input_precision=precision
     )
@@ -232,7 +236,7 @@ def _geometry_vjp(
         initial_m,
         initial_J,
         initial_D,
-        torch.empty(0, device=u.device, dtype=u.dtype),
+        torch.empty(0, device=u.device, dtype=torch.float32),
     )
     boundary, final = triton_geometry_chunk_scan(
         u,
@@ -316,6 +320,175 @@ def test_triton_geometry_affine_adjoint_matches_fp64(
         assert _rho(expected_grad, actual_grad) < ceiling
 
 
+def test_triton_geometry_bf16_affine_adjoint_matches_quantized_fp64() -> None:
+    torch.manual_seed(20260906)
+    batch, length, heads, rank, chunk_size = 1, 65, 2, 128, 16
+    inputs = (
+        F.normalize(
+            torch.randn(batch, length, heads, rank, device="cuda"), dim=-1
+        ).to(torch.bfloat16),
+        (0.2 * torch.randn(batch, length, heads, rank, device="cuda")).to(
+            torch.bfloat16
+        ),
+        -0.2 * torch.rand(batch, length, heads, device="cuda"),
+        0.5 + torch.rand(batch, heads, device="cuda"),
+        0.04 * torch.randn(batch, heads, rank, rank, device="cuda"),
+        0.04 * torch.randn(batch, heads, rank, rank, device="cuda"),
+    )
+    reference_inputs = tuple(value.double() for value in inputs)
+    reference_outputs = _geometry_scan_recompute(
+        *reference_inputs, chunk_size
+    )
+    torch.manual_seed(20260907)
+    output_grads = tuple(
+        torch.randn_like(value, dtype=torch.float32)
+        for value in reference_outputs
+    )
+
+    actual = _geometry_vjp(inputs, output_grads, chunk_size=chunk_size)
+    reference_variables = tuple(
+        value.detach().double().requires_grad_(True) for value in inputs
+    )
+    expected_outputs = _geometry_scan_recompute(
+        *reference_variables, chunk_size
+    )
+    expected = torch.autograd.grad(
+        expected_outputs,
+        reference_variables,
+        tuple(value.double() for value in output_grads),
+    )
+    for index, (expected_grad, actual_grad) in enumerate(zip(expected, actual)):
+        assert torch.isfinite(actual_grad).all()
+        ceiling = 5e-3 if index < 3 else 5e-4
+        assert _rho(expected_grad, actual_grad) < ceiling
+
+
+def test_lower_level_bf16_scan_backward_keeps_fp32_partials_for_composition() -> None:
+    torch.manual_seed(20260910)
+    batch, length, heads, rank, chunk_size = 1, 17, 1, 128, 16
+    u = F.normalize(
+        torch.randn(batch, length, heads, rank, device="cuda"), dim=-1
+    ).to(torch.bfloat16)
+    h = (0.2 * torch.randn_like(u.float())).to(torch.bfloat16)
+    log_decay = -0.2 * torch.rand(batch, length, heads, device="cuda")
+    initial = SolveDeltaState(
+        0.5 + torch.rand(batch, heads, device="cuda"),
+        0.04 * torch.randn(batch, heads, rank, rank, device="cuda"),
+        0.04 * torch.randn(batch, heads, rank, rank, device="cuda"),
+        torch.empty(0, device="cuda", dtype=torch.float32),
+    )
+    boundary, final = _triton_geometry_chunk_scan_forward(
+        u,
+        h,
+        log_decay,
+        initial_state=initial,
+        chunk_size=chunk_size,
+        input_precision="ieee",
+    )
+    outputs = (*boundary[:3], *final[:3])
+    output_grads = tuple(
+        torch.randn_like(output, dtype=torch.float32) for output in outputs
+    )
+
+    partials = _triton_geometry_chunk_scan_backward(
+        u,
+        h,
+        log_decay,
+        boundary.m,
+        boundary.J,
+        boundary.D,
+        *output_grads,
+        chunk_size,
+    )
+    assert all(partial.dtype == torch.float32 for partial in partials)
+    for partial in partials[:2]:
+        assert torch.count_nonzero(partial - partial.to(torch.bfloat16).float())
+
+    public = _geometry_vjp(
+        (u, h, log_decay, initial.m, initial.J, initial.D),
+        output_grads,
+        chunk_size=chunk_size,
+    )
+    assert public[0].dtype == public[1].dtype == torch.bfloat16
+    assert public[2].dtype == torch.float32
+    assert torch.equal(public[0], partials[0].to(torch.bfloat16))
+    assert torch.equal(public[1], partials[1].to(torch.bfloat16))
+
+
+def test_triton_geometry_bf16_deep_cancellation_uses_fp32_state() -> None:
+    torch.manual_seed(20260908)
+    batch, length, heads, rank, chunk_size = 1, 16, 1, 128, 16
+    u = F.normalize(
+        torch.randn(batch, length, heads, rank, device="cuda"), dim=-1
+    ).to(torch.bfloat16)
+    h = (0.2 * torch.randn_like(u.float())).to(torch.bfloat16)
+    u[0, 0, 0].zero_()
+    u[0, 0, 0, :2] = torch.tensor(
+        [0.6953125, 0.71875], device="cuda", dtype=torch.bfloat16
+    )
+    h[0, 0, 0].zero_()
+    h[0, 0, 0, 0] = 0.6953125
+    log_decay = torch.zeros(batch, length, heads, device="cuda")
+    initial_m = torch.ones(batch, heads, device="cuda")
+    initial_J = 0.04 * torch.randn(
+        batch, heads, rank, rank, device="cuda"
+    )
+    initial_D = torch.zeros_like(initial_J)
+    initial_D[0, 0, 1, 0] = -0.5
+    inputs = (u, h, log_decay, initial_m, initial_J, initial_D)
+
+    boundary = initial_D[0, 0, 1, 0].double()
+    local = u[0, 0, 0, 1].double() * h[0, 0, 0, 0].double()
+    kappa = (boundary.abs() + local.abs()) / (boundary + local).abs()
+    assert kappa == 4095.0
+
+    reference_variables = tuple(
+        value.detach().double().requires_grad_(True) for value in inputs
+    )
+    expected_outputs = _geometry_scan_recompute(
+        *reference_variables, chunk_size
+    )
+    torch.manual_seed(20260909)
+    output_grads = tuple(
+        torch.randn_like(value, dtype=torch.float32)
+        for value in expected_outputs
+    )
+    actual = _geometry_vjp(inputs, output_grads, chunk_size=chunk_size)
+    expected = torch.autograd.grad(
+        expected_outputs,
+        reference_variables,
+        tuple(value.double() for value in output_grads),
+    )
+    for index, (expected_grad, actual_grad) in enumerate(zip(expected, actual)):
+        assert torch.isfinite(actual_grad).all()
+        ceiling = 5e-3 if index < 3 else 5e-4
+        assert _rho(expected_grad, actual_grad) < ceiling
+
+
+def test_triton_geometry_requires_fp32_decay_and_state() -> None:
+    u = torch.zeros(1, 1, 1, 32, device="cuda", dtype=torch.bfloat16)
+    h = torch.zeros_like(u)
+    low_precision_decay = torch.zeros(
+        1, 1, 1, device="cuda", dtype=torch.bfloat16
+    )
+    with pytest.raises(TypeError, match="geometry_log_decay must be FP32"):
+        triton_geometry_chunk_scan(u, h, low_precision_decay)
+
+    initial = SolveDeltaState(
+        torch.zeros(1, 1, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(1, 1, 32, 32, device="cuda", dtype=torch.float32),
+        torch.zeros(1, 1, 32, 32, device="cuda", dtype=torch.float32),
+        torch.empty(0, device="cuda", dtype=torch.float32),
+    )
+    with pytest.raises(TypeError, match="initial_state.m must be FP32"):
+        triton_geometry_chunk_scan(
+            u,
+            h,
+            torch.zeros(1, 1, 1, device="cuda"),
+            initial_state=initial,
+        )
+
+
 def test_triton_geometry_affine_adjoint_is_bitwise_repeatable() -> None:
     torch.manual_seed(20260903)
     batch, length, heads, rank, chunk_size = 2, 35, 2, 128, 32
@@ -339,7 +512,7 @@ def test_triton_geometry_affine_adjoint_is_bitwise_repeatable() -> None:
     assert all(torch.equal(left, right) for left, right in zip(first, second))
 
 
-def test_triton_geometry_affine_adjoint_driven_cancellation_contract() -> None:
+def test_triton_geometry_fp32_affine_adjoint_cancellation_diagnostic() -> None:
     torch.manual_seed(1947)
     batch, length, heads, rank = 1, 16, 1, 128
     left = F.normalize(
@@ -380,8 +553,8 @@ def test_triton_geometry_affine_adjoint_driven_cancellation_contract() -> None:
     )
     for expected_grad, actual_grad in zip(expected, actual):
         assert _rho(expected_grad, actual_grad) < 1e-4
-    # The small tail follows a legal 2^12 cancellation. Lock its absolute
-    # FP32 envelope separately so the large first coordinate cannot hide drift.
+    # This is the retained FP32 diagnostic. The BF16 production fixture is
+    # quantized before its cancellation ratio is classified.
     torch.testing.assert_close(
         actual[2][:, 1:].double(), expected[2][:, 1:], rtol=3e-2, atol=5e-4
     )
