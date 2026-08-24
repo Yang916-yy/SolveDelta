@@ -678,6 +678,85 @@ primal and two-route dual workspaces that the frame adjoint overwrites in
 place; the former `grad_d/grad_e/grad_chi` cross-kernel interface and its three
 allocations no longer exist.
 
+## MESA execution-graph and exterior-kernel audit
+
+A warmed same-device CUDA profile at
+`B=1,T=1024,H=8,r=d_v=128,C=32` was used to answer why adopting MESA's local
+Gram/two-dot identities did not make the complete operators equally fast.
+The sums below are attributed CUDA kernel time, not wall-clock medians; both
+operators exclude projections and conv4 in this comparison.
+
+| Profile | SolveDelta | FLA MESA |
+|---|---:|---:|
+| forward + backward CUDA activity | about `5.904 ms` | about `1.151 ms` |
+| main resident solve work | prepare forward `0.934 ms`; prepare backward `0.807 ms` | two 30-step CG kernels `0.737 ms` total |
+| outer state/output | state reverse `0.336 ms`; output forward `0.132 ms` | paired state forward kernels `0.044 ms` total |
+| geometry-only work | strict diagonal/cross `1.018 ms`; geometry scan adjoint `0.343 ms`; radial transpose `0.254 ms`; strict correlations `0.238 ms` | no bounded-LDU chart or separate `J/D` radial/strict VJP |
+
+This is not a contradiction in the shared local-action formula. MESA loads a
+`BT x K` tile and its `K x K` states once, then executes all 30 fixed CG
+iterations inside one resident Triton program. Its production chunk path uses
+FP16 normalized query/key panels, stores ordinary chunk states in the input
+dtype (`states_in_fp32=False`), and differentiates the approximate solve with
+one implicit adjoint solve. With its default `C=64`, it also has half as many
+chunk boundaries as SolveDelta C32.
+
+SolveDelta has a larger exact computation graph around the shared two-dot
+motif. It retains FP32 continuation states `(m,J,D,S)`, maps separate `J` and
+`D` through four bounded strict/radial chart routes, applies one primal and two
+transpose-dual actions, constructs and reverses the C32 WY system, and returns
+the exact VJP of that declared recurrence. The current implementation splits
+these stages across many CUDA/Triton programs and still performs some small
+matrix products as scalar selection/reduction loops. Therefore MESA's
+matrix-free action only accelerates one algebraic subexpression; it neither
+removes SolveDelta's additional geometry nor gives the surrounding kernels
+MESA's residency, precision, or launch schedule.
+
+The audit found a concrete non-core bottleneck. SolveDelta's current output
+kernel computes `A_qd @ residual` through 32 static `where/sum` selections and
+used about `131.5 us`; FLA's Tensor-Core `chunk_gla_fwd_kernel_o` probe used
+about `7.2 us`. Current state forward/reverse used about `59.2/335.9 us`, while
+FLA common state forward/transpose probes used about `50.2/75.9 us`. Paired WY
+itself used only about `21/36 us` forward/reverse. The next engineering target
+is consequently the state/output exterior and its transpose, not another WY
+micro-optimization.
+
+FLA main was inspected at
+[`3e61322b`](https://github.com/fla-org/flash-linear-attention/commit/3e61322b615df248e7579222d1a68260560f7c24).
+Its MESA action remains the same resident
+`dot((dot(P,K.T)*M),V)` implementation, so it supplies no newer matched strict
+transpose. It does, however, now contain a more directly useful DPLR
+[`fused H/O forward`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_ho_fwd.py)
+and
+[`streaming reverse`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_stream_bwd.py),
+including an explicit `SM120,K=V=128,BT=32` schedule. After statically deleting
+one unused DPLR route, the exact mapping is
+
+\[
+w=-Y,\quad u=U_z,\quad b_g=D_{\rm tail},\quad q_g=Q_\gamma,
+\quad A_{qb}=A_{qd},
+\]
+
+which gives `R=U_z-YS`, `S'=Lambda S+D_tail^T R`, and
+`O=Q_gamma S+A_qd R`. This is a code-block reuse candidate, not permission to
+restore the generalized-DPLR ABI. A simpler specialized Triton rewrite remains
+the first A/B; the fused TileLang schedule is the next candidate because it
+can keep residual and reverse carry on chip.
+
+The broader audit also reviewed Mamba at
+[`e9594ce1`](https://github.com/state-spaces/mamba/commit/e9594ce1c732d97440f0332fdc43170a2294dbfa),
+`causal-conv1d` at
+[`cd81f041`](https://github.com/Dao-AILab/causal-conv1d/commit/cd81f0413cad2fc1e6f17e785ac39f59aae690cd),
+and CUTLASS at
+[`7107b055`](https://github.com/NVIDIA/cutlass/commit/7107b05535f8977f5ecb9d01ee203205b1fd9bc4).
+The decisions are, in order: adopt original-stride addressing before retaining
+panel copies; A/B Mamba's deterministic-workspace versus FP32-atomic reduction
+ownership under the existing fixed gates; replace the manual conv final-cache
+slice only with the latest CUDA convolution's now-complete state VJP; and keep
+CUTLASS back-to-back/grouped examples as lower-priority scheduling references.
+The function-level inventory and adoption gates are in
+`docs/UPSTREAM_REUSE.md`.
+
 ## Explicitly closed directions
 
 The review above caused the repository to close, rather than maintain, the

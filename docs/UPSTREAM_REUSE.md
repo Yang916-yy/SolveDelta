@@ -7,9 +7,13 @@ execution contract. A checked source-review item means that the upstream block
 has been inspected, not that it has been adopted.
 
 The reviewed baseline is Flash Linear Attention (FLA) `v0.5.2`, installed in
-the repository's `causallsso` virtual environment. FLA is MIT licensed. Any
-adapted source must retain its copyright header, identify the exact upstream
-function, and update `THIRD_PARTY_NOTICES.md` before merge.
+the repository's `causallsso` virtual environment. The exterior audit also
+reviews FLA main at commit
+[`3e61322b`](https://github.com/fla-org/flash-linear-attention/commit/3e61322b615df248e7579222d1a68260560f7c24),
+because its newer fused DPLR state/output schedules did not exist in the
+installed release. FLA is MIT licensed. Any adapted source must retain its
+copyright header, identify the exact upstream function, and update
+`THIRD_PARTY_NOTICES.md` before merge.
 
 ## Reuse Rules
 
@@ -357,6 +361,15 @@ before the complete path is evaluated.
 
 ## P2: State and Output Exterior
 
+The target-profile execution audit found that this exterior is not secondary.
+The current `_output_forward_kernel` expands 32 row/column selections with
+`tl.where` and `tl.sum` instead of issuing `tl.dot(A_qd, residual)`. In a
+warmed same-device probe it used about `131.5 us`, while FLA's comparable
+`chunk_gla_fwd_kernel_o` used about `7.2 us`. The current state forward/reverse
+used about `59.2/335.9 us`; FLA common state forward/transpose probes used
+about `50.2/75.9 us`. These are isolated schedule comparisons, not adoption
+results, but they make the exterior the lowest-risk next rewrite.
+
 ### Factorized state scan
 
 Upstream:
@@ -366,10 +379,13 @@ Upstream:
 - Its paired reverse
   [`chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64`](https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/common/chunk_delta_h.py)
 
-- [x] The persistent FP32 state and declared BF16/FP16 contraction schedule is relevant to
-  SolveDelta's factorized state recurrence.
-- [ ] Reuse only after confirming native inputs match `(Y,U_z,D_tail,G_last)`
-  without a DPLR staging adapter.
+- [x] The persistent FP32 state and declared BF16/FP16 contraction schedule is
+  relevant to SolveDelta's factorized state recurrence.
+- [x] The native recurrence maps directly as
+  `k=D_tail`, `w=Y`, `u=U_z`, `v_new=U_z-Y@S`, with the existing vector
+  `G_last`; no DPLR staging adapter is algebraically required.
+- [ ] Specialize the load and `tl.dot` bodies to these native names and signs;
+  do not call the allocation-owning FLA wrapper.
 - [ ] Preserve FP32 state at every chunk boundary and both initial/final-state
   cotangents.
 - [ ] Benchmark against the current dedicated `chunk_state.py`; do not assume
@@ -392,6 +408,156 @@ Upstream:
   loses chunk-parallel CTAs and is not presumed faster.
 - [ ] Implement output reverse with the same operand rounding and causal mask
   as forward.
+
+### Fused state/output and streaming reverse
+
+Upstream, FLA main `3e61322b`:
+
+- generalized-Delta DPLR
+  [`chunk_ho_fwd.py`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_ho_fwd.py)
+- generalized-Delta DPLR
+  [`chunk_stream_bwd.py`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_stream_bwd.py)
+
+FLA's fused state equation is
+
+\[
+v_2=wS+u,\qquad
+S'=\Lambda S+k_g^Tv+b_g^Tv_2,
+\]
+
+\[
+O=q_gS+A_{qk}v+A_{qb}v_2.
+\]
+
+SolveDelta is the static one-route specialization
+
+\[
+w=-Y,\quad u=U_z,\quad b_g=D_{\rm tail},\quad q_g=Q_\gamma,
+\quad A_{qb}=A_{qd},
+\]
+
+with the `k_g/v/A_qk` route deleted. Thus `v_2=R`, and the remaining equations
+are exactly
+
+\[
+R=U_z-YS,\qquad S'=\Lambda S+D_{\rm tail}^TR,\qquad
+O=Q_\gamma S+A_{qd}R.
+\]
+
+- [x] The forward algebra and reverse carry orientation match exactly after
+  the static route deletion.
+- [x] The upstream schedule keeps the FP32 state fragment resident, computes
+  the residual at use, and can avoid global `boundaries` and `residual` in a
+  recompute configuration.
+- [x] Upstream explicitly tunes the target `K=V=128,BT=32,SM120` case rather
+  than treating GeForce Blackwell as an untested fallback.
+- [ ] Port only the resident state, residual, output, and transpose schedule.
+  Do not instantiate zero `k_g/v/A_qk` tensors and do not restore generalized
+  DPLR's public ABI.
+- [ ] A/B the context-saving training form against recomputation. SolveDelta
+  requires FP32 chunk-boundary/final state even if a private saved boundary is
+  rounded for a declared backward consumer.
+- [ ] Compare against the simpler specialized Triton state/output rewrite
+  first. TileLang is a candidate implementation tool, not a required backend.
+
+## P3: Frontend, Layout, and Reductions
+
+### Native-stride chunk addressing
+
+Upstream:
+
+- Mamba
+  [`ssd_combined.py`](https://github.com/state-spaces/mamba/blob/e9594ce1c732d97440f0332fdc43170a2294dbfa/mamba_ssm/ops/triton/ssd_combined.py)
+- FLA common state/output kernels linked above
+
+The current `native_chunk.py` uses `_panelize` to pad with `torch.cat`, then
+`permute(...).contiguous()`, and separately materializes `valid_count` and an
+expanded `panel_strength`. Mamba and FLA instead pass source strides and derive
+`batch/head/chunk/token` offsets in the consumer kernel, copying only when no
+supported contiguous dimension exists.
+
+- [x] The native `[B,T,H,r]` layout has a contiguous `r` dimension and is
+  directly addressable by every C32 frame/radial tile.
+- [ ] Make radial and strict owners consume original strides and a scalar
+  tail mask; remove the panel HBM round trip and expanded metadata tensors.
+- [ ] Keep a copy only when an actual unsupported input stride reaches the
+  public boundary, and measure that path separately from the contiguous target.
+
+### Gate, sigmoid, and local cumsum fusion
+
+Upstream, FLA main `3e61322b`:
+
+- [`gdn_gate_chunk_cumsum_scalar_kernel`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/gated_delta_rule/gate.py)
+- vector [`kda_gate_fwd/kda_gate_bwd`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/kda/gate.py)
+- [`fused_beta_sigmoid`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/common/gate.py)
+- vector [`chunk_local_cumsum`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/utils/cumsum.py)
+
+The layer currently forms erase/write sigmoid panels and both log-decays with
+ordinary PyTorch pointwise graphs, then launches a separate native vector
+cumsum. The FLA blocks provide the same FP32 `exp/softplus/sigmoid`, local
+cumsum, and strict reverse formulas.
+
+- [x] The scalar geometry gate and vector associative gate formulas match the
+  corresponding FLA producer blocks after substituting native parameters.
+- [ ] Fuse gate production with local cumsum and its reverse; fuse the two
+  `2*sigmoid` panels only if the complete layer profile shows a launch-bound
+  frontend.
+- [ ] Preserve FP32 gate evaluation and output. This reuse is scheduling only;
+  it must not adopt FLA's optional bounded-gate semantics.
+
+### Normalization
+
+Upstream:
+
+- FLA [`l2norm_fwd/l2norm_bwd`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/modules/l2norm.py)
+
+- [x] FLA already supports FP32 reduction from BF16 input and direct FP16
+  normalized output, which is SolveDelta's declared private-panel boundary.
+- [ ] Prefer a three-panel specialization for `u/q/key` over three wrapper
+  calls. The current total is only about `70 us`, so do this after state/output.
+
+### Conv4 and recurrent cache
+
+Upstream:
+
+- `causal-conv1d` commit
+  [`cd81f041`](https://github.com/Dao-AILab/causal-conv1d/commit/cd81f0413cad2fc1e6f17e785ac39f59aae690cd)
+
+The latest CUDA convolution owns fused SiLU, channel-last input, initial and
+final states, `dfinal_state`, `dinitial_state`, and deterministic or atomic
+weight-gradient reductions. This closes the final-cache VJP gap present in
+FLA 0.5.2's Triton wrapper.
+
+- [x] It can replace the manual `cat(...)[...,-4:]` final-cache construction
+  in the no-reset CUDA layer path without changing conv4 semantics.
+- [ ] Install and A/B the CUDA backend for the complete layer, including cache
+  cotangents. This is not part of the core-operator timing and cannot close the
+  current frame/state gap by itself.
+
+### Reduction ownership
+
+Upstream:
+
+- Mamba's deterministic workspace helpers and SSD backward reductions at
+  commit
+  [`e9594ce1`](https://github.com/state-spaces/mamba/commit/e9594ce1c732d97440f0332fdc43170a2294dbfa)
+
+- [x] The upstream policy supports both FP32 atomics and deterministic
+  per-tile workspaces followed by a fixed reduction, selected structurally.
+- [ ] Reuse the allocation/finalization pattern for route or coordinate-block
+  cotangents. The fixed SolveDelta repeatability and complete-path gates, not a
+  blanket preference, choose between atomics and workspace reduction.
+
+### Lower-priority CUDA templates
+
+CUTLASS main was reviewed at commit
+[`7107b055`](https://github.com/NVIDIA/cutlass/commit/7107b05535f8977f5ecb9d01ee203205b1fd9bc4).
+Its back-to-back GEMM, grouped GEMM/SYR2K, and programmatic-dependent-launch
+examples are useful scheduling references for Gram--Hadamard--action fusion
+and launch chaining. The Blackwell SSD example is SM100 `tcgen05/TMEM` code,
+not a directly reusable SM120 kernel. Previous SolveDelta CuTe broad-action
+attempts also lost occupancy, so no CUTLASS/CuTe port precedes the direct FLA
+state/output and original-stride rewrites.
 
 ## Explicit Non-Reuse
 
