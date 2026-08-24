@@ -70,7 +70,7 @@ def _normalize_backward_kernel(
 
 
 def _normalize_forward(source: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    normalized = torch.empty_like(source)
+    normalized = torch.empty_like(source, dtype=torch.float16)
     vectors = source.numel() // _RANK
     signed_inverse_norm = torch.empty(
         vectors,
@@ -164,7 +164,7 @@ def normalize_solvedelta_inputs(
     query: torch.Tensor,
     edit_key: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Normalize the three fixed r=128 key-side inputs in one VJP owner."""
+    """Normalize BF16 inputs directly into certified FP16 private panels."""
     for name, tensor in (
         ("geometry_feature", geometry_feature),
         ("query", query),

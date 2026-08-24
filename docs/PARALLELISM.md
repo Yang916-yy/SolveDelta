@@ -38,11 +38,11 @@ The first native specialization is
 r=d_k=128,\qquad K=1,\qquad C=32,
 \]
 
-with BF16 activation and matrix operands, FP32 accumulation and scalar
-evaluation, and FP32 continuation states. The formulas below are written for
-one batch element, one head, and one chunk. Batch and head dimensions are
-independent. Column-vector orientation is used in the frame, while chunk
-factors are stored by row.
+with BF16 public/raw activations, analytically bounded private FP16 panels,
+FP32 accumulation and scalar evaluation, and FP32 continuation states. The
+formulas below are written for one batch element, one head, and one chunk.
+Batch and head dimensions are independent. Column-vector orientation is used
+in the frame, while chunk factors are stored by row.
 
 The following are forbidden production interfaces:
 
@@ -690,6 +690,15 @@ W[Y\ U_z]=[E_\gamma\ Z].
 specialized kernel may use an explicit small inverse internally only if a
 matched benchmark and the same numerical gates select it.
 
+The selected C32 specialization uses FLA's 16+16 block identity internally:
+the two diagonal substitutions and the off-diagonal merge
+`R_10=-R_11 W_10 R_00` are evaluated in FP32, and `R` never leaves the
+kernel. Each private inverse block and FP32-formed RHS is rounded directly to
+BF16 for one Tensor Core product with FP32 accumulation, followed by one BF16
+panel store. No FP32 diagnostic result or high/low copy is materialized.
+`Z=write*value` is formed exactly in FP32 from the two BF16 operands at use and
+is never materialized or independently rounded as a tensor.
+
 Given the chunk input state `S_0`, define
 
 \[
@@ -772,12 +781,13 @@ first performance-oriented cache is
 \boxed{W,\ y,\ d,\ s_e,\ s_q,\ e,\ \chi}
 \]
 
-with `W` in FP32 and the vector panels in BF16 after their FP32 reductions.
+with `W` in FP32 and the analytically bounded vector panels written directly
+from their FP32 producers to FP16.
 Here `s_e=sigma*ell_e` and `s_q=sigma*ell_q`; the lower dual values required
 by reverse are recovered elementwise as `ell=s/sigma` only if a consumer
 actually needs them. This cache avoids replaying the primal solves and both
 upper dual actions. At
-`B=1,T=1024,H=8,r=128`, the six BF16 vector panels occupy about 12 MiB and
+`B=1,T=1024,H=8,r=128`, the six FP16 vector panels occupy about 12 MiB and
 `W` occupies about 1 MiB, for about 13 MiB per layer before allocator padding.
 
 The first cache A/B compares:
@@ -789,7 +799,7 @@ The first cache A/B compares:
 Cache variants are scheduling choices and must report complete forward plus
 backward wall time and peak memory. Reduced-precision private caches are
 numerical approximations of the native VJP subject to the frozen VJP gates;
-they do not redefine the FP64 operator. When cached `e/chi` are the exact BF16
+they do not redefine the FP64 operator. When cached `e/chi` are the exact FP16
 bits consumed by forward WY, saving them introduces no additional mismatch.
 No cache variant may change the forward formulas or continuation-state
 precision.
@@ -1556,35 +1566,45 @@ The native path uses the following fixed precision map.
 
 | Quantity | Native representation and arithmetic |
 |---|---|
-| projected activations, conv inputs/outputs, normalized `u/q/k`, values, erase/write operands | BF16, rounded once at the declared boundary |
+| projected/raw activations, conv inputs/outputs, unnormalized `h`, values, erase/write gates | BF16, rounded once at the public/raw boundary |
+| normalized `u/q/k` | FP32 norm and normalization, then direct FP16 private-panel store; norm and components at most one |
+| erase source `b=beta odot k` | form in FP32, then direct FP16 private-panel store; `||b||_2 <= 2` |
 | continuation and chunk-boundary `m/J/D/S` | FP32; never rounded between chunks or recurrent calls |
 | geometry and associative log-decay; `exp`, `softplus`, `sigmoid` | FP32 |
-| normalization norms; radial norms/scales; diagonal `tanh/exp`; sensitive inner products and scalar reverse | FP32 with deterministic reductions |
-| generated LDU factor coordinates | compute in FP32, pack once to BF16 when entering an MMA action |
-| primal and dual action operands | the same packed BF16 factor bits and BF16 RHS |
+| normalization norms; radial `q2`/scales; diagonal `tanh`/`expm1`; sensitive inner products and scalar reverse | FP32 with deterministic reductions |
+| generated strict L/U coordinates | compute in FP32, pack once directly to FP16 when entering an MMA action; combined Frobenius radius at most `1/4` |
+| diagonal action | keep `delta`/`expm1(delta)` FP32 and apply `exp(delta)x = x + expm1(delta)x` without materializing a BF16 identity-centered diagonal |
+| primal and dual strict-action operands | the same packed FP16 factor and certified FP16 RHS bits |
 | GEMM, dot, block update, action, and backward partials | FP32 accumulation; reduced-precision accumulation is forbidden |
-| `T`, `A_qd`, `W`, and the C32 unit-triangular solve | FP32 |
-| `D_tail/Y/U_z/Q_gamma` storage | BF16 only after FP32 accumulation and validation; any panel-type upgrade is static for the complete hardware specialization |
+| `T`, `A_qd`, and `W` storage; C32 diagonal inverse and off-diagonal merge | FP32 |
+| C32 wide-RHS forward and transpose action | direct BF16 operands, one MMA per block product, FP32 accumulation; inverse remains private |
+| certified `d/e/chi`, `D_tail/E_gamma/Q_gamma` storage | FP16 written directly by the FP32 producer; including factor rounding, norm bounds are below `2.284`, `4.014`, and `2.007` |
+| `W` and continuation/state-derived panels | FP32 |
+| unbounded `Y/U_z` solve outputs | BF16 only after FP32 accumulation; FP16 forbidden |
+| write-value product `z` | form in FP32 from BF16 gate/value operands at use; do not materialize a low-precision panel |
 | public activation and activation-gradient outputs | BF16 after the complete FP32 reduction |
 | state and scalar cotangents | FP32 |
 
 Tensor Core operand conversion is frozen per named contraction and hardware
-specialization, not selected from runtime values. The initial implementation
-uses direct BF16 packing and one MMA wherever the table below says `direct`.
-Only a contraction that fails the unchanged oracle, cancellation, or VJP gates
-is promoted. Once promoted, that contraction uses the promoted schedule for
-every legal input of the specialization.
+specialization, not selected from runtime values. Private FP16 must be written
+directly by an FP32 producer with a static analytic magnitude bound and consumed
+with FP32 accumulation. `BF16 -> FP16` can never recover bits and may lose
+exponent range; it is forbidden as pseudo-promotion. Forward and
+strict transpose reverse use the same declared bits. There is no runtime dtype
+selection, magnitude threshold, clamp, or fallback.
 
 | Contraction | Initial static schedule |
 |---|---|
-| strict `J0` boundary action and transpose | direct BF16 packing, one MMA, FP32 accumulation |
-| strict `D0` boundary action and transpose | direct BF16 packing, one MMA, FP32 accumulation; first high/low candidate if the frozen cancellation class fails |
-| broad `Y S0`, `Q_gamma S0`, `D_tail^T R_z`, and their transpose products | direct BF16 packing of the FP32 `S0` or `R_z`, one MMA, FP32 accumulation |
+| strict `J0` boundary action and transpose | frozen direct BF16 or high/low packing of FP32 boundary, FP16 certified RHS, FP32 accumulation |
+| strict `D0` boundary action and transpose | frozen direct BF16 or high/low packing of FP32 boundary, FP16 certified RHS, FP32 accumulation |
+| broad `Y S0` and transpose | `Y` is BF16 because it lacks an FP16 certificate; frozen packing of FP32 `S0`; FP32 accumulation |
+| broad `Q_gamma S0`, `D_tail^T R_z`, and transpose | certified frame operand is FP16; frozen packing of FP32 `S0` or `R_z`; FP32 accumulation |
 | `Gamma_C S0` | FP32 elementwise multiplication; no Tensor Core packing |
 | `A_qd R_z` and its transpose contributions | dedicated FP32 C32 kernel |
+| C32 inverse applied to edit/value RHS and corresponding transpose action | direct BF16 packing, one MMA per block product, FP32 accumulation |
 
-For a promoted contraction with one FP32 operand `X` and one already-BF16
-operand, use the fixed twofold representation
+For a promoted contraction with one FP32 operand `X` and one declared
+low-precision operand, use the fixed twofold BF16 representation
 
 \[
 X_{\rm hi}=\operatorname{RN}_{\rm BF16}(X),
@@ -1595,7 +1615,25 @@ X_{\rm lo}=\operatorname{RN}_{\rm BF16}(X-X_{\rm hi}),
 and two BF16 MMA products accumulated into the same FP32 result. The pair is
 one representation of one FP32 state, not two parameters, and its VJP returns
 one FP32 boundary cotangent. Persistent `J/D/S` and returned state remain FP32;
-temporary direct or high/low packing is not a BF16 state round trip.
+temporary direct or high/low packing is not a state round trip. It is separate
+from the FP32-to-FP16 private-panel rule and cannot be reached by runtime
+inspection.
+
+The FP16 panel certificate follows the FP32 chart proof. With `c=s_max=1/4`,
+
+\[
+B_P=\frac{e^{1/4}}{(1-1/4)^2}\approx2.283,
+\qquad
+B_D=(1+1/4)^2e^{1/4}\approx2.006.
+\]
+
+Thus normalized `a,q` and `b=beta odot a`, `0<=beta<=2`, give
+`||d||_2<=B_P`, `||chi||_2<=B_D`, and `||e||_2<=2B_D`. Tile-local decays are
+nonamplifying. Including FP16 strict-factor rounding gives conservative bounds
+below `2.284`, `2.007`, and `4.014`. These bounds, together with the
+strict-coordinate radius, are well inside FP16's overflow range. They do not
+bound `h`, values, `S`, `Y`, or `U_z`. Tiny-component underflow remains subject
+to the same action/VJP gates and never triggers a BF16 fallback.
 
 Data-dependent precision switching, threshold-selected fallback, iterative
 correction semantics, and silently applying direct BF16 packing after that
@@ -1644,7 +1682,9 @@ The comparison point is the continuous FP64 oracle evaluated at the exact
 runtime inputs. Generate deterministic master tensors, round each BF16 operand
 once, promote those bits to FP64, and run `causallsso/reference.py`. FP32 gate,
 decay, and state values are promoted without another BF16 rounding. Apply the
-same rule to upstream cotangents.
+same rule to upstream cotangents. For every declared private FP16 boundary,
+execute its FP32 producer, round directly to FP16, and use those exact FP16 bits
+in the same-packed FP64 action oracle.
 
 For reference `x` and optimized `x_hat`, report
 
@@ -1657,7 +1697,8 @@ a_\infty(x,\widehat x)=\|\widehat x-x\|_\infty.
 \]
 
 An FP32 internal tensor passes when `a_inf <= 1e-6` or its declared relative
-ceiling passes. A BF16 public or packed tensor uses `a_inf <= 2e-4`. The
+ceiling passes. A BF16 public tensor or declared FP16 private panel uses
+`a_inf <= 2e-4`. The
 absolute branch is not added to the relative allowance. NaN or infinity is an
 unconditional failure.
 
@@ -1690,32 +1731,66 @@ must pass these internal ceilings before end-to-end acceptance:
 
 | Boundary | Forward ceiling | Backward ceiling | Additional gate |
 |---|---:|---:|---|
-| one BF16-operand/FP32-accumulated resident tile | `tau <= 2e-4` | `tau <= 2e-4` | measure before BF16 output storage |
+| one declared-BF16/FP16-operand, FP32-accumulated resident tile | `tau <= 2e-4` | `tau <= 2e-4` | measure before low-precision output storage; same-packed oracle uses exact operand bits |
 | deterministic FP32 long triangular reduction | `tau <= 5e-4` | `tau <= 5e-4` | no data-dependent order |
 | chunk-boundary `m/J/D/H/R` | `rho <= 5e-3` | `rho <= 5e-3` | initial-state VJP `rho <= 5e-4` |
-| radial scalars and pre-pack chart from the same FP32 moments | `rho <= 1e-3` | `rho <= 3e-3` | reconstructed norm nonnegative |
-| BF16 packed factors against the exact chart | `rho <= 6e-3` | `rho <= 1e-2` | strict masks, unit diagonal, identity exact |
+| radial `q2`/scale and pre-pack chart from the same FP32 moments | `rho <= 1e-3` | `rho <= 3e-3` | ordinary envelope only; deep nonstructural cancellation gates `A=aZ`, its action, and composed VJP |
+| FP16 packed strict factors against the exact chart | `rho <= 6e-3` | `rho <= 1e-2` | strict masks and unit triangular diagonals exact; structural identity exact |
 | FP32-accumulated primal/dual action using the same packed bits | `rho <= 5e-3` | `rho <= 1e-2` | every triangular `eta <= 2e-5` |
-| composed frame factors at the quantized point | `rho <= 6e-3` | end-to-end VJP class | pre-cast `pi <= 5e-4`, stored-BF16 `pi <= 8e-3` |
+| composed frame factors at the quantized point | `rho <= 6e-3` | end-to-end VJP class | pre-cast `pi <= 5e-4`, stored-FP16 `pi <= 8e-3` |
 
 Stable WY has no newly invented tolerance row. Each `T/A_qd` interaction tile
-must pass the existing `tau <= 2e-4` contraction gate, each C32 forward and
-transpose solve must pass `eta <= 2e-5`, and the composed
+must pass the existing `tau <= 2e-4` contraction gate. The direct-BF16 C32
+forward and transpose actions must pass `rho <= 5e-3`; the private inverse and
+its residual have no standalone production gate. The composed
 `Y/U_z/D_tail/Q_gamma`, output, state, and VJP use the existing end-to-end
 classes below. The diagnostic `d/e/chi` rows in `VALIDATION_PLAN.md` remain
 legal internal checkpoints even though those tensors are not a production
 forward interface; a private saved-tensor cache remains governed by Section 8.
 
-Direct-BF16, promoted high/low, 9 MiB cache, 13 MiB cache, and FP32-cache
-variants all face these identical cancellation, state, pairing, and VJP gates.
-A variant that fails a gate is not a performance candidate; tolerance changes
-or a looser cache-specific reference are forbidden.
+For one strict route define
+
+\[
+Z=\alpha B+\sum_s w_sL_s,qquad
+n=\|Z\|_F^2,qquad
+Q=c^2+g^2n,qquad
+a=gcQ^{-1/2}.
+\]
+
+The FP64 oracle retains `n >= 0`. A native Gram/pair schedule may have a signed
+private `n_hat` because its three contractions round independently. At a
+nonstructural exact cancellation, require
+
+\[
+\widehat Q>0,\qquad
+\widehat Q,\widehat a\ \text{finite},\qquad
+a_\infty(\widehat A,A)\le2\times10^{-4}
+\ \text{or}\ \rho(\widehat A,A)\le6\times10^{-3},
+\]
+
+where `A=aZ` crosses the declared FP16 chart boundary. The action and composed
+per-dtype VJP must pass their ordinary rows. The scale-node cotangent is tested
+only through the reachable relation `bar a=<bar A,Z>`; an arbitrary `O(1)`
+cotangent at zero or deeply cancelled `Z` is not a model VJP. There is no
+separate accuracy, bitwise-zero, or sign requirement on private `q2`/scale
+(`n_hat`, `Q`, or `a`) inside this envelope, except that `Q` remains positive
+and finite.
+The explicit identity-geometry switch, `g=0`, invalid tails, strict masks, and
+unit triangular diagonals remain bitwise exact. This distinction is static and
+dtype-derived; it does not authorize a runtime threshold, clamp, precision
+fallback, or cancellation-scaled tolerance.
+
+Direct-BF16 boundary packing, promoted high/low, bounded-FP16 panels, and
+larger FP32-cache
+variants all face these identical observable, state, pairing, and VJP gates.
+A variant that fails a gate is not a performance candidate; a looser
+cache-specific reference is forbidden.
 
 The complete native row is
 
 | Advertised path | BF16 outputs and FP32 `S` | `q/k/v/S0/Cq0/Ck0/Cv0` gradients | `u/h/J0/D0` and gate/geometry gradients |
 |---|---:|---:|---:|
-| `r=128,K=1,C=32`, BF16 operands and FP32 accumulation/state/scalars | `rho <= 6e-3` | `rho <= 1.5e-2` | `rho <= 2.5e-2` |
+| `r=128,K=1,C=32`, BF16 public/raw operands, bounded private FP16 panels, and FP32 accumulation/state/scalars | `rho <= 6e-3` | `rho <= 1.5e-2` | `rho <= 2.5e-2` |
 
 Every returned geometry boundary and final state must also pass its stricter
 internal row. End-to-end tolerance cannot hide a failed scan, chart, action,
@@ -1742,9 +1817,14 @@ Acceptance requires all of the following:
    pass without a sequence-length tolerance multiplier;
 9. geometry and associative log-decays `-110` and `-1000` pass without an
    inverse-decay overflow;
-10. legal J and D cancellation fixtures, including the frozen `2^12` class,
-    pass the unchanged `VALIDATION_PLAN.md` radial and tying-map gates;
-11. repeat runs are bitwise deterministic for fixed inputs and launch config;
+10. legal J and D cancellation fixtures, including the frozen `2^12` input
+    class, pass the `VALIDATION_PLAN.md` BF16-observable radial, action, VJP,
+    and tying-map gates;
+11. fixed-tree kernels are bitwise deterministic for fixed inputs and launch
+    config; an FP32 atomic route/coordinate-block reduction may instead use
+    the fixed `rho_repeat <= 1e-6` gate from `VALIDATION_PLAN.md`, provided
+    every run also passes its oracle/VJP ceiling and the atomic schedule wins
+    complete forward-plus-backward median and p95 latency;
 12. unsupported widths, edit counts, dtypes, masks, resets, packed layouts, or
     architectures fail explicitly until their exact native path is accepted.
 
@@ -1754,7 +1834,8 @@ The primary operator profile is
 
 ```text
 B=1, T=1024, H=8, r=d_v=128, K=1, C=32,
-BF16 activation/matrix operands, FP32 accumulation and recurrent state.
+BF16 public/raw operands, analytically bounded private FP16 panels, FP32
+accumulation, and FP32 recurrent state.
 ```
 
 Report forward, backward alone, forward plus backward, peak memory, and launch

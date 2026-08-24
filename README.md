@@ -1,7 +1,8 @@
 # SolveDelta
 
 > **Status:** unfinished research repository. The FP64 operator contract and
-> first BF16-operands/FP32-accumulation numerical contract are frozen. The one
+> first BF16-observable, bounded-private-FP16, FP32-accumulation numerical
+> contract are frozen. The one
 > native training path is implemented for `r=128`, `K=1`, `C=32` on SM120, but
 > its resident frame reverse is still the dominant performance and workspace
 > cost. Deep-cancellation shared-strength gradients use a separately derived
@@ -33,10 +34,12 @@ reductions or comparison baselines.
   action; erase and read covectors use the exact dual action.
 - Channel-wise associative decay is enabled by default and has one structural
   off intervention for exact ungated Delta-family reductions.
-- Native activations and large contraction operands are BF16. Tensor Core
-  contractions, normalization/radial reductions, gate and decay evaluation,
-  backward partials, and recurrent `m,J,D,S` states accumulate or reside in
-  FP32. State is never rounded at chunk boundaries.
+- Public and raw native activations remain BF16. Analytically bounded private
+  panels are produced in FP32 and stored directly as FP16. Tensor Core
+  contractions and backward partials accumulate in FP32; normalization/radial
+  reductions, gate and decay evaluation, and recurrent `m,J,D,S` states also
+  compute or reside in FP32. State is never rounded at chunk boundaries, and
+  BF16-to-FP16 casts are not treated as precision promotion.
 
 Per head, the recurrent operator state is
 
@@ -90,31 +93,39 @@ The intended training path has one direction:
 \[
 \text{Triton geometry boundaries}
 \longrightarrow
-\text{chunk-owned frame forward/backward}
+\text{chunk-owned frame and pair statistics}
 \longrightarrow
-\text{FLA generalized Delta/WY}.
+\text{FLA-derived C32 WY blocks and project-owned state scan}.
 \]
 
-Its required execution form is BF16 Tensor Core operands with FP32
-accumulation and continuation state. The FP64 oracle is evaluated after the
-runtime operands have been rounded once to BF16, so validation separates input
-representation from kernel arithmetic.
+Its frozen rewrite target uses BF16 public/raw operands, FP32-produced private
+FP16 panels where the chart supplies an analytic range certificate, and FP32
+Tensor Core accumulation and continuation state. The FP64 oracle is evaluated
+after public runtime operands have been rounded once to BF16; a same-packed
+internal oracle separately consumes the exact declared FP16 panel bits.
 
-The Triton affine scan and adjoint consume BF16 geometry activations while
-keeping chunk boundaries and final `(m,J,D)` states in FP32. The resident CUDA
-frame consumes BF16 vectors and packed factors, accumulates actions and reverse
-partials in FP32, emits BF16 `d,e,chi`, and saves compact FP32 chart data for one
-joint backward. The composed autograd owner joins the frame cotangents with the
-FP32 scan adjoint before any BF16 leaf cast. Tensor Core instructions are used
-by the Triton scan/WY contractions and the resident reverse's broad BF16
-`bmm`s; the custom resident forward and compact CUDA primitives remain
-scalar-FMA kernels. Full block-action MMA utilization is still open.
+In the selected rewrite, Triton normalization loads raw BF16 geometry, query,
+and key activations, computes in FP32, and writes private FP16 `u/q/k` panels;
+the affine scan consumes `u` while keeping chunk boundaries and final
+`(m,J,D)` states in FP32. Bounded frame producers likewise write erase-source,
+strict-coordinate, and certified frame-action panels directly from FP32 to
+FP16. Paired actions and their transpose accumulate
+in FP32 from those exact bits. Radial, strict-diagonal, and sensitive scalar
+reductions remain FP32, as do all state and scalar cotangents. Nonstructural
+deep cancellation is accepted at the BF16-observable chart action and VJP,
+not by requiring a private expanded norm to be bitwise exact. Structural
+identity remains exact. The current CUDA checkpoint still stores these private
+panels as BF16; the direct FP32-to-FP16 producer boundary, radial replay
+removal, and remaining pair-to-frame fusion are rewrite work, not completed
+claims.
 
-The WY exterior specializes FLA 0.5.2's mature generalized-Delta kernels to
-generate `a=-e*exp(g)` at use. It neither materializes nor saves `a`, and its
-backward folds the pullback directly into `e` and `g`. The current frame/WY
-boundary still explicitly materializes `d,e,chi`; this is not a fully fused
-Solve-to-WY kernel. The former packet, panel, `chunk_frame`,
+The C32 WY owner specializes FLA 0.5.2's 16+16 unit-lower inverse, wide-RHS
+application, and matrix reverse to SolveDelta's native panels. It keeps the
+inverse private, never materializes a concatenated RHS, applies each solve
+block with one direct BF16 Tensor Core product and FP32 accumulation, and fuses
+`-barB X^T` with the `write/value` pullback. The current frame/WY boundary
+still explicitly materializes private `d,e,chi` caches; this is not a fully
+fused Solve-to-WY kernel. The former packet, panel, `chunk_frame`,
 `tensorcore_frame`, `triton_frame`, standalone polynomial solve, isolated
 chart-VJP, and all-FP32 C32 ABIs have been removed rather than retained as
 compatibility paths.
@@ -122,18 +133,20 @@ compatibility paths.
 On the local SM120 target profile
 `B=1,T=1024,H=8,r=d_v=128,K=1,C=32`, warmed medians are:
 
-| Component | Forward | Forward + backward |
+| Complete-operator measurement | Scalar C32 solve at `6d4e53f` | FLA-derived C32 block |
 |---|---:|---:|
-| Triton geometry scan | `0.119 ms` | `0.695 ms` |
-| resident frame | `1.243 ms` | `6.174 ms` |
-| direct-`e` WY exterior | `0.234 ms` | `0.936 ms` |
-| complete SolveDelta operator | `1.669 ms` | `7.740 ms` |
-| matched GDN2 operator | `0.358 ms` | `1.154 ms` |
+| forward | `1.639--1.643 ms` | `1.608--1.620 ms` |
+| forward + backward | `6.885--7.122 ms` | `6.443--6.497 ms` |
+| isolated paired WY forward/reverse | scalar reverse about `0.272 ms` | `0.023 / 0.040 ms` |
 
-Resident frame backward is therefore about `4.93 ms` and remains the primary
-optimization target; the direct-`e` WY exterior is already close to the
-matched GDN2 core. The current implementation passes ordinary forward,
-state, VJP, irregular-tail, identity, and repeatability checks. In two deepest
+Across the two matched rounds, complete forward-plus-backward improved by
+about `5.6--9.5%`. In the current run, complete backward is about `4.88 ms` by
+forward subtraction; the remaining frame/radial/strict/state/scan aggregate,
+not the roughly `0.040 ms` paired-WY reverse, is now the primary optimization
+target. The separately matched GDN2 operator remains much faster at about
+`0.358 ms` forward and `1.154 ms` forward-plus-backward. The current
+implementation passes ordinary forward, state, VJP, irregular-tail, identity,
+and repeatability checks. In two deepest
 `2^12` cancellation fixtures the six shared-strength channels nearly cancel in
 the final tied scalar, making relative-to-total error ill-conditioned. Those
 fixtures are judged by the operator-scaled error of the fixed six-to-one tying
@@ -144,13 +157,15 @@ warning-only exception is used.
 
 These are operator measurements: SolveDelta includes normalization, geometry
 scan, resident frame, WY, and final state; GDN2 includes its corresponding
-normalization/core/final-state work. Neither row includes input/output
-projections or conv4.
+normalization/core/final-state work. Neither operator timing includes
+input/output projections or conv4.
 
 MathDx is retained only as an optional exact `r=128` triangular validation
 oracle and possible decode candidate. It is not imported by model dispatch and
-is not a default build dependency. FLA owns the mature generalized Delta/WY
-exterior; project code owns the geometry scan and local frame action.
+is not a default build dependency. FLA supplies the attributed C32 inverse,
+wide-RHS application, and matrix-reverse blocks; project code owns the
+specialized composition, geometry scan, local frame action, pair reverse, and
+state exterior.
 
 See [docs/PARALLELISM.md](docs/PARALLELISM.md) for the execution design and
 [docs/VALIDATION_PLAN.md](docs/VALIDATION_PLAN.md) for acceptance gates.

@@ -32,11 +32,23 @@ the decision it informed.
   compression study, not part of the base model.
 - Prefer the simplest engineering form that is algebraically equivalent to the
   reference and measurably better for the intended workload.
-- The first native training contract uses BF16 activation/contraction operands
-  with FP32 accumulation. Geometry and associative continuation states,
-  log-decay and gate evaluation, normalization and radial reductions, and
-  backward partials remain FP32. FP64 remains the mathematical oracle; it is
-  not the production execution dtype.
+- The first native training contract is BF16-observable with BF16 public and
+  raw operands, analytically bounded private FP16 panels, and FP32
+  accumulation. Geometry and associative continuation states, log-decay and
+  gate evaluation, normalization and radial reductions, sensitive scalars,
+  and backward partials remain FP32. FP64 remains the mathematical oracle; it
+  is not the production execution dtype.
+- A private panel may be FP16 only when its FP32 producer has a static analytic
+  magnitude bound safely inside the FP16 finite range, writes the FP16 panel
+  directly, and every consumer accumulates in FP32. Forward and reverse use
+  the same frozen panel schedule. Casting an already-rounded BF16 tensor to
+  FP16 recovers no information, may lose exponent range, and is forbidden as
+  pseudo-promotion. There is no runtime dtype selection, magnitude threshold,
+  or precision fallback.
+- Numerical acceptance is defined at BF16-observable chart actions and VJPs.
+  Structural identity interventions remain bitwise exact, but a private
+  expanded radial quadratic is not required to reproduce nonstructural
+  cancellation below BF16 action resolution.
 - Stable means finite, correct, and trainable throughout the declared dtype,
   rank, sequence-length, gate, and optimizer envelope.
 - Report residual limitations plainly. Do not hide them behind clipping,
@@ -126,11 +138,19 @@ the decision it informed.
   layer passes its looser end-to-end ceiling. Do not add warning-only failures,
   CI relaxations, architecture-specific tolerances, or sequence-length-scaled
   allowances.
-- Runtime-oracle comparisons quantize activation operands once to BF16, promote
-  those exact values to FP64, and compare against that oracle. Tensor Core
-  contractions use BF16 multiplicands and FP32 accumulators; reduced-precision
-  accumulation is outside the contract. Primal and transpose-dual actions must
-  consume the same packed factor bits.
+- Runtime-oracle comparisons quantize public/raw activation operands once to
+  BF16, promote those exact values to FP64, and compare against that oracle.
+  A declared FP16 private panel is instead produced by the matching FP32
+  operation and rounded directly to FP16 on both native and same-packed oracle
+  paths. Tensor Core contractions use the declared BF16 or FP16
+  multiplicands and FP32 accumulators; reduced-precision accumulation is
+  outside the contract. Primal and transpose-dual actions must consume the
+  same packed factor bits.
+- Keep structural zero distinct from algebraic cancellation. Explicit identity
+  geometry, zero strength, invalid padding, and disabled components must remain
+  exact. A nonstructural zero produced by cancellation is accepted through the
+  fixed per-dtype `q2`, chart-action, and VJP gates in
+  `docs/VALIDATION_PLAN.md`; do not add a data-dependent threshold or fallback.
 - An optimized solve must state its algebraic equivalence before adoption.
   Approximate solves are experiments until forward, state, and gradient error
   are bounded over the normal training envelope.
@@ -166,7 +186,7 @@ the decision it informed.
 4. add masks, resets, packed sequences, and recurrent decoding semantics;
 5. derive exact geometry-prefix and associative chunk algebra;
 6. compare every optimized forward and gradient with the token oracle;
-7. benchmark the complete BF16/FP32 layer at the resolved `r = d_k`, including
+7. benchmark the complete BF16/FP16/FP32 layer at the resolved `r = d_k`, including
    the first native `r = 128` target profile and at least one non-128 reference
    width;
 8. only then integrate the selected Triton--CUDA--FLA path: Triton owns prefix

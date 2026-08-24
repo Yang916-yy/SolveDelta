@@ -144,7 +144,14 @@ def _chunk_matrix_summary_kernel(
     # operand and makes the two dot operands ill-typed.
     weighted_left = u_left * local_weights.to(u_left.dtype)[None, :]
     j_tile = tl.dot(weighted_left, u_right, input_precision=input_precision)
-    d_tile = tl.dot(weighted_left, h_right, input_precision=input_precision)
+    # D keeps the raw h operand's representation. In the production mixed
+    # schedule this is BF16, so the already bounded FP16 u panel is packed to
+    # BF16 only for this named contraction; J retains both FP16 operands.
+    d_tile = tl.dot(
+        weighted_left.to(h_right.dtype),
+        h_right,
+        input_precision=input_precision,
+    )
 
     output_base = (head_batch * chunks + chunk) * rank * rank
     output_offsets = output_base + rows[:, None] * rank + cols[None, :]
@@ -347,7 +354,9 @@ def _chunk_summary_vector_vjp_kernel(
     stride_ht: tl.constexpr,
     stride_hh: tl.constexpr,
     stride_hr: tl.constexpr,
-    use_bf16_mma: tl.constexpr,
+    use_low_precision_mma: tl.constexpr,
+    u_is_fp16: tl.constexpr,
+    h_is_fp16: tl.constexpr,
     add_local_partials: tl.constexpr,
     add_panel_partials: tl.constexpr,
 ):
@@ -412,40 +421,67 @@ def _chunk_summary_vector_vjp_kernel(
         )
         grad_J_symmetric = grad_J + tl.trans(grad_Jt_source)
         grad_D_transposed = tl.trans(grad_Dt_source)
-        if use_bf16_mma:
-            grad_J_symmetric = grad_J_symmetric.to(
-                tl.bfloat16, fp_downcast_rounding="rtne"
-            )
-            grad_D = grad_D.to(
-                tl.bfloat16, fp_downcast_rounding="rtne"
-            )
-            grad_D_transposed = grad_D_transposed.to(
-                tl.bfloat16, fp_downcast_rounding="rtne"
-            )
-            source_u = source_u.to(
-                tl.bfloat16, fp_downcast_rounding="rtne"
-            )
-            source_h = source_h.to(
-                tl.bfloat16, fp_downcast_rounding="rtne"
-            )
+        if use_low_precision_mma:
+            if u_is_fp16:
+                grad_J_operand = grad_J_symmetric.to(
+                    tl.float16, fp_downcast_rounding="rtne"
+                )
+                source_u_j = source_u.to(
+                    tl.float16, fp_downcast_rounding="rtne"
+                )
+            else:
+                grad_J_operand = grad_J_symmetric.to(
+                    tl.bfloat16, fp_downcast_rounding="rtne"
+                )
+                source_u_j = source_u.to(
+                    tl.bfloat16, fp_downcast_rounding="rtne"
+                )
+            if h_is_fp16:
+                grad_D_operand = grad_D.to(
+                    tl.float16, fp_downcast_rounding="rtne"
+                )
+                grad_Dt_operand = grad_D_transposed.to(
+                    tl.float16, fp_downcast_rounding="rtne"
+                )
+                source_h_d = source_h.to(
+                    tl.float16, fp_downcast_rounding="rtne"
+                )
+                source_u_d = source_u.to(
+                    tl.float16, fp_downcast_rounding="rtne"
+                )
+            else:
+                grad_D_operand = grad_D.to(
+                    tl.bfloat16, fp_downcast_rounding="rtne"
+                )
+                grad_Dt_operand = grad_D_transposed.to(
+                    tl.bfloat16, fp_downcast_rounding="rtne"
+                )
+                source_h_d = source_h.to(
+                    tl.bfloat16, fp_downcast_rounding="rtne"
+                )
+                source_u_d = source_u.to(tl.bfloat16)
         else:
-            source_u = source_u.to(tl.float32)
-            source_h = source_h.to(tl.float32)
+            grad_J_operand = grad_J_symmetric
+            grad_D_operand = grad_D
+            grad_Dt_operand = grad_D_transposed
+            source_u_j = source_u.to(tl.float32)
+            source_u_d = source_u_j
+            source_h_d = source_h.to(tl.float32)
         action_J_symmetric += tl.dot(
-            grad_J_symmetric,
-            source_u,
+            grad_J_operand,
+            source_u_j,
             input_precision="ieee",
             out_dtype=tl.float32,
         )
         action_D += tl.dot(
-            grad_D,
-            source_h,
+            grad_D_operand,
+            source_h_d,
             input_precision="ieee",
             out_dtype=tl.float32,
         )
         action_Dt += tl.dot(
-            grad_D_transposed,
-            source_u,
+            grad_Dt_operand,
+            source_u_d,
             input_precision="ieee",
             out_dtype=tl.float32,
         )
@@ -597,9 +633,10 @@ def _triton_geometry_chunk_scan_forward(
 ) -> tuple[SolveDeltaState, SolveDeltaState]:
     """Compute chunk-start and final geometry states without tokenwise matrices.
 
-    ``u`` must already be normalized. Vector operands ``u,h`` use FP32, BF16,
-    or FP16 while log-decay and all boundary states are FP32. Boundary ``S``
-    tensors are empty because this operation owns only ``m,J,D``.
+    ``u`` must already be normalized. The production pair is bounded FP16
+    ``u`` with raw BF16 ``h``; equal FP32/BF16/FP16 dtypes remain oracle and
+    provenance modes. Log-decay and all boundary states are FP32. Boundary
+    ``S`` tensors are empty because this operation owns only ``m,J,D``.
     """
     if not torch.cuda.is_available() or u.device.type != "cuda":
         raise ValueError("Triton geometry scan requires CUDA tensors")
@@ -609,8 +646,13 @@ def _triton_geometry_chunk_scan_forward(
         raise ValueError("geometry_log_decay must have shape [B, T, H]")
     if u.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise TypeError("Triton geometry scan supports FP32, BF16, or FP16 inputs")
-    if h.dtype != u.dtype:
-        raise TypeError("u and h must share one vector dtype")
+    if h.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise TypeError("Triton geometry scan supports FP32, BF16, or FP16 inputs")
+    if h.dtype != u.dtype and (u.dtype, h.dtype) != (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise TypeError("mixed geometry operands require FP16 u and BF16 h")
     if geometry_log_decay.dtype != torch.float32:
         raise TypeError("geometry_log_decay must be FP32")
     if chunk_size not in (16, 32, 64):
@@ -749,9 +791,9 @@ def _triton_geometry_chunk_scan_backward(
 ) -> tuple[torch.Tensor, ...]:
     """Return affine-scan partials for a surrounding composed backward.
 
-    Standalone scan partials are FP32. When resident FP32 local partials are
-    supplied, the final vector stores use the activation dtype so the composed
-    owner performs the only BF16 rounding at its public autograd boundary.
+    Standalone and composed scan partials are FP32. When resident FP32 local
+    partials are supplied, they are accumulated before the composed owner
+    performs the only low-precision cast at its public autograd boundary.
     """
     batch, length, heads, rank = u.shape
     chunks = triton.cdiv(length, chunk_size)
@@ -887,12 +929,9 @@ def _triton_geometry_chunk_scan_backward(
         num_stages=1,
     )
 
-    # ``u`` and ``h`` may be BF16 contraction operands. Keep their scan
-    # partials in FP32 so a composed owner can add frame partials before the
-    # single activation-gradient cast at its outer boundary.
-    activation_dtype = (
-        u.dtype if add_local_partials or add_panel_partials else torch.float32
-    )
+    # Mixed FP16/BF16 operands still share FP32 scan and frame partials. The
+    # composed owners perform the only casts at their actual autograd leaves.
+    activation_dtype = torch.float32
     grad_u = torch.empty(u.shape, device=u.device, dtype=activation_dtype)
     grad_h = torch.empty(h.shape, device=h.device, dtype=activation_dtype)
     local_u_pointer = local_grad_u if add_local_partials else grad_u
@@ -938,7 +977,9 @@ def _triton_geometry_chunk_scan_backward(
         stride_ht=h.stride(1),
         stride_hh=h.stride(2),
         stride_hr=h.stride(3),
-        use_bf16_mma=u.dtype == torch.bfloat16,
+        use_low_precision_mma=u.dtype != torch.float32,
+        u_is_fp16=u.dtype == torch.float16,
+        h_is_fp16=h.dtype == torch.float16,
         add_local_partials=add_local_partials,
         add_panel_partials=add_panel_partials,
         num_warps=8,

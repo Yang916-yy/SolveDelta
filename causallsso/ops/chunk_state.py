@@ -147,7 +147,10 @@ def _state_forward_kernel(
         local_D = tl.load(
             D_tail + vector_offsets, mask=vector_mask, other=0.0
         )
-        update = tl.dot(tl.trans(local_D), local_residual.to(tl.bfloat16))
+        update = tl.dot(
+            tl.trans(local_D.to(tl.bfloat16)),
+            local_residual.to(tl.bfloat16),
+        )
         gate = tl.load(
             G_last + panel * K + coordinates,
             mask=coordinates < K,
@@ -212,7 +215,7 @@ def _output_forward_kernel(
         mask=(coordinates[:, None] < K) & (values[None, :] < V),
         other=0.0,
     ).to(tl.float32)
-    result = tl.dot(query, state.to(tl.bfloat16))
+    result = tl.dot(query.to(tl.bfloat16), state.to(tl.bfloat16))
     interaction = tl.load(
         A_qd
         + panel * C * C
@@ -310,7 +313,9 @@ def _state_backward_kernel(
         local_D = tl.load(
             D_tail + vector_offsets, mask=vector_mask, other=0.0
         )
-        local_grad_residual = tl.dot(local_D, carry.to(tl.bfloat16))
+        local_grad_residual = tl.dot(
+            local_D.to(tl.bfloat16), carry.to(tl.bfloat16)
+        )
         interaction = tl.load(
             A_qd
             + panel * C * C
@@ -350,7 +355,10 @@ def _state_backward_kernel(
             other=float("-inf"),
         ).to(tl.float32)
         carry = (
-            tl.dot(tl.trans(local_Q), local_grad_output.to(tl.bfloat16))
+            tl.dot(
+                tl.trans(local_Q.to(tl.bfloat16)),
+                local_grad_output.to(tl.bfloat16),
+            )
             + tl.exp(gate)[:, None] * carry
             - tl.dot(
                 tl.trans(local_Y), local_grad_residual.to(tl.bfloat16)

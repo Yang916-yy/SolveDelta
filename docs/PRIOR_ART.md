@@ -1,7 +1,7 @@
 # Prior Work and Decision Ledger
 
 This file records primary sources that changed the single SolveDelta design. A
-source is not a second project direction. Access and review date: 2026-08-24.
+source is not a second project direction. Access and review date: 2026-08-25.
 
 ## Delta recurrence and parallel algebra
 
@@ -55,7 +55,9 @@ that schedule for geometry/frame state, but saves FLA's compact WY exterior
 because a local target-profile benchmark found it about 28% faster for only
 about 5.5 MiB extra peak memory. The two FLA issue reports changed validation,
 not model math: cross-chunk lengths, multiple seeds and gate regimes, and
-repeat-run gradient determinism are mandatory checks for the optimized path.
+repeat-run gradient stability are mandatory checks for the optimized path.
+Fixed-tree kernels remain bitwise checked; a selected FP32 atomic reduction
+uses the fixed bounded-repeatability gate in `docs/VALIDATION_PLAN.md`.
 
 Decision: the generalized DPLR exterior admits the finite equivalent mapping
 `k=b=d` and `a=-e*exp(g)`, instead of `k=d`, `b=-d`, and `a=e*exp(g)`. The
@@ -84,6 +86,67 @@ interaction/frame/chart transpose actions rather than a chain of entrywise
 VJPs. DeltaNet's WY derivation and FLA's GDN2/Delta implementation informed
 this schedule; the exact forward, reverse, precision map, ABI, and acceptance
 conditions are frozen in `docs/PARALLELISM.md`.
+
+Decision: a source-level audit of FLA `v0.5.2` identified smaller reusable
+kernel blocks without reviving its model ABIs. The selected candidates are the
+C32 16+16 unit-lower inverse and wide-RHS WY application from FLA's triangular
+and generalized-Delta kernels; stable causal pair contractions and their fused
+matrix reverse from KDA/GDN2/generalized-Delta; and MESA-Net's matrix-free
+`((X B^T) \odot \Omega) A` chunk action, moment-tile update, and pair-score
+reverse reductions. MESA's CG iteration, ridge/SPD semantics, and perturbation
+constants are explicitly not candidates. `docs/UPSTREAM_REUSE.md` records the
+function-level mapping, required specialization, transpose owner, provenance,
+and adoption gates. This audit changes implementation priorities, not the
+operator contract.
+
+Decision update (2026-08-25): FLA main was checked again at commit
+`3e61322b615df248e7579222d1a68260560f7c24`. Its current MESA local action still
+uses the same `tl.dot((tl.dot(P, K.T) * M), V)` schedule and the same
+Gram/Hadamard transpose patterns; no newer matched forward/transpose block was
+available to adopt. Local deterministic, atomic, and route-streaming
+transpose schedules were therefore judged by complete SolveDelta F+B rather
+than source resemblance. The tested atomic schedule's roughly `1.2e-7`
+run-to-run drift was numerically acceptable, but that particular integration
+did not improve complete F+B and was deleted. This is not a categorical ban on
+FP32 atomic accumulation: a fused route/coordinate-block schedule remains
+eligible if it passes the fixed repeatability and oracle/VJP gates and wins the
+complete path.
+
+Decision: the first adopted block is
+`causallsso/ops/paired_wy.py::_inverse_c32_blocks`, specialized from FLA
+`v0.5.2`'s `merge_16x16_to_32x32_inverse_kernel`, together with the wide-RHS
+application schedule from `wu_fwd_kernel` and matrix reverse pattern from
+`prepare_wy_repr_bwd_kernel`. It recomputes the private 16+16 inverse from FP32
+`W`, applies the native edit and value RHS
+without concatenating or materializing the inverse, and fuses
+`bar W=-bar B X^T` with the `write/value` pullback. The initial implementation
+rejected direct BF16 inverse/RHS operands despite their passing end-to-end VJP:
+their private C32 solve residual was about `7.6e-4` forward and `9.1e-5` in
+transpose, above an inherited `eta <= 2e-5` gate. It used four-product twofold
+BF16 solely to make that private diagnostic pass.
+
+Decision revision (2026-08-25): the BF16-observable contract does not expose
+the private inverse or FP32 pre-storage residual. Those quantities do not
+justify a stricter production implementation when the stored solve action,
+matrix reverse, output, state, and composed VJP pass their declared gates;
+`eta <= 2e-5` remains an independent MathDx-oracle requirement. The FP32
+diagnostic and twofold helper were deleted. Direct BF16 with one MMA per block
+product measured `rho` about `2.3e-3` for stored forward actions,
+`1.7e-3` for the transpose RHS action, and at most `3.1e-3` for the isolated
+leaf/`W` reverse. A real `T=1024,H=8` SolveDelta-produced system with maximum
+strict entry about `0.218` gave `2.40e-3/2.34e-3` forward-action error,
+`1.68e-3` transpose-action error, and at most `2.82e-3` leaf-VJP error. At
+`B=1,T=1024,H=8,r=d_v=128,C=32`, a matched current-tree A/B changed isolated
+forward/reverse from `0.0416/0.0634 ms` to `0.0399/0.0613 ms`. The original
+FLA-derived checkpoint measured about `0.023/0.040 ms`, versus about `0.272 ms`
+for the displaced scalar reverse.
+Two matched complete-operator rounds against commit `6d4e53f` reduced median
+forward-plus-backward from `6.885--7.122 ms` to `6.443--6.497 ms`, about
+`5.6--9.5%`; forward moved from `1.639--1.643 ms` to `1.608--1.620 ms`.
+The old scalar forward solve, scalar transpose solve, `grad_Z` workspace, and
+separate value-backward launch were deleted. At this checkpoint stable W/A
+construction and the pair-to-frame gradient interface remained open; the later
+frame-ownership change recorded below removed that interface.
 
 Decision: the installed FLA 0.5.2 GDN2 and GatedDeltaProduct layers establish
 three independent depthwise causal `conv4`, bias-free, SiLU branches over the
@@ -115,21 +178,25 @@ initial-cache, and weight gradients.
   and
   [chunk operator](https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/gdn2/chunk.py).
 
-Decision: BF16 is SolveDelta's first native activation and contraction operand
-dtype. Tensor Core products accumulate in FP32; normalization, radial norms,
-log-decay and gate nonlinearities, backward partials, and continuation states
-`m,J,D,S` also remain FP32. Public activation results and leaf gradients return
-to BF16 only after their FP32 reductions. This follows the established mixed
-training boundary while preserving the full FP32 exponent range for recurrent
-state. Rounding state at each chunk is rejected because it makes the numerical
-recurrence depend on the chosen split.
+Decision: BF16 is SolveDelta's public/raw activation dtype, not the mandatory
+storage dtype for every private Tensor Core panel. Tensor Core products
+accumulate in FP32; normalization, radial norms, log-decay and gate
+nonlinearities, backward partials, sensitive scalars, and continuation states
+`m,J,D,S` also remain FP32. An analytically bounded FP32 producer may write a
+named private panel directly as FP16, and its matched reverse consumes the same
+bits with FP32 accumulation. Public activation results and leaf gradients
+return to BF16 only after their FP32 reductions. Rounding state at each chunk
+is rejected because it makes the numerical recurrence depend on the chosen
+split.
 
 Decision: the installed GDN2 layer leaves `q,k,v,b,w` in model dtype, evaluates
 its log-decay in FP32, requires an FP32 initial recurrent state, uses low-
 precision `tl.dot` operands with FP32 accumulators, accumulates major backward
 partials in FP32, and casts returned activation gradients to their input dtype.
-Its public example uses BF16. SolveDelta adopts those boundaries rather than
-the former FP16-outer/FP32-frame staging choice. A local GDN2 BF16 audit against
+Its public example uses BF16. SolveDelta adopts those public and FP32-state
+boundaries. It does not copy GDN2's private operand dtype blindly: bounded
+private FP16 panels are permitted by the separate MESA precedent below. A
+local GDN2 BF16 audit against
 the same-quantized-input FP64 recurrence measured about `3.19e-3` output,
 `2.23e-3` state, and less than `4.5e-3` gradient error.
 
@@ -142,6 +209,22 @@ twofold/high-low contractions may be used where an ordinary product fails, as
 supported by the accurate-dot and Tensor Core decomposition literature, but
 they must be fused, deterministic, and measured. They do not permit iterative
 correction semantics, BF16 state storage, or a data-dependent fallback.
+
+- MESA-Net FLA 0.5.2
+  [`chunk.py`](https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/mesa_net/chunk.py).
+
+Decision: MESA's in-kernel normalization calls `l2norm_fwd(...,
+output_dtype=torch.float16)` for BF16 model inputs. The FP32 normalization
+producer therefore writes bounded FP16 `q/k` panels directly, gaining three
+significand bits while remaining safe because every normalized component has
+magnitude at most one. Its alternate plain `q.to(float16)` path provides no
+such gain: it is exact only over the formats' shared normal exponent range,
+cannot restore discarded BF16 bits, and can lose values outside FP16's range.
+This informed SolveDelta's
+single `BF16 public/raw -> FP32 producer -> bounded FP16 private -> FP32
+accumulator` contract. It does not authorize FP16 `h`, values, recurrent state,
+or solve panels without an analytic magnitude certificate, and it introduces
+no runtime precision branch.
 
 Decision: a fixed high/low Tensor Core representation of an FP32 boundary is
 one continuous state, not two independently differentiated parameters. Its
@@ -365,15 +448,16 @@ requirements for its ABI.
 
 The generic quasiseparable order of a dense continuation can still grow to
 `floor(r/2)`. The generator algorithm is therefore not evidence that the full
-chart has constant ordinary rank or permission to compress `J` or `D`. A plain
-IEEE-FP32 Gram expansion remains rejected because legal boundary/local
-cancellation can lose the residual or reconstruct a negative squared norm.
-The selected resident path preserves four independent radial channels. Each
-named FP32-state contraction starts with one statically frozen direct-BF16
-packing; high/low is permitted only as a static promotion of the particular
-contraction that fails an unchanged oracle or cancellation gate. The same
-`2^12` cancellation cases remain mandatory; mixed precision does not turn
-them into warning-only diagnostics.
+chart has constant ordinary rank or permission to compress `J` or `D`. The
+selected resident path preserves four independent radial channels. A plain
+IEEE-FP32 Gram expansion may reconstruct a small signed quadratic under legal
+boundary/local cancellation, so deep-cancellation acceptance gates the fixed
+BF16-observable chart coordinate `A=aZ`, its action, and composed VJP rather
+than the private expanded `q2` or scale. Each named FP32-state
+contraction starts with one statically frozen direct-BF16 packing; high/low is
+permitted only as a static promotion of the particular contraction that fails
+those common gates. The `2^12` inputs remain mandatory adversarial fixtures,
+not warning-only diagnostics or private bitwise-residual requirements.
 
 - Seeger, *Low Rank Updates for the Cholesky Decomposition*,
   [EPFL technical report](https://infoscience.epfl.ch/entities/publication/00ba309a-d155-4e21-acc2-153702c4605c).
@@ -500,6 +584,30 @@ Its reverse closes over the same projections and descriptor bundle. Dense
 boundary work remains `O(C r^2)` and cannot be removed without restricting the
 chart, but local work can use the finite `O(C^2 r)` chunk algebra.
 
+Decision: the MESA Gram/Hadamard identity was evaluated as a replacement for
+the realized radial residual. A target-profile prototype
+formed `||theta B+L||^2` from boundary norm, boundary-generator pairs, and the
+local generator Gram. The uncompensated form took about `0.325 ms` at P256 and
+matched ordinary FP64 fixtures to roughly `1e-6`, but rounded the legal
+`2^12` cancellation norm from `1.4901161193847656e-8` to zero and emitted
+signed `~1e-6` noise for an exact-zero residual. A deterministic FP32
+`TwoSum`/FMA-`TwoProduct` schedule, following Ogita, Rump, and Oishi's
+[accurate sum and dot-product construction](https://doi.org/10.1137/030601818),
+restored the `2^12` result exactly and reduced ordinary error to roughly
+`1e-7`. Carrying compensation through every pair statistic still left
+`[-2.4e-8, 7.7e-8]` exact-zero noise because Tensor Core dot-product
+accumulation had already discarded the required low part, while latency rose
+to about `1.527 ms`. Recovering that part requires a scalar compensated dot or
+an equivalent exact accumulator and loses the intended Tensor Core advantage.
+The later BF16-observable contract recognized that bitwise recovery of this
+private quadratic is stricter than the deployed action: an identity-centered
+BF16 diagonal cannot expose the requested low bits. The uncompensated direct
+pair schedule is therefore the selected forward candidate, subject to the
+fixed chart-coordinate, action, and reachable exact-transpose VJP gates. The
+compensated variant remains rejected. Do not add a magnitude threshold, clamp, or runtime
+precision branch to make the expanded quadratic appear nonnegative or exactly
+zero.
+
 Decision: the deep-cancellation audit exposed an ambiguity in validating a
 shared `geometry_strength` scalar, not a missing VJP term. The parameter ties
 six chart-channel contributions by the fixed linear map `g=1^T g_6`. One `J`
@@ -521,7 +629,7 @@ forward/forward-plus-backward versus `0.32/1.10 ms` for the matched GDN2
 operator. Both rows exclude projections and conv4. The chunk-owned prepare
 contains frame action, stable pair statistics, and the C32 WY solve; `d/e/chi`
 are generated and consumed inside that ownership boundary and returned only as
-a private BF16 backward cache. They are not a public frame-to-WY ABI.
+a private FP16 backward cache. They are not a public frame-to-WY ABI.
 
 The selected frame checkpoint is a paired normalized-moment schedule: each
 BF16 `16x16` factor tile is generated once, then serves the primal gather solve
@@ -550,6 +658,25 @@ rewrite. Closing that contract now requires a schedule that avoids both the
 four-traversal duplication and the resident `C x 2C` dual-suffix correlation
 state; merely translating the existing formulas into more MMA instructions is
 not an accepted next step.
+
+A later MESA-style transpose screen removed the resident suffix state in three
+ways. A deterministic coordinate-block schedule used about `9 MiB` of reduced
+scalar partials but took `2.820 ms`; an atomic coordinate-block form took
+`2.032 ms` with repeat drift below roughly `rho=1.2e-7`; and a route-streaming
+form restored the intended correlation count and took `1.981 ms` isolated.
+None improved complete F+B against the current path in its controlled A/B, so
+all three were deleted. This local result reinforces the ownership rule:
+traffic reduction is adopted only when the composed training path wins.
+
+One ownership-only change did survive that screen. The frame adjoint's
+unbounded rank-three descriptor bundle is now produced directly in BF16, the
+operand format consumed by the strict Tensor Core transpose, while every
+action and reduction remains FP32-accumulated. Seven target-profile repeats
+reduced median backward from about `5.172 ms` to `5.024 ms` and F+B from about
+`6.762 ms` to `6.704 ms`. The WY pair reverse also writes directly into the
+primal and two-route dual workspaces that the frame adjoint overwrites in
+place; the former `grad_d/grad_e/grad_chi` cross-kernel interface and its three
+allocations no longer exist.
 
 ## Explicitly closed directions
 

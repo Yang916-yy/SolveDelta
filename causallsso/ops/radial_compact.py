@@ -13,11 +13,9 @@ _RANK = tl.constexpr(128)
 _DIAGONAL_TARGET = tl.constexpr(8)
 _DIAGONAL_R = tl.constexpr(16)
 _MATRIX_TILE = tl.constexpr(16)
-_MATRIX_TILES = tl.constexpr(64)
 
 _HOST_CHUNK = 32
 _HOST_RANK = 128
-_HOST_MATRIX_TILES = 64
 _RADIUS = 1.0 / 8.0
 
 
@@ -33,9 +31,12 @@ class RadialCompactOutput(NamedTuple):
 
 
 class RadialCompactSaved(NamedTuple):
-    """The only forward statistic needed by the dedicated reverse."""
+    """Reduced forward statistics consumed directly by the dedicated reverse."""
 
     radial_norm: torch.Tensor
+    gram: torch.Tensor
+    boundary_pair: torch.Tensor
+    boundary_norm: torch.Tensor
 
 
 class RadialCompactGradients(NamedTuple):
@@ -97,132 +98,256 @@ def _temporal_coefficients_kernel(
 
 
 @triton.jit
-def _radial_residual_partial_kernel(
+def _radial_pair_statistics_kernel(
     u,
     h,
-    inverse_mass,
-    theta,
     boundary_j,
     boundary_d,
     valid_count,
-    norm_partial,
+    gram_partial,
+    boundary_pair_partial,
+    boundary_norm_partial,
+    ROUTE: tl.constexpr,
 ):
-    """Square the realized FP32 residual, never a reassociated quadratic."""
+    """MESA-style Gram/Hadamard statistics for one strict chart route."""
 
     panel = tl.program_id(0)
     row_block = tl.program_id(1)
-    column_block = tl.program_id(2)
-    tile = row_block * 8 + column_block
-    rows = (
-        row_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
-    )[:, None]
-    columns = (
-        column_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
-    )[None, :]
+    tokens = tl.arange(0, _CHUNK)
+    local = tl.arange(0, _MATRIX_TILE)
+    rows = row_block * _MATRIX_TILE + local
     count = tl.load(valid_count + panel)
-    boundary_offset = (
-        panel * _RANK * _RANK + rows * _RANK + columns
-    )
-    local_boundary_j = tl.load(boundary_j + boundary_offset).to(tl.float32)
-    local_boundary_d = tl.load(boundary_d + boundary_offset).to(tl.float32)
-    current_j = tl.zeros((_MATRIX_TILE, _MATRIX_TILE), tl.float32)
-    current_d = tl.zeros((_MATRIX_TILE, _MATRIX_TILE), tl.float32)
-    lower = columns < rows
-    upper = columns > rows
+    active = tokens < count
+    panel_vector = panel * _CHUNK * _RANK
+    panel_matrix = panel * _RANK * _RANK
 
-    for target in tl.static_range(0, _CHUNK):
-        active = target < count
-        inverse = tl.load(
-            inverse_mass + panel * _CHUNK + target,
-            mask=active,
-            other=0.0,
-        )
-        local_u_rows = tl.load(
-            u + (panel * _CHUNK + target) * _RANK + rows,
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        local_u_columns = tl.load(
-            u + (panel * _CHUNK + target) * _RANK + columns,
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        local_h_columns = tl.load(
-            h + (panel * _CHUNK + target) * _RANK + columns,
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        phi_j = local_u_rows * local_u_columns
-        phi_d = local_u_rows * local_h_columns
-        if target == 0:
-            local_theta = tl.load(
-                theta + panel * _CHUNK,
-                mask=active,
+    row_u = tl.load(
+        u + panel_vector + tokens[:, None] * _RANK + rows[None, :],
+        mask=active[:, None],
+        other=0.0,
+    )
+    row_u_fp32 = row_u.to(tl.float32)
+    gram = tl.zeros((_CHUNK, _CHUNK), tl.float32)
+    boundary_pair = tl.zeros((_CHUNK,), tl.float32)
+    boundary_norm = 0.0
+
+    for column_block in tl.static_range(0, 8):
+        include = column_block > row_block if ROUTE >= 2 else column_block < row_block
+        columns = column_block * _MATRIX_TILE + local
+        if ROUTE & 1:
+            column_values = tl.load(
+                h
+                + panel_vector
+                + tokens[:, None] * _RANK
+                + columns[None, :],
+                mask=include & active[:, None],
                 other=0.0,
             )
-            next_j = local_theta * local_boundary_j + inverse * phi_j
-            next_d = local_theta * local_boundary_d + inverse * phi_d
         else:
-            retain = 1.0 - inverse
-            next_j = retain * current_j + inverse * phi_j
-            next_d = retain * current_d + inverse * phi_d
-        current_j = tl.where(active, next_j, current_j)
-        current_d = tl.where(active, next_d, current_d)
+            column_values = tl.load(
+                u
+                + panel_vector
+                + tokens[:, None] * _RANK
+                + columns[None, :],
+                mask=include & active[:, None],
+                other=0.0,
+            )
+        if ROUTE & 1:
+            boundary = tl.load(
+                boundary_d
+                + panel_matrix
+                + rows[:, None] * _RANK
+                + columns[None, :],
+                mask=include,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            boundary = tl.load(
+                boundary_j
+                + panel_matrix
+                + rows[:, None] * _RANK
+                + columns[None, :],
+                mask=include,
+                other=0.0,
+            ).to(tl.float32)
 
-        lower_j = tl.sum(tl.sum(tl.where(lower, current_j * current_j, 0.0), axis=1), axis=0)
-        lower_d = tl.sum(tl.sum(tl.where(lower, current_d * current_d, 0.0), axis=1), axis=0)
-        upper_j = tl.sum(tl.sum(tl.where(upper, current_j * current_j, 0.0), axis=1), axis=0)
-        upper_d = tl.sum(tl.sum(tl.where(upper, current_d * current_d, 0.0), axis=1), axis=0)
-        base = ((panel * _CHUNK + target) * 4) * _MATRIX_TILES + tile
-        tl.store(norm_partial + base, tl.where(active, lower_j, 0.0))
-        tl.store(
-            norm_partial + base + _MATRIX_TILES,
-            tl.where(active, lower_d, 0.0),
+        row_gram = tl.dot(row_u, tl.trans(row_u))
+        column_gram = tl.dot(column_values, tl.trans(column_values))
+        gram += row_gram * column_gram
+
+        # The persistent FP32 boundary has no FP16 range certificate. Its
+        # named broad action therefore uses the frozen direct-BF16 schedule,
+        # while the surrounding products and reductions remain FP32.
+        boundary_action = tl.dot(
+            boundary.to(tl.bfloat16),
+            tl.trans(column_values.to(tl.bfloat16)),
         )
-        tl.store(
-            norm_partial + base + 2 * _MATRIX_TILES,
-            tl.where(active, upper_j, 0.0),
+        boundary_pair += tl.sum(
+            row_u_fp32 * tl.trans(boundary_action), axis=1
         )
-        tl.store(
-            norm_partial + base + 3 * _MATRIX_TILES,
-            tl.where(active, upper_d, 0.0),
-        )
+        boundary_norm += tl.sum(boundary * boundary)
+
+    if ROUTE & 1:
+        diagonal_values = tl.load(
+            h + panel_vector + tokens[:, None] * _RANK + rows[None, :],
+            mask=active[:, None],
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        diagonal_values = row_u_fp32
+    prefix = tl.zeros((_CHUNK, _CHUNK), tl.float32)
+    diagonal_gram = tl.zeros((_CHUNK, _CHUNK), tl.float32)
+    if ROUTE >= 2:
+        for step in tl.static_range(0, _MATRIX_TILE):
+            coordinate = _MATRIX_TILE - 1 - step
+            selected = local == coordinate
+            left = tl.sum(row_u_fp32 * selected[None, :], axis=1)
+            right = tl.sum(diagonal_values * selected[None, :], axis=1)
+            left_pair = left[:, None] * left[None, :]
+            diagonal_gram += left_pair * prefix
+            prefix += right[:, None] * right[None, :]
+    else:
+        for coordinate in tl.static_range(0, _MATRIX_TILE):
+            selected = local == coordinate
+            left = tl.sum(row_u_fp32 * selected[None, :], axis=1)
+            right = tl.sum(diagonal_values * selected[None, :], axis=1)
+            left_pair = left[:, None] * left[None, :]
+            diagonal_gram += left_pair * prefix
+            prefix += right[:, None] * right[None, :]
+    gram += diagonal_gram
+
+    if ROUTE & 1:
+        diagonal_boundary = tl.load(
+            boundary_d
+            + panel_matrix
+            + rows[:, None] * _RANK
+            + rows[None, :]
+        ).to(tl.float32)
+    else:
+        diagonal_boundary = tl.load(
+            boundary_j
+            + panel_matrix
+            + rows[:, None] * _RANK
+            + rows[None, :]
+        ).to(tl.float32)
+    diagonal_mask = (
+        local[None, :] > local[:, None]
+        if ROUTE >= 2
+        else local[None, :] < local[:, None]
+    )
+    diagonal_boundary = tl.where(diagonal_mask, diagonal_boundary, 0.0)
+    diagonal_action = tl.dot(
+        diagonal_boundary.to(tl.bfloat16),
+        tl.trans(diagonal_values.to(tl.bfloat16)),
+    )
+    boundary_pair += tl.sum(
+        row_u_fp32 * tl.trans(diagonal_action), axis=1
+    )
+    boundary_norm += tl.sum(diagonal_boundary * diagonal_boundary)
+
+    gram_base = (
+        ((panel * 4 + ROUTE) * 8 + row_block) * _CHUNK
+        + tokens[:, None]
+    ) * _CHUNK + tokens[None, :]
+    tl.store(gram_partial + gram_base, gram)
+    vector_base = ((panel * 4 + ROUTE) * 8 + row_block) * _CHUNK + tokens
+    tl.store(
+        boundary_pair_partial + vector_base,
+        tl.where(active, boundary_pair, 0.0),
+    )
+    tl.store(
+        boundary_norm_partial + (panel * 4 + ROUTE) * 8 + row_block,
+        boundary_norm,
+    )
 
 
 @triton.jit
-def _radial_output_kernel(
-    norm_partial,
+def _radial_pair_output_kernel(
+    theta,
+    weights,
     strength,
     valid_count,
+    gram_partial,
+    boundary_pair_partial,
+    boundary_norm_partial,
     radial_scale,
     radial_q2,
     radial_norm,
-    SAVE_NORM: tl.constexpr,
+    saved_gram,
+    saved_boundary_pair,
+    saved_boundary_norm,
+    SAVE_STATISTICS: tl.constexpr,
 ):
     panel = tl.program_id(0)
-    target = tl.program_id(1)
-    route_vector = tl.arange(0, 4)
-    routes = route_vector[:, None]
-    tiles = tl.arange(0, _MATRIX_TILES)[None, :]
-    active = target < tl.load(valid_count + panel)
-    partial = tl.load(
-        norm_partial
-        + ((panel * _CHUNK + target) * 4 + routes) * _MATRIX_TILES
-        + tiles
+    route = tl.program_id(1)
+    targets = tl.arange(0, _CHUNK)
+    sources = tl.arange(0, _CHUNK)
+    count = tl.load(valid_count + panel)
+    active_target = targets < count
+    active_source = sources < count
+    temporal = tl.load(
+        weights
+        + (panel * _CHUNK + targets[:, None]) * _CHUNK
+        + sources[None, :],
+        mask=active_target[:, None] & active_source[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    gram = tl.zeros((_CHUNK, _CHUNK), tl.float32)
+    boundary_pair = tl.zeros((_CHUNK,), tl.float32)
+    boundary_norm = 0.0
+    for block in tl.static_range(0, 8):
+        gram_base = (
+            ((panel * 4 + route) * 8 + block) * _CHUNK
+            + targets[:, None]
+        ) * _CHUNK + sources[None, :]
+        gram += tl.load(gram_partial + gram_base)
+        vector_base = ((panel * 4 + route) * 8 + block) * _CHUNK + sources
+        boundary_pair += tl.load(
+            boundary_pair_partial + vector_base,
+            mask=active_source,
+            other=0.0,
+        )
+        boundary_norm += tl.load(
+            boundary_norm_partial + (panel * 4 + route) * 8 + block
+        )
+
+    # This is MESA's matrix-free ((P K^T) odot M)V pattern specialized to
+    # the symmetric local generator Gram. The dot operands are BF16 and every
+    # result is accumulated and completed in FP32.
+    local_action = tl.dot(
+        temporal.to(tl.bfloat16), gram.to(tl.bfloat16)
     )
-    norm = tl.sum(partial, axis=1)
+    local_norm = tl.sum(local_action * temporal, axis=1)
+    boundary_cross = tl.sum(
+        temporal * boundary_pair[None, :], axis=1
+    )
+    local_theta = tl.load(
+        theta + panel * _CHUNK + targets,
+        mask=active_target,
+        other=0.0,
+    ).to(tl.float32)
+    norm = (
+        local_theta * local_theta * boundary_norm
+        + 2.0 * local_theta * boundary_cross
+        + local_norm
+    )
     panel_strength = tl.load(strength + panel).to(tl.float32)
     radius = 0.125
     q2 = radius * radius + panel_strength * panel_strength * norm
     scale = panel_strength * radius * tl.rsqrt(q2)
-    output = (panel * _CHUNK + target) * 4 + route_vector
-    tl.store(
-        radial_q2 + output,
-        tl.where(active, q2, radius * radius),
-    )
-    tl.store(radial_scale + output, tl.where(active, scale, 0.0))
-    if SAVE_NORM:
-        tl.store(radial_norm + output, tl.where(active, norm, 0.0))
+    output = (panel * _CHUNK + targets) * 4 + route
+    tl.store(radial_q2 + output, tl.where(active_target, q2, radius * radius))
+    tl.store(radial_scale + output, tl.where(active_target, scale, 0.0))
+    if SAVE_STATISTICS:
+        tl.store(radial_norm + output, tl.where(active_target, norm, 0.0))
+        saved_gram_base = (
+            ((panel * 4 + route) * _CHUNK + targets[:, None]) * _CHUNK
+            + sources[None, :]
+        )
+        tl.store(saved_gram + saved_gram_base, gram)
+        saved_pair_base = (panel * 4 + route) * _CHUNK + sources
+        tl.store(saved_boundary_pair + saved_pair_base, boundary_pair)
+        tl.store(saved_boundary_norm + panel * 4 + route, boundary_norm)
 
 
 @triton.jit
@@ -252,14 +377,11 @@ def _radial_scalar_reverse_kernel(
     panel_strength = tl.load(strength + panel).to(tl.float32)
     radius = 0.125
     grad_q2 = -0.5 * grad_scale * scale / q2
-    # The forward norm is the square of the realized FP32 residual. At an
-    # exactly zero residual its VJP is exactly zero; do not let a reassociated
-    # reverse contraction manufacture a direction that forward never saw.
-    local_grad_norm = tl.where(
-        norm == 0.0,
-        0.0,
-        grad_q2 * panel_strength * panel_strength,
-    )
+    # A zero from the Gram/Hadamard expansion may be a rounded cancellation,
+    # not a structural zero of the underlying strict matrix. Its transpose
+    # therefore keeps the scalar cotangent; structural zeros vanish naturally
+    # in the subsequent linear contractions.
+    local_grad_norm = grad_q2 * panel_strength * panel_strength
     local_grad_strength = (
         grad_scale * radius * tl.rsqrt(q2)
         + grad_q2 * 2.0 * panel_strength * norm
@@ -272,70 +394,50 @@ def _radial_scalar_reverse_kernel(
 
 
 @triton.jit
-def _radial_algebra_boundary_action_kernel(
+def _radial_pair_boundary_leaf_transpose_kernel(
     u,
     h,
     boundary_j,
     boundary_d,
-    theta,
-    weights,
-    grad_norm,
+    boundary_coefficient,
     valid_count,
     grad_u,
     grad_h,
-    correlation_partial,
-    norm_partial,
     ADD_TO_GRAD: tl.constexpr,
 ):
-    """Apply all radial boundary cotangents as broad C32 products."""
+    """Apply the four boundary-pair cotangents as broad C32 products."""
 
     panel = tl.program_id(0)
     row_block = tl.program_id(1)
     rows = row_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
     sources = tl.arange(0, _CHUNK)
-    targets = tl.arange(0, _CHUNK)[:, None]
     count = tl.load(valid_count + panel)
     active_source = sources < count
-    active_target = targets < count
-    local_theta = tl.load(
-        theta + panel * _CHUNK + targets,
-        mask=active_target,
+    coefficient_lj = tl.load(
+        boundary_coefficient + panel * 4 * _CHUNK + sources,
+        mask=active_source,
         other=0.0,
     )
-    temporal = tl.load(
-        weights
-        + (panel * _CHUNK + targets) * _CHUNK
-        + sources[None, :],
-        mask=active_target & active_source[None, :],
+    coefficient_ld = tl.load(
+        boundary_coefficient + (panel * 4 + 1) * _CHUNK + sources,
+        mask=active_source,
         other=0.0,
     )
-    beta_base = (panel * _CHUNK + targets) * 4
-    beta_lj = 2.0 * tl.load(grad_norm + beta_base, mask=active_target, other=0.0)
-    beta_ld = 2.0 * tl.load(grad_norm + beta_base + 1, mask=active_target, other=0.0)
-    beta_uj = 2.0 * tl.load(grad_norm + beta_base + 2, mask=active_target, other=0.0)
-    beta_ud = 2.0 * tl.load(grad_norm + beta_base + 3, mask=active_target, other=0.0)
-    coefficient_lj = tl.sum(temporal * (beta_lj * local_theta), axis=0)
-    coefficient_ld = tl.sum(temporal * (beta_ld * local_theta), axis=0)
-    coefficient_uj = tl.sum(temporal * (beta_uj * local_theta), axis=0)
-    coefficient_ud = tl.sum(temporal * (beta_ud * local_theta), axis=0)
+    coefficient_uj = tl.load(
+        boundary_coefficient + (panel * 4 + 2) * _CHUNK + sources,
+        mask=active_source,
+        other=0.0,
+    )
+    coefficient_ud = tl.load(
+        boundary_coefficient + (panel * 4 + 3) * _CHUNK + sources,
+        mask=active_source,
+        other=0.0,
+    )
 
     panel_vector = panel * _CHUNK * _RANK
     panel_matrix = panel * _RANK * _RANK
-    u_rows = tl.load(
-        u + panel_vector + sources[:, None] * _RANK + rows[None, :],
-        mask=active_source[:, None],
-        other=0.0,
-    ).to(tl.float32)
     grad_u_rows = tl.zeros((_MATRIX_TILE, _CHUNK), tl.float32)
     grad_h_rows = tl.zeros_like(grad_u_rows)
-    corr_lj = tl.zeros((_CHUNK,), tl.float32)
-    corr_ld = tl.zeros_like(corr_lj)
-    corr_uj = tl.zeros_like(corr_lj)
-    corr_ud = tl.zeros_like(corr_lj)
-    norm_lj = 0.0
-    norm_ld = 0.0
-    norm_uj = 0.0
-    norm_ud = 0.0
 
     for start in tl.static_range(0, _RANK, 32):
         columns = start + tl.arange(0, 32)
@@ -391,16 +493,6 @@ def _radial_algebra_boundary_action_kernel(
             dlt_u * coefficient_ld[None, :]
             + dut_u * coefficient_ud[None, :]
         )
-        local_u_rows = tl.trans(u_rows)
-        corr_lj += tl.sum(local_u_rows * jl_u, axis=0)
-        corr_uj += tl.sum(local_u_rows * ju_u, axis=0)
-        corr_ld += tl.sum(local_u_rows * dl_h, axis=0)
-        corr_ud += tl.sum(local_u_rows * du_h, axis=0)
-        norm_lj += tl.sum(jl * jl)
-        norm_uj += tl.sum(ju * ju)
-        norm_ld += tl.sum(dl * dl)
-        norm_ud += tl.sum(du * du)
-
     output = panel_vector + sources[:, None] * _RANK + rows[None, :]
     result_u = tl.trans(grad_u_rows)
     result_h = tl.trans(grad_h_rows)
@@ -417,39 +509,17 @@ def _radial_algebra_boundary_action_kernel(
         ).to(tl.float32)
     tl.store(grad_u + output, tl.where(active_source[:, None], result_u, 0.0))
     tl.store(grad_h + output, tl.where(active_source[:, None], result_h, 0.0))
-    partial_base = ((panel * 4) * 8 + row_block) * _CHUNK + sources
-    tl.store(
-        correlation_partial + partial_base,
-        tl.where(active_source, corr_lj, 0.0),
-    )
-    tl.store(
-        correlation_partial + partial_base + 8 * _CHUNK,
-        tl.where(active_source, corr_ld, 0.0),
-    )
-    tl.store(
-        correlation_partial + partial_base + 16 * _CHUNK,
-        tl.where(active_source, corr_uj, 0.0),
-    )
-    tl.store(
-        correlation_partial + partial_base + 24 * _CHUNK,
-        tl.where(active_source, corr_ud, 0.0),
-    )
-    norm_base = (panel * 4) * 8 + row_block
-    tl.store(norm_partial + norm_base, norm_lj)
-    tl.store(norm_partial + norm_base + 8, norm_ld)
-    tl.store(norm_partial + norm_base + 16, norm_uj)
-    tl.store(norm_partial + norm_base + 24, norm_ud)
 
 
 @triton.jit
-def _radial_residual_boundary_gradient_kernel(
+def _radial_pair_boundary_transpose_kernel(
     u,
     h,
     boundary_j,
     boundary_d,
-    inverse_mass,
     theta,
     grad_norm,
+    boundary_coefficient,
     valid_count,
     grad_boundary_j,
     grad_boundary_d,
@@ -460,85 +530,68 @@ def _radial_residual_boundary_gradient_kernel(
     column_block = tl.program_id(2)
     rows = row_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
     columns = column_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
+    tokens = tl.arange(0, _CHUNK)
     count = tl.load(valid_count + panel)
+    active = tokens < count
     panel_vector = panel * _CHUNK * _RANK
     matrix_offset = (
         panel * _RANK * _RANK
         + rows[:, None] * _RANK
         + columns[None, :]
     )
-    boundary_j_value = tl.load(boundary_j + matrix_offset).to(tl.float32)
-    boundary_d_value = tl.load(boundary_d + matrix_offset).to(tl.float32)
+    local_u_rows = tl.load(
+        u + panel_vector + tokens[:, None] * _RANK + rows[None, :],
+        mask=active[:, None],
+        other=0.0,
+    )
+    local_u_columns = tl.load(
+        u + panel_vector + tokens[:, None] * _RANK + columns[None, :],
+        mask=active[:, None],
+        other=0.0,
+    )
+    local_h_columns = tl.load(
+        h + panel_vector + tokens[:, None] * _RANK + columns[None, :],
+        mask=active[:, None],
+        other=0.0,
+    )
+    local_theta = tl.load(
+        theta + panel * _CHUNK + tokens,
+        mask=active,
+        other=0.0,
+    ).to(tl.float32)
     lower = columns[None, :] < rows[:, None]
     upper = columns[None, :] > rows[:, None]
-    current_j = tl.zeros((_MATRIX_TILE, _MATRIX_TILE), tl.float32)
-    current_d = tl.zeros_like(current_j)
-    result_j = tl.zeros_like(current_j)
-    result_d = tl.zeros_like(current_j)
+    boundary_j_value = tl.load(boundary_j + matrix_offset).to(tl.float32)
+    boundary_d_value = tl.load(boundary_d + matrix_offset).to(tl.float32)
+    result_j = tl.zeros((_MATRIX_TILE, _MATRIX_TILE), tl.float32)
+    result_d = tl.zeros((_MATRIX_TILE, _MATRIX_TILE), tl.float32)
 
-    # Rebuild each realized FP32 residual in the same operation order as the
-    # forward norm kernel. This is one O(C r^2) boundary transpose, not the
-    # former three coordinate-tile VJP replays.
-    for target in tl.static_range(0, _CHUNK):
-        active = target < count
-        inverse = tl.load(
-            inverse_mass + panel * _CHUNK + target,
+    for route in tl.static_range(0, 4):
+        beta = 2.0 * tl.load(
+            grad_norm + (panel * _CHUNK + tokens) * 4 + route,
             mask=active,
             other=0.0,
+        ).to(tl.float32)
+        boundary_scale = tl.sum(beta * local_theta * local_theta, axis=0)
+        coefficient = tl.load(
+            boundary_coefficient + (panel * 4 + route) * _CHUNK + tokens,
+            mask=active,
+            other=0.0,
+        ).to(tl.float32)
+        right = local_h_columns if route & 1 else local_u_columns
+        local_term = tl.dot(
+            tl.trans(local_u_rows.to(tl.bfloat16)),
+            (coefficient[:, None] * right).to(tl.bfloat16),
         )
-        local_theta = tl.load(
-            theta + panel * _CHUNK + target,
-            mask=active,
-            other=0.0,
-        )
-        local_u_rows = tl.load(
-            u + panel_vector + target * _RANK + rows[:, None],
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        local_u_columns = tl.load(
-            u + panel_vector + target * _RANK + columns[None, :],
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        local_h_columns = tl.load(
-            h + panel_vector + target * _RANK + columns[None, :],
-            mask=active,
-            other=0.0,
-        ).to(tl.float32)
-        phi_j = local_u_rows * local_u_columns
-        phi_d = local_u_rows * local_h_columns
-        if target == 0:
-            next_j = local_theta * boundary_j_value + inverse * phi_j
-            next_d = local_theta * boundary_d_value + inverse * phi_d
+        mask = upper if route >= 2 else lower
+        if route & 1:
+            result_d += tl.where(
+                mask, boundary_scale * boundary_d_value + local_term, 0.0
+            )
         else:
-            retain = 1.0 - inverse
-            next_j = retain * current_j + inverse * phi_j
-            next_d = retain * current_d + inverse * phi_d
-        current_j = tl.where(active, next_j, current_j)
-        current_d = tl.where(active, next_d, current_d)
-
-        beta_base = (panel * _CHUNK + target) * 4
-        beta_lj = 2.0 * tl.load(
-            grad_norm + beta_base, mask=active, other=0.0
-        )
-        beta_ld = 2.0 * tl.load(
-            grad_norm + beta_base + 1, mask=active, other=0.0
-        )
-        beta_uj = 2.0 * tl.load(
-            grad_norm + beta_base + 2, mask=active, other=0.0
-        )
-        beta_ud = 2.0 * tl.load(
-            grad_norm + beta_base + 3, mask=active, other=0.0
-        )
-        coefficient_j = local_theta * tl.where(
-            lower, beta_lj, tl.where(upper, beta_uj, 0.0)
-        )
-        coefficient_d = local_theta * tl.where(
-            lower, beta_ld, tl.where(upper, beta_ud, 0.0)
-        )
-        result_j += coefficient_j * current_j
-        result_d += coefficient_d * current_d
+            result_j += tl.where(
+                mask, boundary_scale * boundary_j_value + local_term, 0.0
+            )
 
     if ADD_TO_GRAD:
         result_j += tl.load(grad_boundary_j + matrix_offset).to(tl.float32)
@@ -548,216 +601,355 @@ def _radial_residual_boundary_gradient_kernel(
 
 
 @triton.jit
-def _radial_algebra_local_kernel(
-    u,
-    h,
+def _radial_pair_scalar_reverse_kernel(
     theta,
     weights,
     grad_norm,
     valid_count,
-    correlation_partial,
-    grad_u,
-    grad_h,
-    grad_weights,
+    gram,
+    boundary_pair,
+    boundary_norm,
+    grad_theta_partial,
+    grad_weights_partial,
+    boundary_coefficient,
+    local_coefficient,
 ):
     panel = tl.program_id(0)
-    source = tl.program_id(1)
-    coordinates = tl.arange(0, _RANK)[None, :]
-    partners = tl.arange(0, _CHUNK)[:, None]
-    targets = tl.arange(0, _CHUNK)[:, None]
+    route = tl.program_id(1)
+    targets = tl.arange(0, _CHUNK)
+    sources = tl.arange(0, _CHUNK)
     count = tl.load(valid_count + panel)
-    source_active = source < count
-    partner_active = partners < count
-    target_active = targets < count
-    panel_vector = panel * _CHUNK * _RANK
-    source_u = tl.load(
-        u + panel_vector + source * _RANK + coordinates,
-        mask=source_active,
+    active_target = targets < count
+    active_source = sources < count
+    temporal = tl.load(
+        weights
+        + (panel * _CHUNK + targets[:, None]) * _CHUNK
+        + sources[None, :],
+        mask=active_target[:, None] & active_source[None, :],
         other=0.0,
     ).to(tl.float32)
-    source_h = tl.load(
-        h + panel_vector + source * _RANK + coordinates,
-        mask=source_active,
+    local_theta = tl.load(
+        theta + panel * _CHUNK + targets,
+        mask=active_target,
         other=0.0,
     ).to(tl.float32)
-    partner_u = tl.load(
-        u + panel_vector + partners * _RANK + coordinates,
-        mask=partner_active,
+    beta = 2.0 * tl.load(
+        grad_norm + (panel * _CHUNK + targets) * 4 + route,
+        mask=active_target,
         other=0.0,
     ).to(tl.float32)
-    partner_h = tl.load(
-        h + panel_vector + partners * _RANK + coordinates,
-        mask=partner_active,
+    gram_base = (
+        ((panel * 4 + route) * _CHUNK + targets[:, None]) * _CHUNK
+        + sources[None, :]
+    )
+    local_gram = tl.load(
+        gram + gram_base,
+        mask=active_target[:, None] & active_source[None, :],
         other=0.0,
     ).to(tl.float32)
-    product_u = partner_u * source_u
-    product_h = partner_h * source_h
-    prefix_u = tl.cumsum(product_u, axis=1) - product_u
-    prefix_h = tl.cumsum(product_h, axis=1) - product_h
-    suffix_u = tl.sum(product_u, axis=1)[:, None] - product_u - prefix_u
-    suffix_h = tl.sum(product_h, axis=1)[:, None] - product_h - prefix_h
-    corr_lj = tl.sum(product_u * prefix_u, axis=1)
-    corr_uj = tl.sum(product_u * suffix_u, axis=1)
-    corr_ld = tl.sum(product_u * prefix_h, axis=1)
-    corr_ud = tl.sum(product_u * suffix_h, axis=1)
+    pair_base = (panel * 4 + route) * _CHUNK + sources
+    local_boundary_pair = tl.load(
+        boundary_pair + pair_base,
+        mask=active_source,
+        other=0.0,
+    ).to(tl.float32)
+    local_boundary_norm = tl.load(
+        boundary_norm + panel * 4 + route
+    ).to(tl.float32)
 
-    target_vector = tl.arange(0, _CHUNK)
-    target_ids = target_vector[:, None]
-    partner_ids = tl.arange(0, _CHUNK)[None, :]
-    temporal_source = tl.load(
-        weights + (panel * _CHUNK + target_vector) * _CHUNK + source,
-        mask=target_vector < count,
-        other=0.0,
+    local_action = tl.dot(
+        temporal.to(tl.bfloat16), local_gram.to(tl.bfloat16)
     )
-    temporal_partner = tl.load(
-        weights + (panel * _CHUNK + target_ids) * _CHUNK + partner_ids,
-        mask=target_active & (partner_ids < count),
-        other=0.0,
+    boundary_cross = tl.sum(
+        temporal * local_boundary_pair[None, :], axis=1
     )
-    beta_base = (panel * _CHUNK + target_vector) * 4
-    beta_lj = 2.0 * tl.load(grad_norm + beta_base, mask=target_vector < count, other=0.0)
-    beta_ld = 2.0 * tl.load(grad_norm + beta_base + 1, mask=target_vector < count, other=0.0)
-    beta_uj = 2.0 * tl.load(grad_norm + beta_base + 2, mask=target_vector < count, other=0.0)
-    beta_ud = 2.0 * tl.load(grad_norm + beta_base + 3, mask=target_vector < count, other=0.0)
-    coefficient_lj = tl.sum(
-        temporal_partner * (temporal_source * beta_lj)[:, None], axis=0
+    grad_theta_route = beta * (
+        local_theta * local_boundary_norm + boundary_cross
     )
-    coefficient_ld = tl.sum(
-        temporal_partner * (temporal_source * beta_ld)[:, None], axis=0
+    grad_weights_route = beta[:, None] * (
+        local_theta[:, None] * local_boundary_pair[None, :] + local_action
     )
-    coefficient_uj = tl.sum(
-        temporal_partner * (temporal_source * beta_uj)[:, None], axis=0
+    weighted_temporal = beta[:, None] * temporal
+    boundary_route = tl.sum(
+        weighted_temporal * local_theta[:, None], axis=0
     )
-    coefficient_ud = tl.sum(
-        temporal_partner * (temporal_source * beta_ud)[:, None], axis=0
-    )
-    local_grad_u = tl.sum(
-        partner_u
-        * (
-            (coefficient_lj + coefficient_uj)[:, None]
-            * (prefix_u + suffix_u)
-            + coefficient_ld[:, None] * prefix_h
-            + coefficient_ud[:, None] * suffix_h
-        ),
-        axis=0,
-    )
-    local_grad_h = tl.sum(
-        partner_h
-        * (
-            coefficient_ld[:, None] * suffix_u
-            + coefficient_ud[:, None] * prefix_u
-        ),
-        axis=0,
-    )
-    output = panel_vector + source * _RANK + tl.arange(0, _RANK)
-    tl.store(
-        grad_u + output,
-        tl.load(grad_u + output, mask=source_active, other=0.0) + local_grad_u,
-        mask=source_active,
-    )
-    tl.store(
-        grad_h + output,
-        tl.load(grad_h + output, mask=source_active, other=0.0) + local_grad_h,
-        mask=source_active,
+    local_route = tl.dot(
+        tl.trans(temporal.to(tl.bfloat16)),
+        weighted_temporal.to(tl.bfloat16),
     )
 
-    blocks = tl.arange(0, 8)[None, :]
-    corr_base = ((panel * 4) * 8) * _CHUNK + blocks * _CHUNK + source
-    boundary_lj = tl.sum(tl.load(correlation_partial + corr_base), axis=1)
-    boundary_ld = tl.sum(
-        tl.load(correlation_partial + corr_base + 8 * _CHUNK), axis=1
+    theta_base = (panel * 4 + route) * _CHUNK + targets
+    tl.store(
+        grad_theta_partial + theta_base,
+        tl.where(active_target, grad_theta_route, 0.0),
     )
-    boundary_uj = tl.sum(
-        tl.load(correlation_partial + corr_base + 16 * _CHUNK), axis=1
+    matrix_base = (
+        ((panel * 4 + route) * _CHUNK + targets[:, None]) * _CHUNK
+        + sources[None, :]
     )
-    boundary_ud = tl.sum(
-        tl.load(correlation_partial + corr_base + 24 * _CHUNK), axis=1
-    )
-    target_theta = tl.load(
-        theta + panel * _CHUNK + target_vector,
-        mask=target_vector < count,
-        other=0.0,
-    )
-    dot_lj = tl.sum(temporal_partner * corr_lj[None, :], axis=1)
-    dot_ld = tl.sum(temporal_partner * corr_ld[None, :], axis=1)
-    dot_uj = tl.sum(temporal_partner * corr_uj[None, :], axis=1)
-    dot_ud = tl.sum(temporal_partner * corr_ud[None, :], axis=1)
-    local_grad_weight = (
-        beta_lj * (target_theta * boundary_lj + dot_lj)
-        + beta_ld * (target_theta * boundary_ld + dot_ld)
-        + beta_uj * (target_theta * boundary_uj + dot_uj)
-        + beta_ud * (target_theta * boundary_ud + dot_ud)
+    matrix_mask = active_target[:, None] & active_source[None, :]
+    tl.store(
+        grad_weights_partial + matrix_base,
+        tl.where(matrix_mask, grad_weights_route, 0.0),
     )
     tl.store(
-        grad_weights + (panel * _CHUNK + tl.arange(0, _CHUNK)) * _CHUNK + source,
-        tl.where(
-            (tl.arange(0, _CHUNK) < count) & source_active,
-            local_grad_weight,
-            0.0,
-        ),
+        boundary_coefficient + theta_base,
+        tl.where(active_source, boundary_route, 0.0),
+    )
+    tl.store(
+        local_coefficient + matrix_base,
+        tl.where(matrix_mask, local_route, 0.0),
     )
 
 
 @triton.jit
-def _radial_algebra_theta_kernel(
-    theta,
-    weights,
-    grad_norm,
-    valid_count,
-    correlation_partial,
-    norm_partial,
+def _reduce_radial_pair_scalar_reverse_kernel(
+    grad_theta_partial,
+    grad_weights_partial,
     grad_theta,
+    grad_weights,
 ):
     panel = tl.program_id(0)
-    target_vector = tl.arange(0, _CHUNK)
-    source_vector = tl.arange(0, _CHUNK)
-    targets = target_vector[:, None]
-    sources = source_vector[None, :]
-    blocks = tl.arange(0, 8)[:, None]
-    count = tl.load(valid_count + panel)
-    active_target = targets < count
-    active_source = sources < count
-    corr_base = ((panel * 4) * 8) * _CHUNK + blocks * _CHUNK + source_vector[None, :]
-    corr_lj = tl.sum(tl.load(correlation_partial + corr_base), axis=0)
-    corr_ld = tl.sum(
-        tl.load(correlation_partial + corr_base + 8 * _CHUNK), axis=0
-    )
-    corr_uj = tl.sum(
-        tl.load(correlation_partial + corr_base + 16 * _CHUNK), axis=0
-    )
-    corr_ud = tl.sum(
-        tl.load(correlation_partial + corr_base + 24 * _CHUNK), axis=0
-    )
-    norm_base = (panel * 4) * 8 + tl.arange(0, 8)
-    norm_lj = tl.sum(tl.load(norm_partial + norm_base), axis=0)
-    norm_ld = tl.sum(tl.load(norm_partial + norm_base + 8), axis=0)
-    norm_uj = tl.sum(tl.load(norm_partial + norm_base + 16), axis=0)
-    norm_ud = tl.sum(tl.load(norm_partial + norm_base + 24), axis=0)
-    temporal = tl.load(
-        weights + (panel * _CHUNK + targets) * _CHUNK + sources,
-        mask=active_target & active_source,
-        other=0.0,
-    )
-    local_theta = tl.load(
-        theta + panel * _CHUNK + target_vector,
-        mask=target_vector < count,
-        other=0.0,
-    )
-    beta_base = (panel * _CHUNK + target_vector) * 4
-    beta_lj = 2.0 * tl.load(grad_norm + beta_base, mask=target_vector < count, other=0.0)
-    beta_ld = 2.0 * tl.load(grad_norm + beta_base + 1, mask=target_vector < count, other=0.0)
-    beta_uj = 2.0 * tl.load(grad_norm + beta_base + 2, mask=target_vector < count, other=0.0)
-    beta_ud = 2.0 * tl.load(grad_norm + beta_base + 3, mask=target_vector < count, other=0.0)
-    result = (
-        beta_lj * (local_theta * norm_lj + tl.sum(temporal * corr_lj[None, :], axis=1))
-        + beta_ld * (local_theta * norm_ld + tl.sum(temporal * corr_ld[None, :], axis=1))
-        + beta_uj * (local_theta * norm_uj + tl.sum(temporal * corr_uj[None, :], axis=1))
-        + beta_ud * (local_theta * norm_ud + tl.sum(temporal * corr_ud[None, :], axis=1))
-    )
+    targets = tl.arange(0, _CHUNK)
+    sources = tl.arange(0, _CHUNK)
+    theta_result = tl.zeros((_CHUNK,), tl.float32)
+    weight_result = tl.zeros((_CHUNK, _CHUNK), tl.float32)
+    for route in tl.static_range(0, 4):
+        theta_result += tl.load(
+            grad_theta_partial + (panel * 4 + route) * _CHUNK + targets
+        )
+        weight_result += tl.load(
+            grad_weights_partial
+            + ((panel * 4 + route) * _CHUNK + targets[:, None]) * _CHUNK
+            + sources[None, :]
+        )
+    tl.store(grad_theta + panel * _CHUNK + targets, theta_result)
     tl.store(
-        grad_theta + panel * _CHUNK + tl.arange(0, _CHUNK),
-        tl.where(target_vector < count, result, 0.0),
+        grad_weights
+        + (panel * _CHUNK + targets[:, None]) * _CHUNK
+        + sources[None, :],
+        weight_result,
     )
+
+
+@triton.jit
+def _radial_pair_offdiagonal_transpose_kernel(
+    u,
+    h,
+    local_coefficient,
+    valid_count,
+    grad_u,
+    grad_h,
+):
+    panel = tl.program_id(0)
+    output_block = tl.program_id(1)
+    tokens = tl.arange(0, _CHUNK)
+    local = tl.arange(0, _MATRIX_TILE)
+    output_coordinates = output_block * _MATRIX_TILE + local
+    count = tl.load(valid_count + panel)
+    active = tokens < count
+    panel_vector = panel * _CHUNK * _RANK
+    output_u = tl.load(
+        u
+        + panel_vector
+        + tokens[:, None] * _RANK
+        + output_coordinates[None, :],
+        mask=active[:, None],
+        other=0.0,
+    )
+    output_h = tl.load(
+        h
+        + panel_vector
+        + tokens[:, None] * _RANK
+        + output_coordinates[None, :],
+        mask=active[:, None],
+        other=0.0,
+    )
+    result_u = tl.zeros((_CHUNK, _MATRIX_TILE), tl.float32)
+    result_h = tl.zeros((_CHUNK, _MATRIX_TILE), tl.float32)
+    token_mask = active[:, None] & active[None, :]
+
+    for route in tl.static_range(0, 4):
+        coefficient = tl.load(
+            local_coefficient
+            + ((panel * 4 + route) * _CHUNK + tokens[:, None]) * _CHUNK
+            + tokens[None, :],
+            mask=token_mask,
+            other=0.0,
+        ).to(tl.float32)
+        for other_block in tl.static_range(0, 8):
+            other_coordinates = other_block * _MATRIX_TILE + local
+            row_active = (
+                other_block < output_block
+                if route < 2
+                else other_block > output_block
+            )
+            column_active = (
+                other_block > output_block
+                if route < 2
+                else other_block < output_block
+            )
+            if route & 1:
+                other_right = tl.load(
+                    h
+                    + panel_vector
+                    + tokens[:, None] * _RANK
+                    + other_coordinates[None, :],
+                    mask=row_active & active[:, None],
+                    other=0.0,
+                )
+            else:
+                other_right = tl.load(
+                    u
+                    + panel_vector
+                    + tokens[:, None] * _RANK
+                    + other_coordinates[None, :],
+                    mask=row_active & active[:, None],
+                    other=0.0,
+                )
+            right_gram = tl.dot(other_right, tl.trans(other_right))
+            row_action = tl.dot(
+                (coefficient * right_gram).to(tl.bfloat16),
+                output_u.to(tl.bfloat16),
+            )
+            result_u += tl.where(row_active, row_action, 0.0)
+
+            other_left = tl.load(
+                u
+                + panel_vector
+                + tokens[:, None] * _RANK
+                + other_coordinates[None, :],
+                mask=column_active & active[:, None],
+                other=0.0,
+            )
+            left_gram = tl.dot(other_left, tl.trans(other_left))
+            column_operand = output_h if route & 1 else output_u
+            column_action = tl.dot(
+                (tl.trans(coefficient) * left_gram).to(tl.bfloat16),
+                column_operand.to(tl.bfloat16),
+            )
+            if route & 1:
+                result_h += tl.where(column_active, column_action, 0.0)
+            else:
+                result_u += tl.where(column_active, column_action, 0.0)
+
+    output = (
+        panel_vector
+        + tokens[:, None] * _RANK
+        + output_coordinates[None, :]
+    )
+    result_u += tl.load(grad_u + output, mask=active[:, None], other=0.0)
+    result_h += tl.load(grad_h + output, mask=active[:, None], other=0.0)
+    tl.store(grad_u + output, tl.where(active[:, None], result_u, 0.0))
+    tl.store(grad_h + output, tl.where(active[:, None], result_h, 0.0))
+
+
+@triton.jit
+def _radial_pair_diagonal_transpose_kernel(
+    u,
+    h,
+    local_coefficient,
+    valid_count,
+    grad_u,
+    grad_h,
+):
+    panel = tl.program_id(0)
+    source = tl.program_id(1)
+    partners = tl.arange(0, _CHUNK)[:, None]
+    local = tl.arange(0, _MATRIX_TILE)[None, :]
+    count = tl.load(valid_count + panel)
+    source_active = source < count
+    partner_active = partners < count
+    panel_vector = panel * _CHUNK * _RANK
+
+    for block in tl.static_range(0, 8):
+        coordinates = block * _MATRIX_TILE + local
+        source_u = tl.load(
+            u + panel_vector + source * _RANK + coordinates,
+            mask=source_active,
+            other=0.0,
+        ).to(tl.float32)
+        source_h = tl.load(
+            h + panel_vector + source * _RANK + coordinates,
+            mask=source_active,
+            other=0.0,
+        ).to(tl.float32)
+        partner_u = tl.load(
+            u + panel_vector + partners * _RANK + coordinates,
+            mask=partner_active,
+            other=0.0,
+        ).to(tl.float32)
+        partner_h = tl.load(
+            h + panel_vector + partners * _RANK + coordinates,
+            mask=partner_active,
+            other=0.0,
+        ).to(tl.float32)
+        product_u = partner_u * source_u
+        product_h = partner_h * source_h
+        prefix_u = tl.cumsum(product_u, axis=1) - product_u
+        prefix_h = tl.cumsum(product_h, axis=1) - product_h
+        suffix_u = tl.sum(product_u, axis=1)[:, None] - product_u - prefix_u
+        suffix_h = tl.sum(product_h, axis=1)[:, None] - product_h - prefix_h
+        partner_ids = tl.arange(0, _CHUNK)
+        coefficient_lj = tl.load(
+            local_coefficient
+            + (panel * 4 * _CHUNK + source) * _CHUNK
+            + partner_ids,
+            mask=partner_ids < count,
+            other=0.0,
+        )[:, None]
+        coefficient_ld = tl.load(
+            local_coefficient
+            + ((panel * 4 + 1) * _CHUNK + source) * _CHUNK
+            + partner_ids,
+            mask=partner_ids < count,
+            other=0.0,
+        )[:, None]
+        coefficient_uj = tl.load(
+            local_coefficient
+            + ((panel * 4 + 2) * _CHUNK + source) * _CHUNK
+            + partner_ids,
+            mask=partner_ids < count,
+            other=0.0,
+        )[:, None]
+        coefficient_ud = tl.load(
+            local_coefficient
+            + ((panel * 4 + 3) * _CHUNK + source) * _CHUNK
+            + partner_ids,
+            mask=partner_ids < count,
+            other=0.0,
+        )[:, None]
+        local_grad_u = tl.sum(
+            partner_u
+            * (
+                (coefficient_lj + coefficient_uj)
+                * (prefix_u + suffix_u)
+                + coefficient_ld * prefix_h
+                + coefficient_ud * suffix_h
+            ),
+            axis=0,
+        )
+        local_grad_h = tl.sum(
+            partner_h
+            * (
+                coefficient_ld * suffix_u
+                + coefficient_ud * prefix_u
+            ),
+            axis=0,
+        )
+        output = panel_vector + source * _RANK + coordinates
+        tl.store(
+            grad_u + output,
+            tl.load(grad_u + output, mask=source_active, other=0.0)
+            + local_grad_u,
+            mask=source_active,
+        )
+        tl.store(
+            grad_h + output,
+            tl.load(grad_h + output, mask=source_active, other=0.0)
+            + local_grad_h,
+            mask=source_active,
+        )
 
 
 @triton.jit
@@ -1308,39 +1500,90 @@ def _radial_compact_forward_launch(
         num_warps=1,
     )
 
-    norm_partial = torch.empty(
+    gram_partial = torch.empty(
         panels,
-        _HOST_CHUNK,
         4,
-        _HOST_MATRIX_TILES,
+        8,
+        _HOST_CHUNK,
+        _HOST_CHUNK,
         device=u.device,
         dtype=torch.float32,
     )
-    _radial_residual_partial_kernel[(panels, 8, 8)](
-        u,
-        h,
-        inverse_mass,
-        theta,
-        boundary_j,
-        boundary_d,
-        valid_count,
-        norm_partial,
-        num_warps=4,
+    boundary_pair_partial = torch.empty(
+        panels,
+        4,
+        8,
+        _HOST_CHUNK,
+        device=u.device,
+        dtype=torch.float32,
     )
+    boundary_norm_partial = torch.empty(
+        panels, 4, 8, device=u.device, dtype=torch.float32
+    )
+    for route in range(4):
+        _radial_pair_statistics_kernel[(panels, 8)](
+            u,
+            h,
+            boundary_j,
+            boundary_d,
+            valid_count,
+            gram_partial,
+            boundary_pair_partial,
+            boundary_norm_partial,
+            ROUTE=route,
+            num_warps=4,
+            num_stages=2,
+        )
     radial_scale = torch.empty(
         panels, _HOST_CHUNK, 4, device=u.device, dtype=torch.float32
     )
     radial_q2 = torch.empty_like(radial_scale)
     radial_norm = torch.empty_like(radial_scale) if return_saved else radial_q2
-    _radial_output_kernel[(panels, _HOST_CHUNK)](
-        norm_partial,
+    saved_gram = (
+        torch.empty(
+            panels,
+            4,
+            _HOST_CHUNK,
+            _HOST_CHUNK,
+            device=u.device,
+            dtype=torch.float32,
+        )
+        if return_saved
+        else gram_partial
+    )
+    saved_boundary_pair = (
+        torch.empty(
+            panels,
+            4,
+            _HOST_CHUNK,
+            device=u.device,
+            dtype=torch.float32,
+        )
+        if return_saved
+        else boundary_pair_partial
+    )
+    saved_boundary_norm = (
+        torch.empty(panels, 4, device=u.device, dtype=torch.float32)
+        if return_saved
+        else boundary_norm_partial
+    )
+    _radial_pair_output_kernel[(panels, 4)](
+        theta,
+        weights,
         strength,
         valid_count,
+        gram_partial,
+        boundary_pair_partial,
+        boundary_norm_partial,
         radial_scale,
         radial_q2,
         radial_norm,
-        SAVE_NORM=return_saved,
-        num_warps=4,
+        saved_gram,
+        saved_boundary_pair,
+        saved_boundary_norm,
+        SAVE_STATISTICS=return_saved,
+        num_warps=8,
+        num_stages=2,
     )
 
     diagonal = torch.empty(
@@ -1372,7 +1615,12 @@ def _radial_compact_forward_launch(
     )
     if not return_saved:
         return output
-    return output, RadialCompactSaved(radial_norm)
+    return output, RadialCompactSaved(
+        radial_norm,
+        saved_gram,
+        saved_boundary_pair,
+        saved_boundary_norm,
+    )
 
 
 def radial_compact_forward(
@@ -1389,23 +1637,26 @@ def radial_compact_forward(
 ) -> RadialCompactOutput | tuple[RadialCompactOutput, RadialCompactSaved]:
     """Construct compact radial/diagonal chart data for C32/r128 panels.
 
-    ``u`` and ``h`` are the once-quantized BF16 operands. Persistent boundary
-    states, temporal scalars, reductions, and outputs remain FP32. This
+    ``u`` is the directly produced bounded FP16 normalization panel and ``h``
+    is the once-quantized raw BF16 operand. Persistent boundary states,
+    temporal scalars, reductions, and outputs remain FP32. This
     standalone forward intentionally has no autograd registration; its reverse
     is the transpose of the same statistic graph, not a chain of generic VJPs.
     ``valid_count`` contains one value in ``[0,32]`` per panel; omitting it
     declares every panel full.
 
-    Each radial norm is the sum of squares of one realized FP32 strict-matrix
-    residual. The reverse replays that block recurrence and applies its
-    transpose directly; it does not materialize tokenwise dense matrices or a
-    chain of statistic VJPs.
+    Each radial norm is evaluated by the MESA Gram/Hadamard identity over
+    strict coordinate tiles. Off-diagonal tiles use two low-precision Gram
+    contractions with FP32 accumulation; diagonal 16-by-16 tiles retain their
+    exact strict mask. The reverse applies the corresponding pair-statistic,
+    off-diagonal tile, and diagonal-prefix transposes without materializing a
+    tokenwise dense matrix or a chain of generic VJPs.
     """
 
     if u.ndim != 3:
         raise ValueError("u must have shape [panels,32,128]")
     panels = u.shape[0]
-    _check_tensor(u, "u", (panels, _HOST_CHUNK, _HOST_RANK), torch.bfloat16)
+    _check_tensor(u, "u", (panels, _HOST_CHUNK, _HOST_RANK), torch.float16)
     _check_tensor(h, "h", tuple(u.shape), torch.bfloat16)
     _check_tensor(
         log_decay,
@@ -1496,17 +1747,45 @@ def _radial_compact_reverse_launch(
         num_warps=4,
     )
 
-    correlation_partial = torch.empty(
+    grad_theta_partial = torch.empty(
+        panels, 4, _HOST_CHUNK, device=u.device, dtype=torch.float32
+    )
+    grad_weights_partial = torch.empty(
         panels,
         4,
-        8,
+        _HOST_CHUNK,
         _HOST_CHUNK,
         device=u.device,
         dtype=torch.float32,
     )
-    boundary_norm_partial = torch.empty(
-        panels, 4, 8, device=u.device, dtype=torch.float32
+    boundary_coefficient = torch.empty_like(grad_theta_partial)
+    local_coefficient = torch.empty_like(grad_weights_partial)
+    _radial_pair_scalar_reverse_kernel[(panels, 4)](
+        output.theta,
+        output.weights,
+        grad_norm,
+        valid_count,
+        saved.gram,
+        saved.boundary_pair,
+        saved.boundary_norm,
+        grad_theta_partial,
+        grad_weights_partial,
+        boundary_coefficient,
+        local_coefficient,
+        num_warps=8,
+        num_stages=2,
     )
+    grad_theta_radial = torch.empty_like(output.theta)
+    grad_weights_radial = torch.empty_like(output.weights)
+    _reduce_radial_pair_scalar_reverse_kernel[(panels,)](
+        grad_theta_partial,
+        grad_weights_partial,
+        grad_theta_radial,
+        grad_weights_radial,
+        num_warps=8,
+        num_stages=2,
+    )
+
     vector_shape = (panels, _HOST_CHUNK, _HOST_RANK)
     add_to_grad = accumulated_gradients is not None
     if accumulated_gradients is None:
@@ -1516,61 +1795,51 @@ def _radial_compact_reverse_launch(
         grad_boundary_d = torch.empty_like(boundary_d)
     else:
         grad_u, grad_h, grad_boundary_j, grad_boundary_d = accumulated_gradients
-    _radial_algebra_boundary_action_kernel[(panels, 8)](
+    _radial_pair_boundary_leaf_transpose_kernel[(panels, 8)](
         u,
         h,
         boundary_j,
         boundary_d,
-        output.theta,
-        output.weights,
-        grad_norm,
+        boundary_coefficient,
         valid_count,
         grad_u,
         grad_h,
-        correlation_partial,
-        boundary_norm_partial,
         ADD_TO_GRAD=add_to_grad,
         num_warps=4,
         num_stages=3,
     )
-    _radial_residual_boundary_gradient_kernel[(panels, 8, 8)](
+    _radial_pair_boundary_transpose_kernel[(panels, 8, 8)](
         u,
         h,
         boundary_j,
         boundary_d,
-        output.inverse_mass,
         output.theta,
         grad_norm,
+        boundary_coefficient,
         valid_count,
         grad_boundary_j,
         grad_boundary_d,
         ADD_TO_GRAD=add_to_grad,
-        num_warps=2,
-        num_stages=3,
+        num_warps=4,
+        num_stages=2,
     )
-    grad_weights_radial = torch.empty_like(output.weights)
-    _radial_algebra_local_kernel[(panels, _HOST_CHUNK)](
+    _radial_pair_offdiagonal_transpose_kernel[(panels, 8)](
         u,
         h,
-        output.theta,
-        output.weights,
-        grad_norm,
+        local_coefficient,
         valid_count,
-        correlation_partial,
         grad_u,
         grad_h,
-        grad_weights_radial,
         num_warps=4,
+        num_stages=2,
     )
-    grad_theta_radial = torch.empty_like(output.theta)
-    _radial_algebra_theta_kernel[(panels,)](
-        output.theta,
-        output.weights,
-        grad_norm,
+    _radial_pair_diagonal_transpose_kernel[(panels, _HOST_CHUNK)](
+        u,
+        h,
+        local_coefficient,
         valid_count,
-        correlation_partial,
-        boundary_norm_partial,
-        grad_theta_radial,
+        grad_u,
+        grad_h,
         num_warps=4,
     )
     grad_inverse = torch.zeros_like(output.inverse_mass)
@@ -1708,7 +1977,7 @@ def radial_compact_reverse(
     if u.ndim != 3:
         raise ValueError("u must have shape [panels,32,128]")
     panels = u.shape[0]
-    _check_tensor(u, "u", (panels, _HOST_CHUNK, _HOST_RANK), torch.bfloat16)
+    _check_tensor(u, "u", (panels, _HOST_CHUNK, _HOST_RANK), torch.float16)
     _check_tensor(h, "h", tuple(u.shape), torch.bfloat16)
     _check_tensor(
         log_decay,
@@ -1802,6 +2071,24 @@ def radial_compact_reverse(
         (panels, _HOST_CHUNK, 4),
         torch.float32,
     )
+    _check_tensor(
+        saved.gram,
+        "saved.gram",
+        (panels, 4, _HOST_CHUNK, _HOST_CHUNK),
+        torch.float32,
+    )
+    _check_tensor(
+        saved.boundary_pair,
+        "saved.boundary_pair",
+        (panels, 4, _HOST_CHUNK),
+        torch.float32,
+    )
+    _check_tensor(
+        saved.boundary_norm,
+        "saved.boundary_norm",
+        (panels, 4),
+        torch.float32,
+    )
 
     _check_same_device(
         u.device,
@@ -1820,6 +2107,9 @@ def radial_compact_reverse(
             ("output.radial_q2", output.radial_q2),
             ("output.diagonal", output.diagonal),
             ("saved.radial_norm", saved.radial_norm),
+            ("saved.gram", saved.gram),
+            ("saved.boundary_pair", saved.boundary_pair),
+            ("saved.boundary_norm", saved.boundary_norm),
             ("grad_radial_scale", grad_radial_scale),
             ("grad_log_diagonal", grad_log_diagonal),
         ),

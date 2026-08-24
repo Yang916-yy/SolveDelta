@@ -27,10 +27,11 @@ def test_fused_normalization_matches_declared_expression(length: int) -> None:
     inputs = _runtime(length)
     actual = normalize_solvedelta_inputs(*inputs)
     expected = tuple(
-        F.normalize(tensor.float(), p=2, dim=-1).to(torch.bfloat16)
+        F.normalize(tensor.float(), p=2, dim=-1).to(torch.float16)
         for tensor in inputs
     )
     for fused, reference in zip(actual, expected):
+        assert fused.dtype == torch.float16
         difference = (fused.float() - reference.float()).norm()
         scale = reference.float().norm().clamp_min(1.0e-8)
         assert (difference / scale).item() <= 1.0e-4
@@ -46,7 +47,7 @@ def test_fused_normalization_vjp_matches_declared_expression() -> None:
     )
     actual = normalize_solvedelta_inputs(*actual_inputs)
     reference = tuple(
-        F.normalize(tensor.float(), p=2, dim=-1).to(torch.bfloat16)
+        F.normalize(tensor.float(), p=2, dim=-1).to(torch.float16)
         for tensor in reference_inputs
     )
     torch.manual_seed(20260901)

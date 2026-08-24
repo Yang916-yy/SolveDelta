@@ -4,8 +4,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import torch
-import triton
-import triton.language as tl
 from torch.autograd.function import once_differentiable
 
 from causallsso.ops.chunk_state import (
@@ -14,10 +12,12 @@ from causallsso.ops.chunk_state import (
     decay_cumsum_backward,
     decay_cumsum_forward,
 )
+from causallsso.ops.paired_wy import paired_wy_backward, paired_wy_forward
 from causallsso.ops.radial_compact import (
     RadialCompactOutput,
     RadialCompactSaved,
     _radial_compact_reverse_accumulate_trusted,
+    radial_compact_forward,
 )
 from causallsso.ops.strict_chart import _strict_chart_direct_transpose_trusted
 from causallsso.ops.triton_geometry import (
@@ -43,6 +43,25 @@ class _FrameGradients(NamedTuple):
     boundary_m: torch.Tensor
     boundary_j: torch.Tensor
     boundary_d: torch.Tensor
+
+
+class _FrameCache(NamedTuple):
+    d: torch.Tensor
+    e: torch.Tensor
+    chi: torch.Tensor
+    lower_primal: torch.Tensor
+    lower_dual_scaled: torch.Tensor
+    inverse_mass: torch.Tensor
+    radial_scale: torch.Tensor
+    radial_q2: torch.Tensor
+    radial_norm: torch.Tensor
+    radial_gram: torch.Tensor
+    radial_boundary_pair: torch.Tensor
+    radial_boundary_norm: torch.Tensor
+    diagonal: torch.Tensor
+    alpha0: torch.Tensor
+    theta: torch.Tensor
+    weights: torch.Tensor
 
 
 def _library_candidates() -> tuple[Path, ...]:
@@ -83,34 +102,6 @@ def _load_chunk_library() -> None:
     )
 
 
-@triton.jit
-def _frame_temporal_coefficients_kernel(
-    inverse_mass,
-    alpha0,
-    weights,
-    theta,
-    C: tl.constexpr,
-):
-    panel = tl.program_id(0)
-    sources = tl.arange(0, C)
-    previous = tl.zeros((C,), tl.float32)
-    previous_theta = tl.load(alpha0 + panel).to(tl.float32)
-    for target in tl.static_range(0, C):
-        inverse = tl.load(inverse_mass + panel * C + target).to(tl.float32)
-        active = inverse > 0.0
-        retain = 1.0 - inverse
-        row = retain * previous + tl.where(sources == target, inverse, 0.0)
-        row = tl.where(active, row, 0.0)
-        local_theta = (
-            previous_theta if target == 0 else previous_theta * retain
-        )
-        local_theta = tl.where(active, local_theta, 0.0)
-        tl.store(weights + (panel * C + target) * C + sources, row)
-        tl.store(theta + panel * C + target, local_theta)
-        previous = row
-        previous_theta = local_theta
-
-
 def _panelize(tensor: torch.Tensor, padded_length: int) -> torch.Tensor:
     batch, length, heads = tensor.shape[:3]
     if length != padded_length:
@@ -134,31 +125,6 @@ def _panelize(tensor: torch.Tensor, padded_length: int) -> torch.Tensor:
         .reshape(batch * heads * chunks, _CHUNK, *tail)
         .contiguous()
     )
-
-
-def _frame_temporal_coefficients(
-    inverse_mass: torch.Tensor,
-    alpha0: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    panels = alpha0.numel()
-    inverse = inverse_mass.reshape(panels, _CHUNK).contiguous()
-    weights = torch.empty(
-        panels,
-        _CHUNK,
-        _CHUNK,
-        device=inverse.device,
-        dtype=torch.float32,
-    )
-    theta = torch.empty_like(inverse)
-    _frame_temporal_coefficients_kernel[(panels,)](
-        inverse,
-        alpha0,
-        weights,
-        theta,
-        C=_CHUNK,
-        num_warps=1,
-    )
-    return weights, theta
 
 
 def _valid_counts(
@@ -201,22 +167,9 @@ def _finish_frame_backward(
     boundary_m: torch.Tensor,
     boundary_j: torch.Tensor,
     boundary_d: torch.Tensor,
-    frame: tuple[torch.Tensor, ...],
+    frame: _FrameCache,
     action: tuple[torch.Tensor, ...],
 ) -> _FrameGradients:
-    (
-        _d,
-        _e,
-        _chi,
-        lower_primal,
-        lower_dual_scaled,
-        inverse_mass,
-        radial_scale,
-        radial_q2,
-        radial_norm,
-        diagonal,
-        alpha0,
-    ) = frame
     (
         grad_key,
         grad_erase,
@@ -235,7 +188,6 @@ def _finish_frame_backward(
     panel_h = _panelize(h, padded_length)
     panel_boundary_j = boundary_j.reshape(panels, rank, rank)
     panel_boundary_d = boundary_d.reshape(panels, rank, rank)
-    weights, theta = _frame_temporal_coefficients(inverse_mass, alpha0)
     valid_count = _valid_counts(batch, length, heads, u.device)
     strict = _strict_chart_direct_transpose_trusted(
         lower_left,
@@ -246,9 +198,9 @@ def _finish_frame_backward(
         panel_h,
         panel_boundary_j,
         panel_boundary_d,
-        theta,
-        weights,
-        radial_scale,
+        frame.theta,
+        frame.weights,
+        frame.radial_scale,
         valid_count,
     )
 
@@ -267,14 +219,19 @@ def _finish_frame_backward(
         panel_boundary_j,
         panel_boundary_d,
         RadialCompactOutput(
-            inverse_mass.reshape(panels, _CHUNK),
-            theta,
-            weights,
-            radial_scale,
-            radial_q2,
-            diagonal,
+            frame.inverse_mass,
+            frame.theta,
+            frame.weights,
+            frame.radial_scale,
+            frame.radial_q2,
+            frame.diagonal,
         ),
-        RadialCompactSaved(radial_norm),
+        RadialCompactSaved(
+            frame.radial_norm,
+            frame.radial_gram,
+            frame.radial_boundary_pair,
+            frame.radial_boundary_norm,
+        ),
         strict.grad_radial_scale,
         _panelize(grad_log_diagonal, padded_length),
         valid_count,
@@ -329,29 +286,68 @@ class _NativeChunkSolveWY(torch.autograd.Function):
             input_precision="ieee",
         )
         inclusive_decay = decay_cumsum_forward(associative_log_decay)
+        batch, length, heads, rank = u.shape
+        chunks = (length + _CHUNK - 1) // _CHUNK
+        padded_length = chunks * _CHUNK
+        panels = batch * heads * chunks
+        valid_count = _valid_counts(batch, length, heads, u.device)
+        panel_strength = (
+            geometry_strength[None, :, None]
+            .expand(batch, heads, chunks)
+            .reshape(panels)
+            .contiguous()
+        )
+        radial, radial_saved = radial_compact_forward(
+            _panelize(u, padded_length),
+            _panelize(h, padded_length),
+            _panelize(geometry_log_decay[..., None], padded_length).squeeze(-1),
+            panel_strength,
+            boundary.m.reshape(panels),
+            boundary.J.reshape(panels, rank, rank),
+            boundary.D.reshape(panels, rank, rank),
+            valid_count=valid_count,
+            return_saved=True,
+        )
+        alpha0 = radial.theta[:, 0].contiguous()
         prepare = tuple(
             torch.ops.causallsso.c32_solvedelta_prepare_forward(
                 u,
                 h,
-                geometry_log_decay,
                 key,
                 erase,
                 query,
-                geometry_strength,
-                boundary.m,
                 boundary.J,
                 boundary.D,
+                radial.inverse_mass,
+                radial.radial_scale,
+                radial.diagonal,
+                alpha0,
                 inclusive_decay,
-                write,
-                value,
             )
         )
-        if len(prepare) != 18:
+        if len(prepare) != 10:
             raise RuntimeError(
                 "c32_solvedelta_prepare_forward returned an invalid cache"
             )
-        W, A_qd, Q_gamma, D_tail, G_last, Y, U_z = prepare[:7]
-        frame = prepare[7:]
+        W, A_qd, Q_gamma, D_tail, G_last = prepare[:5]
+        frame = _FrameCache(
+            *prepare[5:],
+            radial.inverse_mass,
+            radial.radial_scale,
+            radial.radial_q2,
+            radial_saved.radial_norm,
+            radial_saved.gram,
+            radial_saved.boundary_pair,
+            radial_saved.boundary_norm,
+            radial.diagonal,
+            alpha0,
+            radial.theta,
+            radial.weights,
+        )
+        wy = paired_wy_forward(
+            W, frame.e, inclusive_decay, write, value
+        )
+        Y, U_z = wy
         state = chunk_state_forward(
             Y, U_z, D_tail, Q_gamma, A_qd, G_last, initial_s
         )
@@ -423,7 +419,8 @@ class _NativeChunkSolveWY(torch.autograd.Function):
             initial_s,
         ) = inputs
         boundary_m, boundary_j, boundary_d = saved[14:17]
-        frame = tuple(saved[17:28])
+        frame_end = 17 + len(_FrameCache._fields)
+        frame = _FrameCache(*saved[17:frame_end])
         (
             inclusive_decay,
             W,
@@ -435,7 +432,7 @@ class _NativeChunkSolveWY(torch.autograd.Function):
             U_z,
             state_boundaries,
             residual,
-        ) = saved[28:38]
+        ) = saved[frame_end : frame_end + 10]
 
         grad_output = _cotangent(grad_output, U_z, dtype=torch.bfloat16)
         grad_final_s = _cotangent(grad_final_s, initial_s, dtype=torch.float32)
@@ -450,6 +447,15 @@ class _NativeChunkSolveWY(torch.autograd.Function):
             grad_output,
             grad_final_s,
         )
+        wy_grad = paired_wy_backward(
+            W,
+            Y,
+            U_z,
+            write,
+            value,
+            state_grad.grad_Y,
+            state_grad.grad_U_z,
+        )
         prepare_grad = tuple(
             torch.ops.causallsso.c32_solvedelta_prepare_backward(
                 u,
@@ -459,37 +465,33 @@ class _NativeChunkSolveWY(torch.autograd.Function):
                 query,
                 boundary_j,
                 boundary_d,
-                frame[0],
-                frame[1],
-                frame[2],
-                frame[3],
-                frame[4],
-                frame[5],
-                frame[6],
-                frame[9],
-                frame[10],
+                frame.d,
+                frame.e,
+                frame.chi,
+                frame.lower_primal,
+                frame.lower_dual_scaled,
+                frame.inverse_mass,
+                frame.radial_scale,
+                frame.diagonal,
+                frame.alpha0,
                 inclusive_decay,
-                W,
                 D_tail,
                 Q_gamma,
-                Y,
-                U_z,
-                write,
-                value,
-                state_grad.grad_Y,
-                state_grad.grad_U_z,
+                wy_grad.system,
+                wy_grad.edit_rhs,
                 state_grad.grad_A_qd,
                 state_grad.grad_Q_gamma,
                 state_grad.grad_D_tail,
                 state_grad.grad_G_last,
             )
         )
-        if len(prepare_grad) != 8:
+        if len(prepare_grad) != 6:
             raise RuntimeError(
                 "c32_solvedelta_prepare_backward returned invalid gradients"
             )
         action = prepare_grad[:5]
-        grad_inclusive, grad_write, grad_value = prepare_grad[5:]
+        grad_inclusive = prepare_grad[5]
+        grad_write, grad_value = wy_grad.write, wy_grad.value
         grad_associative_decay = decay_cumsum_backward(grad_inclusive)
 
         frame_grad = _finish_frame_backward(

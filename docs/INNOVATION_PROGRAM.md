@@ -77,9 +77,11 @@ m_t\in\mathbb R,
 
 initialized to zero. The equations are real-valued operator semantics and the
 executable oracle is FP64. In the first native training contract,
-projection/conv caches and vector operands are BF16, while `m,J,D,S` are FP32
-continuation states and are never rounded at chunk or recurrent-call
-boundaries.
+projection/conv caches and raw vector operands are BF16, analytically bounded
+private panels are written directly from FP32 producers to FP16, and all
+contractions accumulate in FP32. The `m,J,D,S` continuation states remain FP32
+and are never rounded at chunk or recurrent-call boundaries. The private FP16
+representation does not change the BF16-observable operator contract.
 
 Every valid token executes exactly this order:
 

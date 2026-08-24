@@ -25,6 +25,18 @@ __device__ __forceinline__ int vector_index(
     return ((batch * length + token) * heads + head) * kRank + coordinate;
 }
 
+__device__ __forceinline__ int dual_vector_index(
+    int batch,
+    int token,
+    int head,
+    int route,
+    int coordinate,
+    int length,
+    int heads) {
+    return ((((batch * length + token) * heads + head) * 2 + route)
+            * kRank) + coordinate;
+}
+
 __device__ __forceinline__ void decode_panel(
     int panel,
     int heads,
@@ -38,135 +50,21 @@ __device__ __forceinline__ void decode_panel(
     batch = head_batch / heads;
 }
 
-__global__ void wy_solve_backward_kernel(
-    const float* __restrict__ W,
-    const at::BFloat16* __restrict__ Y,
-    const at::BFloat16* __restrict__ U_z,
-    const float* __restrict__ grad_Y,
-    const float* __restrict__ grad_U_z,
-    float* __restrict__ grad_E_gamma,
-    float* __restrict__ grad_Z,
-    float* __restrict__ grad_T,
-    int length,
-    int heads,
-    int chunks,
-    int value_dim,
-    int panels) {
-    extern __shared__ unsigned char storage[];
-    float* shared_W = reinterpret_cast<float*>(storage);
-    at::BFloat16* shared_X = reinterpret_cast<at::BFloat16*>(
-        shared_W + kChunk * kChunk);
-    float* shared_bar = reinterpret_cast<float*>(
-        shared_X + kChunk * (kRank + value_dim));
-    const int panel = blockIdx.x;
-    if (panel >= panels) return;
-    int batch;
-    int head;
-    int chunk;
-    decode_panel(panel, heads, chunks, batch, head, chunk);
-    const int token_start = chunk * kChunk;
-    const int valid_count = min(kChunk, length - token_start);
-    const int rhs_count = kRank + value_dim;
-    for (int index = threadIdx.x; index < kChunk * kChunk; index += blockDim.x) {
-        shared_W[index] = W[panel * kChunk * kChunk + index];
-    }
-    __syncthreads();
-
-    const int rhs = threadIdx.x;
-    if (rhs < rhs_count) {
-        float solution[kChunk];
-#pragma unroll 1
-        for (int reverse = 0; reverse < kChunk; ++reverse) {
-            const int row = kChunk - 1 - reverse;
-            float current = 0.0f;
-            if (row < valid_count) {
-                if (rhs < kRank) {
-                    current = grad_Y[vector_index(
-                        batch, token_start + row, head, rhs, length, heads)];
-                } else {
-                    const int coordinate = rhs - kRank;
-                    const int index =
-                        (((batch * length + token_start + row) * heads + head)
-                         * value_dim) + coordinate;
-                    current = grad_U_z[index];
-                }
-                for (int later = row + 1; later < valid_count; ++later) {
-                    current = fmaf(
-                        -shared_W[later * kChunk + row],
-                        solution[later],
-                        current);
-                }
-            }
-            solution[row] = current;
-            shared_bar[row * rhs_count + rhs] = current;
-            if (row < valid_count) {
-                if (rhs < kRank) {
-                    grad_E_gamma[vector_index(
-                        batch, token_start + row, head, rhs, length, heads)] = current;
-                } else {
-                    const int coordinate = rhs - kRank;
-                    const int index =
-                        (((batch * length + token_start + row) * heads + head)
-                         * value_dim) + coordinate;
-                    grad_Z[index] = current;
-                }
-            }
-        }
-    }
-    for (int index = threadIdx.x;
-         index < kChunk * rhs_count;
-         index += blockDim.x) {
-        const int row = index / rhs_count;
-        const int column = index % rhs_count;
-        at::BFloat16 bits(0.0f);
-        if (row < valid_count) {
-            if (column < kRank) {
-                bits = Y[vector_index(
-                    batch, token_start + row, head, column, length, heads)];
-            } else {
-                const int coordinate = column - kRank;
-                const int offset =
-                    (((batch * length + token_start + row) * heads + head)
-                     * value_dim) + coordinate;
-                bits = U_z[offset];
-            }
-        }
-        shared_X[index] = bits;
-    }
-    __syncthreads();
-
-    for (int pair = threadIdx.x; pair < kChunk * kChunk; pair += blockDim.x) {
-        const int row = pair / kChunk;
-        const int column = pair % kChunk;
-        float gradient = 0.0f;
-        if (row < valid_count && column < row) {
-            for (int coordinate = 0; coordinate < rhs_count; ++coordinate) {
-                gradient = fmaf(
-                    -shared_bar[row * rhs_count + coordinate],
-                    static_cast<float>(shared_X[column * rhs_count + coordinate]),
-                    gradient);
-            }
-        }
-        grad_T[panel * kChunk * kChunk + pair] = gradient;
-    }
-}
-
 __global__ void wy_pair_backward_kernel(
-    const at::BFloat16* __restrict__ d,
-    const at::BFloat16* __restrict__ e,
-    const at::BFloat16* __restrict__ chi,
+    const at::Half* __restrict__ d,
+    const at::Half* __restrict__ e,
+    const at::Half* __restrict__ chi,
     const float* __restrict__ inclusive_decay,
-    const at::BFloat16* __restrict__ D_tail,
-    const at::BFloat16* __restrict__ Q_gamma,
+    const at::Half* __restrict__ D_tail,
+    const at::Half* __restrict__ Q_gamma,
     const float* __restrict__ grad_T,
     const float* __restrict__ grad_A_qd,
     const float* __restrict__ grad_E_gamma,
     const float* __restrict__ grad_Q_gamma,
     const float* __restrict__ grad_D_tail,
     const float* __restrict__ grad_G_last,
-    float* __restrict__ grad_d,
-    float* __restrict__ grad_e,
-    float* __restrict__ grad_chi,
+    float* __restrict__ frame_primal,
+    float* __restrict__ frame_dual,
     float* __restrict__ grad_G,
     int length,
     int heads,
@@ -311,25 +209,39 @@ __global__ void wy_pair_backward_kernel(
             const int coordinate = lane + route * 32;
             const int index = vector_index(
                 batch, token_start + token, head, coordinate, length, heads);
-            grad_d[index] = gd[route];
-            grad_e[index] = ge[route];
-            grad_chi[index] = gq[route];
+            frame_primal[index] = gd[route];
+            frame_dual[dual_vector_index(
+                batch,
+                token_start + token,
+                head,
+                0,
+                coordinate,
+                length,
+                heads)] = ge[route];
+            frame_dual[dual_vector_index(
+                batch,
+                token_start + token,
+                head,
+                1,
+                coordinate,
+                length,
+                heads)] = gq[route];
             grad_G[index] = gg[route];
         }
     }
 }
 
-void check_bf16_vectors(
+void check_fp16_vectors(
     const at::Tensor& tensor,
     const at::Tensor& reference,
     const char* name) {
     TORCH_CHECK(
         tensor.is_cuda()
             && tensor.get_device() == reference.get_device()
-            && tensor.scalar_type() == at::kBFloat16
+            && tensor.scalar_type() == at::kHalf
             && tensor.is_contiguous(),
         name,
-        " must be contiguous BF16 CUDA on the shared device");
+        " must be contiguous FP16 CUDA on the shared device");
 }
 
 void check_fp32(
@@ -357,63 +269,7 @@ void check_sm120(const at::Tensor& reference) {
 
 }  // namespace
 
-C32WYSolveBackwardResult c32_wy_solve_backward_cuda(
-    const at::Tensor& W,
-    const at::Tensor& Y,
-    const at::Tensor& U_z,
-    const at::Tensor& grad_Y,
-    const at::Tensor& grad_U_z) {
-    check_bf16_vectors(Y, Y, "Y");
-    check_bf16_vectors(U_z, Y, "U_z");
-    check_fp32(W, Y, "W");
-    check_fp32(grad_Y, Y, "grad_Y");
-    check_fp32(grad_U_z, Y, "grad_U_z");
-    const int64_t batch = Y.size(0);
-    const int64_t length = Y.size(1);
-    const int64_t heads = Y.size(2);
-    const int64_t value_dim = U_z.size(3);
-    const int64_t chunks = (length + kChunk - 1) / kChunk;
-    TORCH_CHECK(Y.dim() == 4 && Y.size(3) == kRank, "Y must be [B,T,H,128]");
-    TORCH_CHECK(U_z.sizes() == at::IntArrayRef({batch, length, heads, value_dim}), "U_z shape mismatch");
-    TORCH_CHECK(grad_Y.sizes() == Y.sizes() && grad_U_z.sizes() == U_z.sizes(), "solve cotangent shape mismatch");
-    TORCH_CHECK(value_dim > 0 && value_dim <= kRank, "native d_v must be in [1,128]");
-    auto grad_E = at::empty(Y.sizes(), Y.options().dtype(at::kFloat));
-    auto grad_Z = at::empty(U_z.sizes(), U_z.options().dtype(at::kFloat));
-    auto grad_T = at::empty_like(W);
-    const int64_t panels = batch * heads * chunks;
-    const size_t shared_bytes =
-        kChunk * kChunk * sizeof(float)
-        + kChunk * (kRank + value_dim) * sizeof(at::BFloat16)
-        + kChunk * (kRank + value_dim) * sizeof(float);
-    c10::cuda::CUDAGuard guard(Y.device());
-    check_sm120(Y);
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        wy_solve_backward_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_bytes)));
-    wy_solve_backward_kernel<<<
-        static_cast<int>(panels),
-        kThreads,
-        shared_bytes,
-        at::cuda::getCurrentCUDAStream()>>>(
-        W.data_ptr<float>(),
-        Y.data_ptr<at::BFloat16>(),
-        U_z.data_ptr<at::BFloat16>(),
-        grad_Y.data_ptr<float>(),
-        grad_U_z.data_ptr<float>(),
-        grad_E.data_ptr<float>(),
-        grad_Z.data_ptr<float>(),
-        grad_T.data_ptr<float>(),
-        static_cast<int>(length),
-        static_cast<int>(heads),
-        static_cast<int>(chunks),
-        static_cast<int>(value_dim),
-        static_cast<int>(panels));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {grad_E, grad_Z, grad_T};
-}
-
-C32WYPairBackwardResult c32_wy_pair_backward_cuda(
+at::Tensor c32_wy_pair_backward_cuda(
     const at::Tensor& d,
     const at::Tensor& e,
     const at::Tensor& chi,
@@ -425,12 +281,14 @@ C32WYPairBackwardResult c32_wy_pair_backward_cuda(
     const at::Tensor& grad_E_gamma,
     const at::Tensor& grad_Q_gamma,
     const at::Tensor& grad_D_tail,
-    const at::Tensor& grad_G_last) {
-    check_bf16_vectors(d, d, "d");
-    check_bf16_vectors(e, d, "e");
-    check_bf16_vectors(chi, d, "chi");
-    check_bf16_vectors(D_tail, d, "D_tail");
-    check_bf16_vectors(Q_gamma, d, "Q_gamma");
+    const at::Tensor& grad_G_last,
+    const at::Tensor& frame_primal,
+    const at::Tensor& frame_dual) {
+    check_fp16_vectors(d, d, "d");
+    check_fp16_vectors(e, d, "e");
+    check_fp16_vectors(chi, d, "chi");
+    check_fp16_vectors(D_tail, d, "D_tail");
+    check_fp16_vectors(Q_gamma, d, "Q_gamma");
     for (const auto& named : {
              std::pair<const at::Tensor*, const char*>{&inclusive_decay, "inclusive_decay"},
              {&grad_T, "grad_T"},
@@ -438,7 +296,9 @@ C32WYPairBackwardResult c32_wy_pair_backward_cuda(
              {&grad_E_gamma, "grad_E_gamma"},
              {&grad_Q_gamma, "grad_Q_gamma"},
              {&grad_D_tail, "grad_D_tail"},
-             {&grad_G_last, "grad_G_last"}}) {
+             {&grad_G_last, "grad_G_last"},
+             {&frame_primal, "frame_primal"},
+             {&frame_dual, "frame_dual"}}) {
         check_fp32(*named.first, d, named.second);
     }
     TORCH_CHECK(d.dim() == 4 && d.size(3) == kRank, "d must be [B,T,H,128]");
@@ -457,36 +317,37 @@ C32WYPairBackwardResult c32_wy_pair_backward_cuda(
         "pair cotangent shape mismatch");
     TORCH_CHECK(grad_E_gamma.sizes() == d.sizes() && grad_Q_gamma.sizes() == d.sizes() && grad_D_tail.sizes() == d.sizes(), "gauge cotangent shape mismatch");
     TORCH_CHECK(grad_G_last.sizes() == at::IntArrayRef({batch, heads, chunks, kRank}), "grad_G_last shape mismatch");
+    TORCH_CHECK(frame_primal.sizes() == d.sizes(), "frame_primal shape mismatch");
+    TORCH_CHECK(
+        frame_dual.sizes()
+            == at::IntArrayRef({batch, length, heads, 2, kRank}),
+        "frame_dual shape mismatch");
     auto fp32 = d.options().dtype(at::kFloat);
-    auto grad_d = at::empty(d.sizes(), fp32);
-    auto grad_e = at::empty(d.sizes(), fp32);
-    auto grad_chi = at::empty(d.sizes(), fp32);
     auto grad_G = at::empty(d.sizes(), fp32);
     const int64_t panels = batch * heads * chunks;
     c10::cuda::CUDAGuard guard(d.device());
     check_sm120(d);
     wy_pair_backward_kernel<<<
         static_cast<int>(panels), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        d.data_ptr<at::BFloat16>(),
-        e.data_ptr<at::BFloat16>(),
-        chi.data_ptr<at::BFloat16>(),
+        d.data_ptr<at::Half>(),
+        e.data_ptr<at::Half>(),
+        chi.data_ptr<at::Half>(),
         inclusive_decay.data_ptr<float>(),
-        D_tail.data_ptr<at::BFloat16>(),
-        Q_gamma.data_ptr<at::BFloat16>(),
+        D_tail.data_ptr<at::Half>(),
+        Q_gamma.data_ptr<at::Half>(),
         grad_T.data_ptr<float>(),
         grad_A_qd.data_ptr<float>(),
         grad_E_gamma.data_ptr<float>(),
         grad_Q_gamma.data_ptr<float>(),
         grad_D_tail.data_ptr<float>(),
         grad_G_last.data_ptr<float>(),
-        grad_d.data_ptr<float>(),
-        grad_e.data_ptr<float>(),
-        grad_chi.data_ptr<float>(),
+        frame_primal.data_ptr<float>(),
+        frame_dual.data_ptr<float>(),
         grad_G.data_ptr<float>(),
         static_cast<int>(length),
         static_cast<int>(heads),
         static_cast<int>(chunks),
         static_cast<int>(panels));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {grad_d, grad_e, grad_chi, grad_G};
+    return grad_G;
 }

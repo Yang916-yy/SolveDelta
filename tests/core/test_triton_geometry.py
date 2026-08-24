@@ -430,11 +430,10 @@ def test_lower_level_bf16_scan_backward_keeps_fp32_partials_for_composition() ->
         local_grad_h=local_h,
         local_grad_log_decay=local_decay,
     )
-    assert fused[0].dtype == fused[1].dtype == torch.bfloat16
-    assert fused[2].dtype == torch.float32
-    assert torch.equal(fused[0], (partials[0] + local_u).bfloat16())
-    assert torch.equal(fused[1], (partials[1] + local_h).bfloat16())
-    assert torch.equal(fused[2], partials[2] + local_decay)
+    assert all(partial.dtype == torch.float32 for partial in fused)
+    torch.testing.assert_close(fused[0], partials[0] + local_u)
+    torch.testing.assert_close(fused[1], partials[1] + local_h)
+    torch.testing.assert_close(fused[2], partials[2] + local_decay)
     for expected, actual in zip(partials[3:], fused[3:]):
         assert torch.equal(expected, actual)
 

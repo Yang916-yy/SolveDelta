@@ -14,9 +14,9 @@ constexpr int kComponents = 4;
 
 struct alignas(16) PairedActionShared {
     float primal[kChunk * kRank];
-    at::BFloat16 factor[kChunk * kTile * kTile];
-    at::BFloat16 u_left[kChunk * kTile];
-    at::BFloat16 u_right[kChunk * kTile];
+    at::Half factor[kChunk * kTile * kTile];
+    at::Half u_left[kChunk * kTile];
+    at::Half u_right[kChunk * kTile];
     at::BFloat16 h_right[kChunk * kTile];
     float boundary_j[kTile * kTile];
     float boundary_d[kTile * kTile];
@@ -102,8 +102,8 @@ __device__ __forceinline__ void reconstruct_factor_tile(
                     target * kComponents + component + 1] * moment_d);
             shared.factor[target * kTile * kTile + tid] =
                 target < geometry.valid_count()
-                ? at::BFloat16(value)
-                : at::BFloat16(0.0f);
+                ? at::Half(value)
+                : at::Half(0.0f);
         }
     }
     __syncthreads();
@@ -161,11 +161,8 @@ __device__ __forceinline__ void accumulate_dual_tile(
                 active = EffectiveUpper ? row < column : row > column;
             }
             if (active) {
-                float rhs = dual_input.load(
+                const float rhs = dual_input.load(
                     target, route, source_start + row);
-                if constexpr (!Diagonal) {
-                    rhs = static_cast<float>(at::BFloat16(rhs));
-                }
                 value = fmaf(
                     static_cast<float>(shared.factor[
                         target * kTile * kTile + row * kTile + column]),
@@ -234,8 +231,7 @@ __device__ __forceinline__ void update_primal_tile(
         action = fmaf(
             static_cast<float>(shared.factor[
                 target * kTile * kTile + row * kTile + column]),
-            static_cast<float>(at::BFloat16(
-                shared.primal[target * kRank + solved_start + column])),
+            shared.primal[target * kRank + solved_start + column],
             action);
     }
     shared.primal[target * kRank + row_start + row] -= action;
