@@ -53,6 +53,7 @@ def _chunk_weights_kernel(
     stride_b: tl.constexpr,
     stride_t: tl.constexpr,
     stride_h: tl.constexpr,
+    write_mass: tl.constexpr,
 ):
     program = tl.program_id(0)
     chunk = program % chunks
@@ -71,7 +72,8 @@ def _chunk_weights_kernel(
     tl.store(weights + base + offsets, local_weights)
     summary_index = (batch * heads + head) * chunks + chunk
     tl.store(chunk_lambda + summary_index, tl.exp(tl.sum(logs, axis=0)))
-    tl.store(chunk_mass + summary_index, tl.sum(local_weights, axis=0))
+    if write_mass:
+        tl.store(chunk_mass + summary_index, tl.sum(local_weights, axis=0))
 
 
 @triton.jit
@@ -326,6 +328,10 @@ def _chunk_summary_vector_vjp_kernel(
     grad_u,
     grad_h,
     grad_weight_partial,
+    local_grad_u,
+    local_grad_h,
+    panel_grad_u,
+    panel_grad_h,
     length: tl.constexpr,
     heads: tl.constexpr,
     rank: tl.constexpr,
@@ -341,6 +347,9 @@ def _chunk_summary_vector_vjp_kernel(
     stride_ht: tl.constexpr,
     stride_hh: tl.constexpr,
     stride_hr: tl.constexpr,
+    use_bf16_mma: tl.constexpr,
+    add_local_partials: tl.constexpr,
+    add_panel_partials: tl.constexpr,
 ):
     row_block = tl.program_id(0)
     panel = tl.program_id(1)
@@ -354,8 +363,7 @@ def _chunk_summary_vector_vjp_kernel(
     valid = tokens < length
     matrix_base = panel * rank * rank
 
-    action_J = tl.zeros((block_r, chunk_size), tl.float32)
-    action_Jt = tl.zeros((block_r, chunk_size), tl.float32)
+    action_J_symmetric = tl.zeros((block_r, chunk_size), tl.float32)
     action_D = tl.zeros((block_r, chunk_size), tl.float32)
     action_Dt = tl.zeros((block_r, chunk_size), tl.float32)
     for col_block in tl.static_range(0, row_blocks):
@@ -392,7 +400,7 @@ def _chunk_summary_vector_vjp_kernel(
             + cols[:, None] * stride_ur,
             mask=valid[None, :],
             other=0.0,
-        ).to(tl.float32)
+        )
         source_h = tl.load(
             h_value
             + batch * stride_hb
@@ -401,14 +409,45 @@ def _chunk_summary_vector_vjp_kernel(
             + cols[:, None] * stride_hr,
             mask=valid[None, :],
             other=0.0,
-        ).to(tl.float32)
-        action_J += tl.dot(grad_J, source_u, input_precision="ieee")
-        action_Jt += tl.dot(
-            tl.trans(grad_Jt_source), source_u, input_precision="ieee"
         )
-        action_D += tl.dot(grad_D, source_h, input_precision="ieee")
+        grad_J_symmetric = grad_J + tl.trans(grad_Jt_source)
+        grad_D_transposed = tl.trans(grad_Dt_source)
+        if use_bf16_mma:
+            grad_J_symmetric = grad_J_symmetric.to(
+                tl.bfloat16, fp_downcast_rounding="rtne"
+            )
+            grad_D = grad_D.to(
+                tl.bfloat16, fp_downcast_rounding="rtne"
+            )
+            grad_D_transposed = grad_D_transposed.to(
+                tl.bfloat16, fp_downcast_rounding="rtne"
+            )
+            source_u = source_u.to(
+                tl.bfloat16, fp_downcast_rounding="rtne"
+            )
+            source_h = source_h.to(
+                tl.bfloat16, fp_downcast_rounding="rtne"
+            )
+        else:
+            source_u = source_u.to(tl.float32)
+            source_h = source_h.to(tl.float32)
+        action_J_symmetric += tl.dot(
+            grad_J_symmetric,
+            source_u,
+            input_precision="ieee",
+            out_dtype=tl.float32,
+        )
+        action_D += tl.dot(
+            grad_D,
+            source_h,
+            input_precision="ieee",
+            out_dtype=tl.float32,
+        )
         action_Dt += tl.dot(
-            tl.trans(grad_Dt_source), source_u, input_precision="ieee"
+            grad_D_transposed,
+            source_u,
+            input_precision="ieee",
+            out_dtype=tl.float32,
         )
 
     local_u = tl.load(
@@ -435,17 +474,35 @@ def _chunk_summary_vector_vjp_kernel(
         + head * stride_hh
         + rows[:, None] * stride_hr
     )
-    tl.store(
-        grad_u + output_u,
-        (action_J + action_Jt + action_D) * weight[None, :],
-        mask=valid[None, :],
+    result_u = (action_J_symmetric + action_D) * weight[None, :]
+    result_h = action_Dt * weight[None, :]
+    if add_local_partials:
+        result_u += tl.load(
+            local_grad_u + output_u, mask=valid[None, :], other=0.0
+        ).to(tl.float32)
+        result_h += tl.load(
+            local_grad_h + output_h, mask=valid[None, :], other=0.0
+        ).to(tl.float32)
+    if add_panel_partials:
+        panel_offset = (
+            (panel * chunk_size + local_t[None, :]) * rank
+            + rows[:, None]
+        )
+        result_u += tl.load(
+            panel_grad_u + panel_offset,
+            mask=valid[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        result_h += tl.load(
+            panel_grad_h + panel_offset,
+            mask=valid[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    tl.store(grad_u + output_u, result_u, mask=valid[None, :])
+    tl.store(grad_h + output_h, result_h, mask=valid[None, :])
+    grad_weight = tl.sum(
+        local_u * (0.5 * action_J_symmetric + action_D), axis=0
     )
-    tl.store(
-        grad_h + output_h,
-        action_Dt * weight[None, :],
-        mask=valid[None, :],
-    )
-    grad_weight = tl.sum(local_u * (action_J + action_D), axis=0)
     tl.store(
         grad_weight_partial
         + (panel * row_blocks + row_block) * chunk_size
@@ -462,6 +519,8 @@ def _chunk_summary_scalar_vjp_kernel(
     grad_lambda,
     grad_weight_partial,
     grad_log_decay,
+    local_grad_log_decay,
+    panel_grad_log_decay,
     length: tl.constexpr,
     heads: tl.constexpr,
     chunks: tl.constexpr,
@@ -470,6 +529,8 @@ def _chunk_summary_scalar_vjp_kernel(
     stride_b: tl.constexpr,
     stride_t: tl.constexpr,
     stride_h: tl.constexpr,
+    add_local_partial: tl.constexpr,
+    add_panel_partial: tl.constexpr,
 ):
     panel = tl.program_id(0)
     chunk = panel % chunks
@@ -504,12 +565,23 @@ def _chunk_summary_scalar_vjp_kernel(
             tl.where(include, source_grad_weight, 0.0),
             source_weight,
         )
+    output = (
+        batch * stride_b + tokens * stride_t + head * stride_h
+    )
+    result = high + low
+    if add_local_partial:
+        result += tl.load(
+            local_grad_log_decay + output, mask=valid, other=0.0
+        ).to(tl.float32)
+    if add_panel_partial:
+        result += tl.load(
+            panel_grad_log_decay + panel * chunk_size + local_t,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
     tl.store(
-        grad_log_decay
-        + batch * stride_b
-        + tokens * stride_t
-        + head * stride_h,
-        tl.where(valid, high + low, 0.0),
+        grad_log_decay + output,
+        tl.where(valid, result, 0.0),
         mask=valid,
     )
 
@@ -566,6 +638,7 @@ def _triton_geometry_chunk_scan_forward(
         stride_b=geometry_log_decay.stride(0),
         stride_t=geometry_log_decay.stride(1),
         stride_h=geometry_log_decay.stride(2),
+        write_mass=True,
     )
 
     # The summary kernel fills the public boundary storage first. The affine
@@ -668,12 +741,68 @@ def _triton_geometry_chunk_scan_backward(
     grad_final_J: torch.Tensor,
     grad_final_D: torch.Tensor,
     chunk_size: int,
+    *,
+    local_grad_u: torch.Tensor | None = None,
+    local_grad_h: torch.Tensor | None = None,
+    local_grad_log_decay: torch.Tensor | None = None,
+    panel_gradients: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Return FP32 affine-scan partials for a surrounding composed backward."""
+    """Return affine-scan partials for a surrounding composed backward.
+
+    Standalone scan partials are FP32. When resident FP32 local partials are
+    supplied, the final vector stores use the activation dtype so the composed
+    owner performs the only BF16 rounding at its public autograd boundary.
+    """
     batch, length, heads, rank = u.shape
     chunks = triton.cdiv(length, chunk_size)
     panels = batch * heads * chunks
     head_batches = batch * heads
+    local_partials = (
+        local_grad_u,
+        local_grad_h,
+        local_grad_log_decay,
+    )
+    add_local_partials = any(value is not None for value in local_partials)
+    add_panel_partials = panel_gradients is not None
+    if add_local_partials and add_panel_partials:
+        raise ValueError("token-major and panel-major local partials are exclusive")
+    if add_local_partials:
+        if not all(value is not None for value in local_partials):
+            raise ValueError("all local geometry partials must be provided")
+        expected = (u.shape, h.shape, geometry_log_decay.shape)
+        for name, value, shape in zip(
+            ("local_grad_u", "local_grad_h", "local_grad_log_decay"),
+            local_partials,
+            expected,
+        ):
+            if value.shape != shape or value.dtype != torch.float32:
+                raise ValueError(f"{name} must be contiguous FP32 with shape {shape}")
+            if value.device != u.device or not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous on the input device")
+    if add_panel_partials:
+        if len(panel_gradients) != 3:
+            raise ValueError("panel_gradients must contain u, h, and log-decay")
+        panel_shapes = (
+            (panels, chunk_size, rank),
+            (panels, chunk_size, rank),
+            (panels, chunk_size),
+        )
+        for name, value, shape in zip(
+            (
+                "panel_grad_u",
+                "panel_grad_h",
+                "panel_grad_log_decay",
+            ),
+            panel_gradients,
+            panel_shapes,
+        ):
+            if (
+                value.shape != shape
+                or value.dtype != torch.float32
+                or value.device != u.device
+                or not value.is_contiguous()
+            ):
+                raise ValueError(f"{name} must be contiguous FP32 with shape {shape}")
 
     weights = torch.empty(
         batch,
@@ -686,12 +815,11 @@ def _triton_geometry_chunk_scan_backward(
     chunk_lambda = torch.empty(
         batch, heads, chunks, device=u.device, dtype=torch.float32
     )
-    chunk_mass = torch.empty_like(chunk_lambda)
     _chunk_weights_kernel[(panels,)](
         geometry_log_decay,
         weights,
         chunk_lambda,
-        chunk_mass,
+        chunk_lambda,
         length=length,
         heads=heads,
         chunks=chunks,
@@ -699,6 +827,7 @@ def _triton_geometry_chunk_scan_backward(
         stride_b=geometry_log_decay.stride(0),
         stride_t=geometry_log_decay.stride(1),
         stride_h=geometry_log_decay.stride(2),
+        write_mass=False,
         num_warps=4,
     )
 
@@ -761,8 +890,18 @@ def _triton_geometry_chunk_scan_backward(
     # ``u`` and ``h`` may be BF16 contraction operands. Keep their scan
     # partials in FP32 so a composed owner can add frame partials before the
     # single activation-gradient cast at its outer boundary.
-    grad_u = torch.empty(u.shape, device=u.device, dtype=torch.float32)
-    grad_h = torch.empty(h.shape, device=h.device, dtype=torch.float32)
+    activation_dtype = (
+        u.dtype if add_local_partials or add_panel_partials else torch.float32
+    )
+    grad_u = torch.empty(u.shape, device=u.device, dtype=activation_dtype)
+    grad_h = torch.empty(h.shape, device=h.device, dtype=activation_dtype)
+    local_u_pointer = local_grad_u if add_local_partials else grad_u
+    local_h_pointer = local_grad_h if add_local_partials else grad_h
+    panel_pointers = (
+        panel_gradients
+        if add_panel_partials
+        else (grad_u, grad_h, geometry_log_decay)
+    )
     row_blocks = rank // 32
     grad_weight_partial = torch.empty(
         panels,
@@ -780,6 +919,10 @@ def _triton_geometry_chunk_scan_backward(
         grad_u,
         grad_h,
         grad_weight_partial,
+        local_u_pointer,
+        local_h_pointer,
+        panel_pointers[0],
+        panel_pointers[1],
         length=length,
         heads=heads,
         rank=rank,
@@ -795,6 +938,9 @@ def _triton_geometry_chunk_scan_backward(
         stride_ht=h.stride(1),
         stride_hh=h.stride(2),
         stride_hr=h.stride(3),
+        use_bf16_mma=u.dtype == torch.bfloat16,
+        add_local_partials=add_local_partials,
+        add_panel_partials=add_panel_partials,
         num_warps=8,
         num_stages=1,
     )
@@ -803,6 +949,9 @@ def _triton_geometry_chunk_scan_backward(
         device=geometry_log_decay.device,
         dtype=torch.float32,
     )
+    local_decay_pointer = (
+        local_grad_log_decay if add_local_partials else grad_log_decay
+    )
     _chunk_summary_scalar_vjp_kernel[(panels,)](
         weights,
         chunk_lambda,
@@ -810,6 +959,8 @@ def _triton_geometry_chunk_scan_backward(
         grad_lambda,
         grad_weight_partial,
         grad_log_decay,
+        local_decay_pointer,
+        panel_pointers[2],
         length=length,
         heads=heads,
         chunks=chunks,
@@ -818,6 +969,8 @@ def _triton_geometry_chunk_scan_backward(
         stride_b=grad_log_decay.stride(0),
         stride_t=grad_log_decay.stride(1),
         stride_h=grad_log_decay.stride(2),
+        add_local_partial=add_local_partials,
+        add_panel_partial=add_panel_partials,
         num_warps=1,
         num_stages=1,
     )

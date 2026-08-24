@@ -27,6 +27,10 @@ def test_deleted_backend_abis_do_not_return() -> None:
         "causallsso/ops/tensorcore_frame.py",
         "causallsso/ops/triton_frame.py",
         "causallsso/ops/triton_bounded_ldu.py",
+        "causallsso/ops/resident_frame.py",
+        "causallsso/ops/wy.py",
+        "causallsso/ops/wy_stage.py",
+        "native/solvedelta_c32_backward.cu",
     )
     assert all(not (ROOT / path).exists() for path in forbidden_paths)
 
@@ -48,7 +52,7 @@ def test_deleted_backend_abis_do_not_return() -> None:
         for path in (
             "native/solvedelta_c32.h",
             "native/solvedelta_c32_forward.cu",
-            "native/solvedelta_c32_backward.cu",
+            "native/solvedelta_wy.cu",
         )
     )
     forbidden_native_abi = (
@@ -56,6 +60,13 @@ def test_deleted_backend_abis_do_not_return() -> None:
         "c32_frame_backward_cuda",
         '"c32_frame_forward(',
         '"c32_frame_backward(',
+        "c32_frame_resident_forward",
+        "c32_frame_resident_action_backward",
+        "c32_frame_wy_stage_forward",
+        "c32_frame_wy_stage_action_backward",
+        "c32_frame_compact_pair",
+        "c32_frame_compact_coefficients",
+        "c32_frame_compact_leaf",
     )
     assert all(symbol not in native_sources for symbol in forbidden_native_abi)
 
@@ -64,9 +75,13 @@ def test_single_native_training_path_is_present() -> None:
     required_paths = (
         "causallsso/ops/chunk_wy.py",
         "causallsso/ops/native_chunk.py",
-        "causallsso/ops/resident_frame.py",
+        "causallsso/ops/chunk_state.py",
+        "causallsso/ops/radial_compact.py",
+        "causallsso/ops/strict_chart.py",
         "causallsso/ops/triton_geometry.py",
-        "causallsso/ops/wy.py",
+        "native/solvedelta_c32_forward.cu",
+        "native/solvedelta_wy.cu",
+        "native/solvedelta_prepare.cu",
     )
     assert all((ROOT / path).is_file() for path in required_paths)
 
@@ -74,8 +89,17 @@ def test_single_native_training_path_is_present() -> None:
     assert "_CHUNK_SIZE = 32" in chunk_wy
     assert "_RANK = 128" in chunk_wy
     assert "_EDITS = 1" in chunk_wy
-    assert "native_geometry_frame" in chunk_wy
-    assert "wy_associative" in chunk_wy
+    assert "native_chunk_solvedelta" in chunk_wy
+    for forbidden in (
+        "native_geometry_wy_stage",
+        "wy_stage_statistics",
+        "wy_associative_staged",
+        "qg",
+        "kg",
+        "ag",
+        "A_ad",
+    ):
+        assert forbidden not in chunk_wy
     module = ast.parse(chunk_wy)
     entrypoint = next(
         node
@@ -91,17 +115,24 @@ def test_single_native_training_path_is_present() -> None:
 
     native_chunk = (ROOT / "causallsso/ops/native_chunk.py").read_text()
     for symbol in (
-        "c32_frame_resident_forward",
-        "c32_frame_resident_action_backward",
+        "c32_solvedelta_prepare_forward",
+        "c32_solvedelta_prepare_backward",
+    ):
+        assert symbol in native_chunk
+    for symbol in (
+        "c32_frame_actions_forward",
+        "c32_frame_actions_backward",
+        "c32_wy_statistics_forward",
+        "c32_wy_solve_forward",
+        "c32_wy_solve_backward",
+        "c32_wy_pair_backward",
+        "c32_frame_wy_stage_forward",
+        "c32_frame_wy_stage_action_backward",
         "c32_frame_compact_pair",
         "c32_frame_compact_coefficients",
         "c32_frame_compact_leaf",
     ):
-        assert symbol in native_chunk
-
-    wy = (ROOT / "causallsso/ops/wy.py").read_text()
-    assert "_direct_e_fwd_intra_kernel" in wy
-    assert "_direct_e_bwd_intra_kernel" in wy
+        assert symbol not in native_chunk
 
 
 def test_mathdx_is_an_optional_oracle_only() -> None:

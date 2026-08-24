@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
-
 import pytest
 import torch
 
@@ -10,8 +8,8 @@ from causallsso.reference import SolveDeltaState, solvedelta_reference
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or importlib.util.find_spec("fla") is None,
-    reason="CUDA and flash-linear-attention are required",
+    not torch.cuda.is_available(),
+    reason="CUDA is required",
 )
 
 _INPUT_NAMES = (

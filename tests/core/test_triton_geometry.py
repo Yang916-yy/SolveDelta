@@ -414,6 +414,30 @@ def test_lower_level_bf16_scan_backward_keeps_fp32_partials_for_composition() ->
     assert torch.equal(public[0], partials[0].to(torch.bfloat16))
     assert torch.equal(public[1], partials[1].to(torch.bfloat16))
 
+    local_u = torch.randn_like(u, dtype=torch.float32)
+    local_h = torch.randn_like(h, dtype=torch.float32)
+    local_decay = torch.randn_like(log_decay)
+    fused = _triton_geometry_chunk_scan_backward(
+        u,
+        h,
+        log_decay,
+        boundary.m,
+        boundary.J,
+        boundary.D,
+        *output_grads,
+        chunk_size,
+        local_grad_u=local_u,
+        local_grad_h=local_h,
+        local_grad_log_decay=local_decay,
+    )
+    assert fused[0].dtype == fused[1].dtype == torch.bfloat16
+    assert fused[2].dtype == torch.float32
+    assert torch.equal(fused[0], (partials[0] + local_u).bfloat16())
+    assert torch.equal(fused[1], (partials[1] + local_h).bfloat16())
+    assert torch.equal(fused[2], partials[2] + local_decay)
+    for expected, actual in zip(partials[3:], fused[3:]):
+        assert torch.equal(expected, actual)
+
 
 def test_triton_geometry_bf16_deep_cancellation_uses_fp32_state() -> None:
     torch.manual_seed(20260908)

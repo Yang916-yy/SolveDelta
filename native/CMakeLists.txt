@@ -7,12 +7,19 @@ project(causallsso_native LANGUAGES CXX CUDA)
 find_package(Torch REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
+set(CUTLASS_ROOT "/opt/nvidia-cutlass" CACHE PATH "CUTLASS installation root")
+
 add_library(
   causallsso_chunk SHARED
   solvedelta_c32_forward.cu
-  solvedelta_c32_backward.cu
+  solvedelta_wy.cu
+  solvedelta_prepare.cu
 )
 target_compile_features(causallsso_chunk PRIVATE cxx_std_20)
+target_include_directories(
+  causallsso_chunk PRIVATE
+  "${CUTLASS_ROOT}/include"
+)
 target_compile_options(
   causallsso_chunk PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-extended-lambda;-Xptxas=-v>

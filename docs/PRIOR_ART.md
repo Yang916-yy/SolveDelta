@@ -70,6 +70,21 @@ and state-cotangent tests validate the specialization. It removes
 materialization, saving, and replay of `a`; it does not change the operator or
 claim a new WY algorithm.
 
+Decision: the direct-`e` generalized-DPLR composition above is a validated
+historical checkpoint, not the target production ABI. The selected rewrite
+fuses chunk-local SolveDelta actions directly into WY statistics, keeps the
+native action panel at `r x C` rather than constructing a synthetic `3C`
+dimension, and retains FLA's mature factorized state scan without requiring
+its generic Python staging interface. Channel-wise decay interactions are
+formed from the nonpositive log differences `exp(G_i-G_j)` and
+`exp(G_C-G_i)`; the algebraically convenient inverse gauge `exp(-G_j)d_j` is
+never materialized because it can overflow while the true pair interaction is
+finite. The paired backward uses the C32 transpose solve and direct
+interaction/frame/chart transpose actions rather than a chain of entrywise
+VJPs. DeltaNet's WY derivation and FLA's GDN2/Delta implementation informed
+this schedule; the exact forward, reverse, precision map, ABI, and acceptance
+conditions are frozen in `docs/PARALLELISM.md`.
+
 Decision: the installed FLA 0.5.2 GDN2 and GatedDeltaProduct layers establish
 three independent depthwise causal `conv4`, bias-free, SiLU branches over the
 projected query, packed keys, and packed values. Convolution precedes head
@@ -353,10 +368,12 @@ The generic quasiseparable order of a dense continuation can still grow to
 chart has constant ordinary rank or permission to compress `J` or `D`. A plain
 IEEE-FP32 Gram expansion remains rejected because legal boundary/local
 cancellation can lose the residual or reconstruct a negative squared norm.
-The selected resident path preserves four independent radial channels and a
-fixed high/low representation for FP32 boundary products. The same `2^12`
-cancellation cases remain mandatory; mixed precision does not turn them into
-warning-only diagnostics.
+The selected resident path preserves four independent radial channels. Each
+named FP32-state contraction starts with one statically frozen direct-BF16
+packing; high/low is permitted only as a static promotion of the particular
+contraction that fails an unchanged oracle or cancellation gate. The same
+`2^12` cancellation cases remain mandatory; mixed precision does not turn
+them into warning-only diagnostics.
 
 - Seeger, *Low Rank Updates for the Cholesky Decomposition*,
   [EPFL technical report](https://infoscience.epfl.ch/entities/publication/00ba309a-d155-4e21-acc2-153702c4605c).
@@ -498,24 +515,41 @@ Unlike multiplying tolerance by the observed cancellation ratio, this ceiling
 is fixed by the six-to-one map's operator norm and cannot vary with the data.
 
 On the local SM120 profile
-`B=1,T=1024,H=8,r=d_v=128,K=1,C=32`, the selected path measures
-`1.669/7.740 ms` forward/forward-plus-backward versus `0.358/1.154 ms` for the
-matched GDN2 operator. Both rows exclude projections and conv4. The split is
-geometry scan `0.119/0.695 ms`, resident frame
-`1.243/6.174 ms`, and direct-`e` WY `0.234/0.936 ms`; resident frame backward is
-about `4.93 ms`. The WY core is already close to matched GDN2's
-`0.244/0.941 ms`, localizing the remaining performance and workspace gap to
-the frame, especially its reverse. Explicit `d,e,chi` still cross the frame/WY
-boundary, so this checkpoint is not a complete Solve-to-WY fusion.
+`B=1,T=1024,H=8,r=d_v=128,K=1,C=32`, the current closed
+scan--prepare--state path measures about `1.91/6.86 ms`
+forward/forward-plus-backward versus `0.32/1.10 ms` for the matched GDN2
+operator. Both rows exclude projections and conv4. The chunk-owned prepare
+contains frame action, stable pair statistics, and the C32 WY solve; `d/e/chi`
+are generated and consumed inside that ownership boundary and returned only as
+a private BF16 backward cache. They are not a public frame-to-WY ABI.
 
-A SASS audit of the loaded native library found no MMA instruction in its nine
-custom resident kernels. Tensor Core work currently comes from the Triton
-scan/WY contractions and the reverse's broad BF16 `bmm`s; resident forward and
-the compact action-adjoint/pair/leaf/coefficient kernels remain scalar-FMA
-code. This is why the BF16/FP32 ABI and lower precision alone do not close the
-GDN2 gap. The next performance rewrite must express common boundary actions as
-wide GEMMs and local terms as the exact `O(C^2r)` semiseparable action, with the
-corresponding transpose schedule in backward.
+The selected frame checkpoint is a paired normalized-moment schedule: each
+BF16 `16x16` factor tile is generated once, then serves the primal gather solve
+and the two-route dual scatter action. Its target-profile mixed frame kernels
+measure about `1.01 ms` forward and `0.70 ms` adjoint, with no register spill.
+This replaced four independent factor traversals and reduced the complete path
+from roughly `2.25/7.7 ms` to `1.91/6.86 ms`. The reverse now also accumulates
+strict, radial, and diagonal geometry cotangents into one FP32 vector panel and
+one FP32 `J/D` boundary pair rather than returning separate VJP panels.
+
+Two exact broad/local semiseparable A/Bs were then rejected at the same shape.
+A direct-BF16 CuTe version with separate primal and dual traversals passed the
+same full-layer FP64/VJP tests but measured about `2.25/7.68 ms`, with mixed
+frame forward/adjoint near `1.08/1.02 ms`. A genuinely paired version shared
+the diagonal factor and used boundary `32/64`-RHS MMA plus cumulative `C x C`
+local correlations. It also passed the full-layer oracle and VJP, but its
+dual-suffix precompute and `50.8 KiB` shared footprint reduced occupancy to one
+CTA per SM; the result regressed to about `2.90/9.60 ms`, with mixed frame
+forward/adjoint near `1.92/2.11 ms`. Both implementations were deleted rather
+than retained as alternate backends.
+
+This is rejection evidence for those schedules, not for the Section 6
+algebra. The current paired scalar checkpoint remains faster at `r=128,C=32`,
+but it does not complete the intended boundary-GEMM plus `O(C^2r)` production
+rewrite. Closing that contract now requires a schedule that avoids both the
+four-traversal duplication and the resident `C x 2C` dual-suffix correlation
+state; merely translating the existing formulas into more MMA instructions is
+not an accepted next step.
 
 ## Explicitly closed directions
 

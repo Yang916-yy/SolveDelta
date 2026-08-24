@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-from causallsso.ops.native_chunk import native_geometry_frame
-from causallsso.ops.wy import wy_associative
+from causallsso.ops.native_chunk import native_chunk_solvedelta
+from causallsso.ops.normalization import normalize_solvedelta_inputs
 from causallsso.reference import SolveDeltaState
 
 
@@ -118,10 +117,6 @@ def _validate_inputs(
     return batch, length, heads, value_dim
 
 
-def _normalize_to_bf16(x: torch.Tensor) -> torch.Tensor:
-    return F.normalize(x.float(), p=2, dim=-1).to(torch.bfloat16)
-
-
 def chunk_wy_solvedelta(
     u: torch.Tensor,
     h: torch.Tensor,
@@ -150,38 +145,59 @@ def chunk_wy_solvedelta(
         geometry_strength,
         initial_state,
     )
-    normalized_u = _normalize_to_bf16(u)
-    normalized_q = _normalize_to_bf16(q)
-    normalized_keys = _normalize_to_bf16(keys)
-    d, e, chi, geometry_final = native_geometry_frame(
+    normalized_u, normalized_q, normalized_keys = normalize_solvedelta_inputs(
+        u,
+        q,
+        keys,
+    )
+    if initial_state is None:
+        batch, _, heads, rank = normalized_u.shape
+        value_dim = values.shape[-1]
+        initial_state = SolveDeltaState(
+            torch.zeros(
+                batch, heads, device=u.device, dtype=torch.float32
+            ),
+            torch.zeros(
+                batch,
+                heads,
+                rank,
+                rank,
+                device=u.device,
+                dtype=torch.float32,
+            ),
+            torch.zeros(
+                batch,
+                heads,
+                rank,
+                rank,
+                device=u.device,
+                dtype=torch.float32,
+            ),
+            torch.zeros(
+                batch,
+                heads,
+                rank,
+                value_dim,
+                device=u.device,
+                dtype=torch.float32,
+            ),
+        )
+    else:
+        initial_state = SolveDeltaState(
+            *(tensor.contiguous() for tensor in initial_state)
+        )
+    return native_chunk_solvedelta(
         normalized_u,
-        h,
-        geometry_log_decay,
-        normalized_keys,
-        erase,
+        h.contiguous(),
         normalized_q,
-        geometry_strength,
-        initial_state=initial_state,
-    )
-
-    z = write * values
-    output, final_s = wy_associative(
-        chi,
-        d,
-        e,
-        z,
-        associative_log_decay,
-        initial_state=initial_state.S if initial_state is not None else None,
-        output_final_state=True,
-        chunk_size=_CHUNK_SIZE,
-    )
-    if final_s is None:  # pragma: no cover - fixed output_final_state=True
-        raise RuntimeError("the WY exterior did not return its final state")
-    return output, SolveDeltaState(
-        geometry_final.m,
-        geometry_final.J,
-        geometry_final.D,
-        final_s,
+        normalized_keys,
+        values.contiguous(),
+        geometry_log_decay.contiguous(),
+        associative_log_decay.contiguous(),
+        erase.contiguous(),
+        write.contiguous(),
+        geometry_strength.contiguous(),
+        initial_state,
     )
 
 
