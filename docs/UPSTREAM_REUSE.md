@@ -2,9 +2,10 @@
 
 This inventory controls source-level reuse for the one production SolveDelta
 path. It does not define operator mathematics; `causallsso/reference.py`
-remains the sole executable oracle, and `docs/PARALLELISM.md` remains the
-execution contract. A checked source-review item means that the upstream block
-has been inspected, not that it has been adopted.
+remains the sole executable oracle, and `docs/FROM_SCRATCH_REBUILD.md` is the
+current execution blueprint. `docs/PARALLELISM.md` records the older execution
+audit and does not override the selected rebuild. A checked source-review item
+means that the upstream block has been inspected, not that it has been adopted.
 
 The reviewed baseline is Flash Linear Attention (FLA) `v0.5.2`, installed in
 the repository's `causallsso` virtual environment. The exterior audit also
@@ -19,25 +20,34 @@ copyright header, identify the exact upstream function, and update
 
 - [x] Reuse the smallest algebraically matching kernel block, tile schedule, or
   transpose formula. Do not import an entire model or operator ABI.
-- [x] Keep the native specialization fixed at `C=32`, `r=128`, `K=1`, BF16
+- [x] Keep the first native model specialization at `r=128`, `K=1`, BF16
   public/raw operands, analytically bounded private FP16 panels, FP32
-  accumulation, and FP32 continuation states.
-- [x] Preserve SolveDelta-owned layouts. Do not create generic `qg/kg/ag`,
-  public `d/e/chi`, synthetic `3C=96`, or DPLR compatibility tensors.
+  accumulation, and FP32 continuation states. Select execution chunk width
+  from `C in {16,32,64}` by complete-path A/B.
+- [x] Preserve the model-facing SolveDelta state/output contract, but let
+  internal layouts follow the selected mature producer/consumer schedule.
+  Internal `d/e/chi`, `D_bar/E/Q`, `qg/kg/ag`, or packed compatibility panels
+  are admissible when their complete-path A/B wins; none becomes a model API.
 - [x] Keep stable decay gauges tile-local. Never materialize
   `exp(-G_i) * d_i` in HBM.
 - [x] Adopt a forward block only with its strict transpose reverse in the same
   change. Entrywise VJP chains are forbidden.
-- [x] Remove upstream varlen, C64, multi-backend, fallback, and unused autotune
-  branches unless they exactly serve the frozen specialization.
+- [x] Evaluate the mature C16/C32/C64 and four-/eight-warp schedules before
+  deleting unused branches. After offline selection, retain only the static
+  target winner plus required irregular/packed semantics; no runtime autotune
+  or data-dependent fallback survives.
 - [x] Benchmark the complete SolveDelta forward and forward-plus-backward path.
   A faster isolated upstream primitive is not sufficient evidence.
+- [x] Treat fusion as a measured schedule choice, not an ABI requirement. A
+  candidate must report register/shared-memory lifetimes, spills, barriers,
+  active CTAs/SM, launches, HBM bytes, and backward cache/recompute cost against
+  a split mature-kernel implementation.
 - [x] Delete a failed adaptation instead of retaining another backend or
   runtime switch.
 
-## P0: Pair Statistics and C32 WY
+## P0: Pair Statistics and Chunk-WY
 
-### C32 unit-lower inverse
+### C16/C32/C64 unit-lower inverse candidates
 
 Upstream:
 
@@ -58,14 +68,18 @@ R_{10}=-R_{11}W_{10}R_{00}.
 \]
 
 - [x] The 16-by-16 diagonal inverse and 16+16 block merge are algebraically
-  compatible with SolveDelta's unit-lower C32 matrix.
+  compatible with SolveDelta's unit-lower C16/C32 candidates.
+- [ ] Audit and pin the exact upstream C64 block composition before treating it
+  as a candidate; do not infer maturity from the C32 merge alone.
 - [x] Specialize the block to the native panel layout; do not call FLA's
   allocation-owning public wrapper.
 - [x] Keep diagonal substitution in FP32 and separately validate the selected
   operand precision for the two off-diagonal products.
 - [x] Handle irregular final chunks with identity-padded rows and columns.
-- [x] Compare `R @ B` and the transpose solve against the FP64 C32 WY oracle
-  without materializing `R`. MathDx remains the separate `r=128` frame-action
+- [x] Compare the current C32 `R @ B` and transpose solve against the FP64
+  chunk-WY oracle without materializing `R`.
+- [ ] Add the same oracle comparison for C16 and C64 before their performance
+  results enter selection. MathDx remains the separate `r=128` frame-action
   oracle.
 
 ### Wide-RHS application
@@ -137,6 +151,12 @@ A_{qd}=\operatorname{tril}(Q\bar D^T,0).
 - [ ] Measure a separate Triton consumer A/B before attempting a CUDA/Triton
   fusion. A temporary workspace is internal to the prepare owner and must be
   deleted if it does not improve complete F+B latency.
+
+The internal ABI is part of this A/B. The split candidate may preserve
+`d/e/chi`, write transformed `D_bar/E/Q`, or use the exact upstream consumer
+layout so that frame and pair/WY retain their mature CTA schedules. Full fusion
+is accepted only if removing those stores offsets its longer register/shared
+lifetimes, synchronization, occupancy loss, and any backward recomputation.
 
 ### WY and pair transpose reverse
 
@@ -216,17 +236,18 @@ and may lose exponent range.
 - [x] Permit FP32-produced strict chart coordinates and `d/e/chi`-family frame
   panels using the existing `1/4`, `B_P~=2.283`, and rounded-factor
   `2B_D<4.014` certificates.
-- [x] Require every consumer and every backward partial to accumulate in FP32,
-  with forward/reverse consuming the same frozen FP16 bits.
+- [x] Require every consumer and every backward partial to accumulate in FP32;
+  forward and reverse may use different equivalent private layouts.
 - [x] Forbid FP16 storage for unnormalized `h`, values/write-value products,
   and recurrent states. Keep `W` FP32 as the canonical chunk system, and keep
   unbounded `Y/U_z` in BF16 rather than FP16.
 - [x] Forbid runtime dtype selection, range tests, clamps, fallbacks, and
   BF16-to-FP16 pseudo-promotion.
 
-This is the selected rewrite contract. The production normalization and frame
+This is the current implementation baseline. The production normalization and frame
 producers now write the certified vector and strict-factor panels directly from
-FP32 to FP16. The paired frame reverse consumes those same stored FP16 bits.
+FP32 to FP16. The current paired frame reverse consumes those stored FP16 bits,
+but that cache choice is not an operator or release contract.
 Unbounded descriptor cotangents are formed in FP32 registers and written once
 as BF16 for their Tensor Core consumer; descriptor contractions and
 geometry-scan composition still accumulate in FP32. The unbounded paired-WY
@@ -255,16 +276,52 @@ Use `(A,B)=(u,u)` for J generators and `(A,B)=(u,h)` for D generators.
 
 - [x] The two-`tl.dot` schedule is an exact match for every off-diagonal
   coordinate block of the local semiseparable action.
-- [x] Retain a warp strict-triangular solve only for each 16-by-16 diagonal
-  coordinate block.
+- [x] Reuse the resident program loop around `chunk_update_once` for the fixed
+  Neumann inverse; do not retain a coordinate-serial diagonal substitution in
+  the selected route.
 - [ ] Stream tile-local `C x C` interactions; do not restore the rejected
   resident `C x 2C` dual-suffix state.
 - [x] Share one generated factor/action tile between primal gather and the two
-  dual routes without creating a synthetic `3C` dimension.
-- [ ] Derive and implement the exact transpose of this same two-dot action.
+  dual routes when their lifetimes align. A synthetic packed consumer dimension
+  is not required, but remains eligible under the internal-ABI A/B.
+- [x] Derive the exact transpose of this same two-dot action.
+- [ ] Implement the forward action and its strict transpose in the same
+  resident specialization.
 - [ ] Record shared memory, registers, spills, barriers, and CTAs per SM. A
   correct kernel that falls to one CTA per SM is not accepted without a
   complete-path win.
+
+### Resident degree-six Neumann inverse
+
+Upstream skeleton:
+
+- MESA-Net
+  [`chunk_fwd_mesa_cg_dim64_kernel`](https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/mesa_net/chunk_cg_solver_fwd.py)
+- its inline [`chunk_update_once`](https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/mesa_net/chunk_cg_solver_fwd.py)
+
+Reuse target for either strict factor is
+
+\[
+x^{(0)}=b,\qquad x^{(j+1)}=b-Nx^{(j)},\quad j=0,\ldots,5.
+\]
+
+- [x] Freeze `p=6`; the operator remains the exact bounded-LDU solve and the
+  production action is its analytically bounded numerical approximation.
+- [x] Keep the `C x r` base and iterates resident across all six calls. Do not
+  materialize powers, full factors, convergence scalars, or iteration panels
+  in HBM.
+- [x] Use the same six-step schedule with the strict transpose action for the
+  implicit solve VJP, then stream `-bar_b y^T` into chart transpose.
+- [x] Preserve exact structural identity: `N=0` returns `b` at every step.
+- [ ] Specialize and benchmark the complete forward and reverse. It must beat
+  the blocked-substitution checkpoint in warmed F+B median and p95 before it
+  ships.
+
+The reusable MESA content is the inline two-dot action, resident SSA-panel
+lifetime, and static loop placement. SolveDelta deletes CG's `alpha/beta`
+reductions, residual norms, `1e-5` denominator changes, adaptive iteration
+surface, ridge term, output ABI, and backward semantics. Reverse targets the
+implicit exact-solve VJP; it is not autograd through six Horner nodes.
 
 Three workspace-free MESA two-dot schedules were evaluated and deleted. A
 deterministic coordinate-block schedule reduced the old `48 MiB` correlation
@@ -273,9 +330,10 @@ transpose. Its atomic variant removed the remaining partials and took about
 `2.032 ms`; repeat drift was at most roughly `rho=1.2e-7`, but complete F+B did
 not improve. A route-streaming variant restored the exact `O(C^2 r)`
 correlation count and reached about `1.981 ms` isolated, yet regressed the same
-complete path. The current paired scalar action and existing strict transpose
-remain production until one matched forward/transpose schedule wins end to
-end; none of the failed implementations remains in source. This rejects those
+complete path. The current paired scalar action and blocked strict transpose
+remain only as the replacement benchmark until the selected resident Neumann
+forward/transpose schedule wins end to end; none of the failed implementations
+remains in source. This rejects those
 three schedules, not cross-route or coordinate-block FP32 atomics as a class.
 A later fused atomic schedule remains admissible under the fixed repeated-run
 precision and complete-path performance gates in `VALIDATION_PLAN.md`.
@@ -354,13 +412,14 @@ The reusable identity for a full generator tile is
 
 - [x] MESA's pair-score, Hadamard weight, row/column reduction, and decay VJP
   schedule supplies the needed building blocks.
-- [x] Use two C32 Gram contractions plus an elementwise product for each full
-  off-diagonal coordinate tile.
+- [x] Use two `C x C` Gram contractions plus an elementwise product for each
+  full off-diagonal coordinate tile at the selected C.
 - [x] Handle diagonal coordinate tiles with the exact strict mask rather than
   a full-outer approximation.
-- [x] Keep H lower/upper distinct at the public full-ambient `J0` boundary;
-  reached symmetric states may be optimized only inside an ownership boundary
-  that restores the full ambient cotangent. Keep R lower/upper independent.
+- [x] Use one H-symmetric transpose route under the production symmetric-`J`
+  state contract and freeze the full-storage `(G+G^T)/2` cotangent
+  representative. Keep R lower/upper independent; asymmetric R alone supplies
+  the chart's full ambient rank.
 - [x] Keep radial norm, `q2`, mass, tanh, and sensitive reductions in FP32.
 - [x] Apply radial transpose once to the combined chart cotangent; do not emit
   per-descriptor VJP panels.
@@ -528,7 +587,7 @@ an expanded `panel_strength`. Mamba and FLA instead pass source strides and deri
 supported contiguous dimension exists.
 
 - [x] The native `[B,T,H,r]` layout has a contiguous `r` dimension and is
-  directly addressable by every C32 frame/radial tile.
+  directly addressable by every C16/C32/C64 frame/radial tile.
 - [x] Make radial and strict owners consume original strides and a structural
   tail mask; remove the panel HBM round trip and expanded metadata tensors.
 - [x] Keep a copy only when an actual unsupported input stride reaches the
@@ -644,8 +703,10 @@ production port rather than retained as another backend.
 
 ## Explicit Non-Reuse
 
-- [x] Do not reuse MESA-Net's conjugate-gradient loop, ridge parameter, SPD
-  solve semantics, `1e-5` denominator perturbations, or `q_star` ABI.
+- [x] Do not reuse MESA-Net's conjugate-gradient update equations, reductions,
+  ridge parameter, SPD solve semantics, `1e-5` denominator perturbations, or
+  `q_star` ABI. Its resident static-loop and inline-action schedule are the
+  explicitly selected reusable blocks.
 - [x] Do not replace the exact bounded LDU chart with MESA's Gram/ridge system.
 - [x] Do not call complete FLA GDN2, KDA, MESA, generalized-Delta, or DPLR
   operators from the SolveDelta production path.
@@ -667,8 +728,16 @@ production port rather than retained as another backend.
   cancellation, identity, and repeatability fixtures.
 - [ ] Pass the mandatory internal Triton and MathDx budgets from
   `docs/VALIDATION_PLAN.md`.
-- [ ] Report warmed forward, backward-alone, F+B, peak memory, registers,
-  shared memory, spills, and occupancy at the target profile.
+- [x] Report warmed forward, backward-alone, F+B, peak memory, registers,
+  shared memory, spills, and occupancy at the target profile. The symmetric
+  streamed reverse measures `1.634/4.760/6.539 ms` median and
+  `1.845/5.150/6.872 ms` p95 forward/backward/F+B. Incremental allocator peaks
+  are `95.2 MiB` forward and `241.8 MiB` F+B. The resident upper/lower actions
+  use `64` registers and `42,624` bytes shared per CTA with two-CTA launch
+  bounds; ptxas reports upper `12/16`-byte store/load spills and lower
+  `4/4`-byte spills. The strict boundary kernels use `56` registers and no
+  shared memory or spills. Streamed Triton register allocation is recorded by
+  the generated kernel metadata rather than inferred from source.
 - [x] Test at least one non-128 reference width at the Python/oracle layer even
   when the native block remains specialized to 128.
 - [x] Remove the replaced scalar loop, obsolete cache fields, old tests, and

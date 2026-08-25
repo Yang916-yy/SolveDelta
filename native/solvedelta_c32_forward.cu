@@ -278,13 +278,6 @@ struct Fp32DualActionView {
     float* data;
     ActionPanelLayout layout;
 
-    __device__ __forceinline__ float load(
-        int target,
-        int route,
-        int coordinate) const {
-        return data[layout.dual(target, route, coordinate)];
-    }
-
     __device__ __forceinline__ void store(
         int target,
         int route,
@@ -559,29 +552,66 @@ __global__ __launch_bounds__(kThreads, 2) void mixed_frame_kernel(
     }
 }
 
+template <bool Upper>
+__device__ __forceinline__ float strict_left(
+    int route,
+    int target,
+    int coordinate,
+    const ActionPanelLayout& layout,
+    const at::Half* key,
+    const at::BFloat16* erase,
+    const at::Half* query,
+    const at::Half* lower_dual_scaled,
+    const float* action_primal) {
+    const int vector = layout.vector(target, coordinate);
+    if constexpr (Upper) {
+        return route == 0
+            ? -action_primal[vector]
+            : static_cast<float>(lower_dual_scaled[
+                layout.dual(target, route - 1, coordinate)]);
+    }
+    if (route == 0) return -action_primal[vector];
+    if (route == 1) {
+        return static_cast<float>(erase[vector])
+            * static_cast<float>(key[vector]);
+    }
+    return static_cast<float>(query[vector]);
+}
+
+template <bool Upper>
+__device__ __forceinline__ float strict_right(
+    int route,
+    int target,
+    int coordinate,
+    const ActionPanelLayout& layout,
+    const at::Half* d,
+    const at::Half* lower_primal,
+    const float* original_dual,
+    const float* action_dual) {
+    if constexpr (Upper) {
+        return route == 0
+            ? static_cast<float>(d[layout.vector(target, coordinate)])
+            : original_dual[layout.dual(target, route - 1, coordinate)];
+    }
+    return route == 0
+        ? static_cast<float>(lower_primal[
+            layout.vector(target, coordinate)])
+        : action_dual[layout.dual(target, route - 1, coordinate)];
+}
+
 __global__ __launch_bounds__(kThreads, 2)
-void mixed_frame_adjoint_kernel(
+void upper_frame_adjoint_kernel(
     const at::Half* __restrict__ u,
     const at::BFloat16* __restrict__ h,
-    const at::Half* __restrict__ key,
-    const at::BFloat16* __restrict__ erase,
-    const at::Half* __restrict__ query,
     const float* __restrict__ boundary_j,
     const float* __restrict__ boundary_d,
-    const at::Half* __restrict__ lower_primal,
-    const at::Half* __restrict__ lower_dual_scaled,
-    const at::Half* __restrict__ d,
     const float* __restrict__ inverse_mass,
     const float* __restrict__ coefficient,
-    const float* __restrict__ diagonal,
     const float* __restrict__ alpha0,
-    float* __restrict__ grad_key,
-    at::BFloat16* __restrict__ grad_erase,
-    float* __restrict__ grad_query,
+    const float* __restrict__ frame_primal,
+    const float* __restrict__ frame_dual,
     float* __restrict__ upper_primal,
     float* __restrict__ upper_dual_output,
-    float* __restrict__ grad_log_diagonal,
-    at::BFloat16* __restrict__ descriptor_bundle,
     int length,
     int heads,
     int chunks,
@@ -605,24 +635,6 @@ void mixed_frame_adjoint_kernel(
         length,
         heads};
 
-    for (int index = threadIdx.x;
-         index < valid_count * kRank;
-         index += blockDim.x) {
-        const int target = index / kRank;
-        const int coordinate = index % kRank;
-        const int vector = layout.vector(target, coordinate);
-        const int descriptor_base =
-            (((3 * panels + panel) * kChunk + target) * 3) * kRank
-            + coordinate;
-        descriptor_bundle[descriptor_base] = at::BFloat16(
-            static_cast<float>(d[vector]));
-        descriptor_bundle[descriptor_base + kRank] = at::BFloat16(
-            upper_dual_output[layout.dual(target, 0, coordinate)]);
-        descriptor_bundle[descriptor_base + 2 * kRank] = at::BFloat16(
-            upper_dual_output[layout.dual(target, 1, coordinate)]);
-    }
-    __syncthreads();
-
     const ActionGeometryView geometry{
         u,
         h,
@@ -633,10 +645,10 @@ void mixed_frame_adjoint_kernel(
         alpha0,
         layout,
         panel};
-    const GradPrimalActionInput grad_primal_input{upper_primal, layout};
+    const GradPrimalActionInput grad_primal_input{frame_primal, layout};
     const Fp32VectorActionView upper_primal_view{
         upper_primal, layout};
-    const GradDualActionInput grad_dual_input{upper_dual_output, layout};
+    const GradDualActionInput grad_dual_input{frame_dual, layout};
     const Fp32DualActionView upper_dual_view{
         upper_dual_output, layout};
     solvedelta::paired_action::run_paired_action<true, true>(
@@ -646,29 +658,31 @@ void mixed_frame_adjoint_kernel(
         upper_primal_view,
         grad_dual_input,
         upper_dual_view);
+}
 
-    for (int index = threadIdx.x;
-         index < valid_count * kRank;
-         index += blockDim.x) {
-        const int target = index / kRank;
-        const int coordinate = index % kRank;
-        const int vector = layout.vector(target, coordinate);
-        const int descriptor_base =
-            (((2 * panels + panel) * kChunk + target) * 3) * kRank
-            + coordinate;
-        descriptor_bundle[descriptor_base] = at::BFloat16(
-            -upper_primal[vector]);
-        descriptor_bundle[descriptor_base + kRank] = at::BFloat16(
-            static_cast<float>(lower_dual_scaled[
-                layout.dual(target, 0, coordinate)]));
-        descriptor_bundle[descriptor_base + 2 * kRank] = at::BFloat16(
-            static_cast<float>(lower_dual_scaled[
-                layout.dual(target, 1, coordinate)]));
-    }
-    __syncthreads();
+__global__ void diagonal_frame_adjoint_kernel(
+    const at::Half* __restrict__ lower_primal,
+    const at::Half* __restrict__ lower_dual_scaled,
+    const float* __restrict__ diagonal,
+    float* __restrict__ upper_primal,
+    float* __restrict__ upper_dual,
+    float* __restrict__ grad_log_diagonal,
+    int length,
+    int heads,
+    int chunks,
+    int panels) {
+    const int panel = blockIdx.x;
+    if (panel >= panels) return;
+    int batch_index;
+    int head;
+    int chunk;
+    decode_panel(panel, heads, chunks, batch_index, head, chunk);
+    const int token_start = chunk * kChunk;
+    const int valid_count = min(kChunk, length - token_start);
+    const ActionPanelLayout layout{
+        batch_index, head, token_start, valid_count, length, heads};
 
-    for (int index = threadIdx.x;
-         index < valid_count * kRank;
+    for (int index = threadIdx.x; index < valid_count * kRank;
          index += blockDim.x) {
         const int target = index / kRank;
         const int coordinate = index % kRank;
@@ -678,48 +692,57 @@ void mixed_frame_adjoint_kernel(
         const float scale = diagonal[
             (panel * kChunk + target) * kRank + coordinate];
         const float primal = upper_primal[vector];
-        const float direct0 = upper_dual_output[dual0];
-        const float direct1 = upper_dual_output[dual1];
+        const float direct0 = upper_dual[dual0];
+        const float direct1 = upper_dual[dual1];
         upper_primal[vector] = primal / scale;
-        upper_dual_output[dual0] = direct0 * scale;
-        upper_dual_output[dual1] = direct1 * scale;
+        upper_dual[dual0] = direct0 * scale;
+        upper_dual[dual1] = direct1 * scale;
         grad_log_diagonal[vector] =
             -primal * (static_cast<float>(lower_primal[vector]) / scale)
             + static_cast<float>(lower_dual_scaled[dual0]) * direct0
             + static_cast<float>(lower_dual_scaled[dual1]) * direct1;
-        const int descriptor_base =
-            (((1 * panels + panel) * kChunk + target) * 3) * kRank
-            + coordinate;
-        descriptor_bundle[descriptor_base] = at::BFloat16(
-            static_cast<float>(lower_primal[vector]));
-        descriptor_bundle[descriptor_base + kRank] = at::BFloat16(
-            upper_dual_output[dual0]);
-        descriptor_bundle[descriptor_base + 2 * kRank] = at::BFloat16(
-            upper_dual_output[dual1]);
     }
-    __syncthreads();
+}
+
+__global__ __launch_bounds__(kThreads, 2)
+void lower_frame_adjoint_kernel(
+    const at::Half* __restrict__ u,
+    const at::BFloat16* __restrict__ h,
+    const at::Half* __restrict__ key,
+    const at::BFloat16* __restrict__ erase,
+    const float* __restrict__ boundary_j,
+    const float* __restrict__ boundary_d,
+    const float* __restrict__ inverse_mass,
+    const float* __restrict__ coefficient,
+    const float* __restrict__ alpha0,
+    float* __restrict__ upper_primal,
+    const float* __restrict__ upper_dual,
+    float* __restrict__ grad_key,
+    at::BFloat16* __restrict__ grad_erase,
+    float* __restrict__ grad_query,
+    int length,
+    int heads,
+    int chunks,
+    int panels) {
+    extern __shared__ __align__(16) unsigned char storage[];
+    auto& shared = *reinterpret_cast<
+        solvedelta::paired_action::PairedActionShared*>(storage);
+    const int panel = blockIdx.x;
+    if (panel >= panels) return;
+    int batch_index;
+    int head;
+    int chunk;
+    decode_panel(panel, heads, chunks, batch_index, head, chunk);
+    const int token_start = chunk * kChunk;
+    const int valid_count = min(kChunk, length - token_start);
+    const ActionPanelLayout layout{
+        batch_index, head, token_start, valid_count, length, heads};
+    const ActionGeometryView geometry{
+        u, h, boundary_j, boundary_d, inverse_mass, coefficient,
+        alpha0, layout, panel};
 
     const Fp32VectorActionView lower_primal_input{upper_primal, layout};
-    const Fp32DualActionView lower_dual_view{
-        upper_dual_output, layout};
-
-    for (int index = threadIdx.x;
-         index < valid_count * kRank;
-         index += blockDim.x) {
-        const int target = index / kRank;
-        const int coordinate = index % kRank;
-        const int vector = layout.vector(target, coordinate);
-        const int descriptor_base =
-            ((panel * kChunk + target) * 3) * kRank + coordinate;
-        descriptor_bundle[descriptor_base] = at::BFloat16(
-            -upper_primal[vector]);
-        descriptor_bundle[descriptor_base + kRank] = at::BFloat16(
-            static_cast<float>(erase[vector])
-            * static_cast<float>(key[vector]));
-        descriptor_bundle[descriptor_base + 2 * kRank] = at::BFloat16(
-            static_cast<float>(query[vector]));
-    }
-    __syncthreads();
+    const GradDualActionInput lower_dual_view{upper_dual, layout};
 
     const FinalGradientDualOutput final_gradient{
         key,
@@ -736,6 +759,69 @@ void mixed_frame_adjoint_kernel(
         lower_primal_input,
         lower_dual_view,
         final_gradient);
+}
+
+template <bool Upper>
+__global__ __launch_bounds__(256)
+void strict_boundary_matrix_stream_kernel(
+    const at::Half* __restrict__ key,
+    const at::BFloat16* __restrict__ erase,
+    const at::Half* __restrict__ query,
+    const at::Half* __restrict__ d,
+    const at::Half* __restrict__ lower_primal,
+    const at::Half* __restrict__ lower_dual_scaled,
+    const float* __restrict__ original_dual,
+    const float* __restrict__ action_primal,
+    const float* __restrict__ action_dual,
+    const float* __restrict__ theta,
+    const float* __restrict__ coefficient,
+    float* __restrict__ grad_boundary_j,
+    float* __restrict__ grad_boundary_d,
+    int length,
+    int heads,
+    int chunks,
+    int panels) {
+    const int panel = blockIdx.x;
+    const int tile_pair = blockIdx.y;
+    if (panel >= panels) return;
+    const int row_block = tile_pair / (kRank / kTile);
+    const int column_block = tile_pair % (kRank / kTile);
+    const int local = threadIdx.x;
+    const int row = row_block * kTile + local / kTile;
+    const int column = column_block * kTile + local % kTile;
+    if (!((Upper && row < column) || (!Upper && row > column))) return;
+    int batch_index;
+    int head;
+    int chunk;
+    decode_panel(panel, heads, chunks, batch_index, head, chunk);
+    const int token_start = chunk * kChunk;
+    const int valid_count = min(kChunk, length - token_start);
+    const ActionPanelLayout layout{
+        batch_index, head, token_start, valid_count, length, heads};
+    float result_j = 0.0f;
+    float result_d = 0.0f;
+    for (int target = 0; target < valid_count; ++target) {
+        const int scalar = panel * kChunk + target;
+        const int component = Upper ? 2 : 0;
+        const float theta_j = theta[scalar]
+            * coefficient[scalar * kComponents + component];
+        const float theta_d = theta[scalar]
+            * coefficient[scalar * kComponents + component + 1];
+#pragma unroll
+        for (int route = 0; route < 3; ++route) {
+            const float product = strict_left<Upper>(
+                route, target, row, layout,
+                key, erase, query, lower_dual_scaled, action_primal)
+                * strict_right<Upper>(
+                    route, target, column, layout,
+                    d, lower_primal, original_dual, action_dual);
+            result_j = fmaf(theta_j, product, result_j);
+            result_d = fmaf(theta_d, product, result_d);
+        }
+    }
+    const int output = (panel * kRank + row) * kRank + column;
+    atomicAdd(grad_boundary_j + output, result_j);
+    atomicAdd(grad_boundary_d + output, result_d);
 }
 
 void check_fp32_cuda_contiguous(
@@ -931,7 +1017,17 @@ C32PrepareForwardResult c32_solvedelta_prepare_forward_cuda(
 }
 
 
-C32FrameActionsBackwardResult c32_frame_actions_backward_cuda(
+namespace {
+
+struct FrameBackwardShape {
+    int batch;
+    int length;
+    int heads;
+    int chunks;
+    int panels;
+};
+
+FrameBackwardShape validate_frame_backward(
     const at::Tensor& u,
     const at::Tensor& h,
     const at::Tensor& key,
@@ -944,6 +1040,7 @@ C32FrameActionsBackwardResult c32_frame_actions_backward_cuda(
     const at::Tensor& d,
     const at::Tensor& inverse_mass,
     const at::Tensor& coefficient,
+    const at::Tensor& theta,
     const at::Tensor& diagonal,
     const at::Tensor& alpha0,
     const at::Tensor& frame_primal,
@@ -997,6 +1094,7 @@ C32FrameActionsBackwardResult c32_frame_actions_backward_cuda(
              {&boundary_d, "boundary_D"},
              {&inverse_mass, "inverse_mass"},
              {&coefficient, "radial_scale"},
+             {&theta, "theta"},
              {&diagonal, "diagonal"},
              {&alpha0, "alpha0"},
              {&frame_primal, "frame_primal"},
@@ -1053,6 +1151,9 @@ C32FrameActionsBackwardResult c32_frame_actions_backward_cuda(
                 == at::IntArrayRef({panels64, kChunk, kComponents}),
         "radial_scale must be [P,32,4]");
     TORCH_CHECK(
+        theta.sizes() == at::IntArrayRef({panels64, kChunk}),
+        "theta must be [P,32]");
+    TORCH_CHECK(
         diagonal.sizes()
                 == at::IntArrayRef({panels64, kChunk, kRank}),
         "diagonal must be [P,32,128]");
@@ -1069,7 +1170,6 @@ C32FrameActionsBackwardResult c32_frame_actions_backward_cuda(
             && boundary_j.numel() <= max_index,
         "resident action tensors exceed the int32 index space");
 
-    c10::cuda::CUDAGuard guard(u.device());
     cudaDeviceProp properties{};
     C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, u.get_device()));
     TORCH_CHECK(
@@ -1077,55 +1177,169 @@ C32FrameActionsBackwardResult c32_frame_actions_backward_cuda(
         "the resident action backward contains only the SM120 specialization; got SM",
         properties.major,
         properties.minor);
-    const int panels = static_cast<int>(panels64);
+    return {
+        static_cast<int>(batch),
+        static_cast<int>(length),
+        static_cast<int>(heads),
+        static_cast<int>(chunks),
+        static_cast<int>(panels64)};
+}
+
+}  // namespace
+
+C32FrameUpperBackwardResult c32_frame_upper_backward_cuda(
+    const at::Tensor& u,
+    const at::Tensor& h,
+    const at::Tensor& key,
+    const at::Tensor& erase,
+    const at::Tensor& query,
+    const at::Tensor& boundary_j,
+    const at::Tensor& boundary_d,
+    const at::Tensor& lower_primal,
+    const at::Tensor& lower_dual_scaled,
+    const at::Tensor& d,
+    const at::Tensor& inverse_mass,
+    const at::Tensor& coefficient,
+    const at::Tensor& theta,
+    const at::Tensor& diagonal,
+    const at::Tensor& alpha0,
+    const at::Tensor& frame_primal,
+    const at::Tensor& frame_dual) {
+    const auto shape = validate_frame_backward(
+        u, h, key, erase, query, boundary_j, boundary_d, lower_primal,
+        lower_dual_scaled, d, inverse_mass, coefficient, theta, diagonal,
+        alpha0, frame_primal, frame_dual);
+    c10::cuda::CUDAGuard guard(u.device());
     const auto fp32_options = u.options().dtype(at::kFloat);
-    auto grad_key = at::empty(key.sizes(), fp32_options);
-    auto grad_erase = at::empty_like(erase);
-    auto grad_query = at::empty(u.sizes(), fp32_options);
-    auto grad_log_diagonal = at::empty_like(frame_primal);
-    auto descriptor_bundle = at::empty(
-        {4, panels64, kChunk, 3, kRank},
-        u.options().dtype(at::kBFloat16));
+    auto upper_primal = at::empty_like(frame_primal);
+    auto upper_dual = at::empty_like(frame_dual);
+    auto grad_boundary_j = at::zeros_like(boundary_j);
+    auto grad_boundary_d = at::zeros_like(boundary_d);
     const auto stream = at::cuda::getCurrentCUDAStream();
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        mixed_frame_adjoint_kernel,
+        upper_frame_adjoint_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(sizeof(solvedelta::paired_action::PairedActionShared))));
-    mixed_frame_adjoint_kernel<<<
-        panels,
+    upper_frame_adjoint_kernel<<<
+        shape.panels,
         kThreads,
         sizeof(solvedelta::paired_action::PairedActionShared),
         stream>>>(
         u.data_ptr<at::Half>(),
         h.data_ptr<at::BFloat16>(),
-        key.data_ptr<at::Half>(),
-        erase.data_ptr<at::BFloat16>(),
-        query.data_ptr<at::Half>(),
         boundary_j.data_ptr<float>(),
         boundary_d.data_ptr<float>(),
-        lower_primal.data_ptr<at::Half>(),
-        lower_dual_scaled.data_ptr<at::Half>(),
-        d.data_ptr<at::Half>(),
         inverse_mass.data_ptr<float>(),
         coefficient.data_ptr<float>(),
-        diagonal.data_ptr<float>(),
         alpha0.data_ptr<float>(),
-        grad_key.data_ptr<float>(),
-        grad_erase.data_ptr<at::BFloat16>(),
-        grad_query.data_ptr<float>(),
         frame_primal.data_ptr<float>(),
         frame_dual.data_ptr<float>(),
-        grad_log_diagonal.data_ptr<float>(),
-        descriptor_bundle.data_ptr<at::BFloat16>(),
-        static_cast<int>(length),
-        static_cast<int>(heads),
-        static_cast<int>(chunks),
-        panels);
+        upper_primal.data_ptr<float>(),
+        upper_dual.data_ptr<float>(),
+        shape.length,
+        shape.heads,
+        shape.chunks,
+        shape.panels);
+
+    const dim3 matrix_grid(
+        shape.panels, (kRank / kTile) * (kRank / kTile));
+    strict_boundary_matrix_stream_kernel<true><<<
+        matrix_grid, 256, 0, stream>>>(
+        key.data_ptr<at::Half>(), erase.data_ptr<at::BFloat16>(),
+        query.data_ptr<at::Half>(), d.data_ptr<at::Half>(),
+        lower_primal.data_ptr<at::Half>(),
+        lower_dual_scaled.data_ptr<at::Half>(),
+        frame_dual.data_ptr<float>(), upper_primal.data_ptr<float>(),
+        upper_dual.data_ptr<float>(), theta.data_ptr<float>(),
+        coefficient.data_ptr<float>(), grad_boundary_j.data_ptr<float>(),
+        grad_boundary_d.data_ptr<float>(), shape.length,
+        shape.heads, shape.chunks, shape.panels);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {upper_primal, upper_dual, grad_boundary_j, grad_boundary_d};
+}
+
+C32FrameLowerBackwardResult c32_frame_lower_backward_cuda(
+    const at::Tensor& u,
+    const at::Tensor& h,
+    const at::Tensor& key,
+    const at::Tensor& erase,
+    const at::Tensor& query,
+    const at::Tensor& boundary_j,
+    const at::Tensor& boundary_d,
+    const at::Tensor& lower_primal,
+    const at::Tensor& lower_dual_scaled,
+    const at::Tensor& d,
+    const at::Tensor& inverse_mass,
+    const at::Tensor& coefficient,
+    const at::Tensor& theta,
+    const at::Tensor& diagonal,
+    const at::Tensor& alpha0,
+    const at::Tensor& upper_primal,
+    const at::Tensor& upper_dual,
+    const at::Tensor& grad_boundary_j,
+    const at::Tensor& grad_boundary_d) {
+    const auto shape = validate_frame_backward(
+        u, h, key, erase, query, boundary_j, boundary_d, lower_primal,
+        lower_dual_scaled, d, inverse_mass, coefficient, theta, diagonal,
+        alpha0, upper_primal, upper_dual);
+    check_fp32_cuda_contiguous(grad_boundary_j, u, "grad_boundary_J");
+    check_fp32_cuda_contiguous(grad_boundary_d, u, "grad_boundary_D");
+    TORCH_CHECK(
+        grad_boundary_j.sizes() == boundary_j.sizes()
+            && grad_boundary_d.sizes() == boundary_d.sizes(),
+        "boundary gradient shape mismatch");
+    c10::cuda::CUDAGuard guard(u.device());
+    const auto fp32_options = u.options().dtype(at::kFloat);
+    auto grad_key = at::empty(key.sizes(), fp32_options);
+    auto grad_erase = at::empty_like(erase);
+    auto grad_query = at::empty(u.sizes(), fp32_options);
+    auto grad_log_diagonal = at::empty_like(upper_primal);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        lower_frame_adjoint_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(sizeof(solvedelta::paired_action::PairedActionShared))));
+    diagonal_frame_adjoint_kernel<<<shape.panels, 256, 0, stream>>>(
+        lower_primal.data_ptr<at::Half>(),
+        lower_dual_scaled.data_ptr<at::Half>(), diagonal.data_ptr<float>(),
+        upper_primal.data_ptr<float>(), upper_dual.data_ptr<float>(),
+        grad_log_diagonal.data_ptr<float>(), shape.length,
+        shape.heads, shape.chunks, shape.panels);
+    lower_frame_adjoint_kernel<<<
+        shape.panels,
+        kThreads,
+        sizeof(solvedelta::paired_action::PairedActionShared),
+        stream>>>(
+        u.data_ptr<at::Half>(), h.data_ptr<at::BFloat16>(),
+        key.data_ptr<at::Half>(), erase.data_ptr<at::BFloat16>(),
+        boundary_j.data_ptr<float>(), boundary_d.data_ptr<float>(),
+        inverse_mass.data_ptr<float>(), coefficient.data_ptr<float>(),
+        alpha0.data_ptr<float>(), upper_primal.data_ptr<float>(),
+        upper_dual.data_ptr<float>(), grad_key.data_ptr<float>(),
+        grad_erase.data_ptr<at::BFloat16>(), grad_query.data_ptr<float>(),
+        shape.length, shape.heads, shape.chunks, shape.panels);
+
+    const dim3 matrix_grid(
+        shape.panels, (kRank / kTile) * (kRank / kTile));
+    strict_boundary_matrix_stream_kernel<false><<<
+        matrix_grid, 256, 0, stream>>>(
+        key.data_ptr<at::Half>(), erase.data_ptr<at::BFloat16>(),
+        query.data_ptr<at::Half>(), d.data_ptr<at::Half>(),
+        lower_primal.data_ptr<at::Half>(),
+        lower_dual_scaled.data_ptr<at::Half>(),
+        upper_dual.data_ptr<float>(), upper_primal.data_ptr<float>(),
+        upper_dual.data_ptr<float>(), theta.data_ptr<float>(),
+        coefficient.data_ptr<float>(), grad_boundary_j.data_ptr<float>(),
+        grad_boundary_d.data_ptr<float>(), shape.length,
+        shape.heads, shape.chunks, shape.panels);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {
         grad_key,
         grad_erase,
         grad_query,
         grad_log_diagonal,
-        descriptor_bundle};
+        grad_boundary_j,
+        grad_boundary_d,
+        upper_dual,
+        upper_primal};
 }

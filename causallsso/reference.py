@@ -234,6 +234,17 @@ def solvedelta_reference(
     state = zero if initial_state is None else initial_state
     if state.m.shape != zero.m.shape or state.J.shape != zero.J.shape or state.D.shape != zero.D.shape or state.S.shape != zero.S.shape:
         raise ValueError("initial_state shapes do not match inputs")
+    if initial_state is not None:
+        if not torch.equal(state.J, state.J.transpose(-1, -2)):
+            raise ValueError("initial_state.J must be exactly symmetric")
+        # Full storage represents a symmetric state manifold. This identity
+        # map freezes its full-tensor cotangent as (G + G^T) / 2.
+        state = SolveDeltaState(
+            state.m,
+            0.5 * (state.J + state.J.transpose(-1, -2)),
+            state.D,
+            state.S,
+        )
 
     u = F.normalize(u, p=2, dim=-1)
     q = F.normalize(q, p=2, dim=-1)

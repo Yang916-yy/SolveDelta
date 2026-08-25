@@ -300,8 +300,9 @@ to first order, so at the identity
 =\Delta X^{(H)}+\Delta X^{(R)}.
 \]
 
-As a map from unconstrained ambient `(X^(H),X^(R))` coordinates, the chart
-consequently has full `r^2` local differential rank at `X^(H)=X^(R)=0` and
+In the production state domain `X^(H)` is symmetric while `X^(R)` is
+unconstrained. The `X^(R)` coordinate alone therefore gives the chart full
+`r^2` local differential rank at `X^(H)=X^(R)=0`, so the joint chart
 contains an open neighborhood of the identity rather than a symmetric,
 orthogonal-only, diagonal, or low-rank submanifold. This derivative is with
 respect to chart inputs, not with respect to `R` after the structural

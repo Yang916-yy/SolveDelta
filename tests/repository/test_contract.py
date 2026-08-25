@@ -29,6 +29,7 @@ def test_deleted_backend_abis_do_not_return() -> None:
         "causallsso/ops/triton_frame.py",
         "causallsso/ops/triton_bounded_ldu.py",
         "causallsso/ops/resident_frame.py",
+        "causallsso/ops/strict_chart.py",
         "causallsso/ops/wy.py",
         "causallsso/ops/wy_stage.py",
         "native/solvedelta_c32_backward.cu",
@@ -48,20 +49,10 @@ def test_deleted_backend_abis_do_not_return() -> None:
     )
     assert all(symbol not in public_ops for symbol in forbidden_symbols)
 
-    native_sources = "\n".join(
-        (ROOT / path).read_text()
-        for path in (
-            "native/solvedelta_c32.h",
-            "native/solvedelta_c32_forward.cu",
-            "native/solvedelta_wy.cu",
-            "native/solvedelta_prepare.cu",
-        )
-    )
+    native_header = (ROOT / "native" / "solvedelta_c32.h").read_text()
     forbidden_native_abi = (
         "c32_frame_forward_cuda",
         "c32_frame_backward_cuda",
-        '"c32_frame_forward(',
-        '"c32_frame_backward(',
         "c32_frame_resident_forward",
         "c32_frame_resident_action_backward",
         "c32_frame_wy_stage_forward",
@@ -69,18 +60,34 @@ def test_deleted_backend_abis_do_not_return() -> None:
         "c32_frame_compact_pair",
         "c32_frame_compact_coefficients",
         "c32_frame_compact_leaf",
-        "wy_solve_backward_kernel",
-        "solution[kChunk]",
-        "value_backward_kernel",
+        "c32_solvedelta_prepare_backward",
     )
-    assert all(symbol not in native_sources for symbol in forbidden_native_abi)
-    assert re.search(r"\bgrad_(?:d|e|chi)\b", native_sources) is None
+    assert all(symbol not in native_header for symbol in forbidden_native_abi)
 
-    frame_source = (
-        ROOT / "native" / "solvedelta_c32_forward.cu"
-    ).read_text()
-    assert "at::BFloat16* __restrict__ descriptor_bundle" in frame_source
-    assert "descriptor_bundle.data_ptr<at::BFloat16>()" in frame_source
+    production_reverse = "\n".join(
+        (ROOT / path).read_text()
+        for path in (
+            "causallsso/ops/native_chunk.py",
+            "causallsso/ops/streamed_chart.py",
+            "native/solvedelta_c32_forward.cu",
+            "native/solvedelta_prepare.cu",
+        )
+    )
+    forbidden_reverse_glue = (
+        "descriptor_bundle",
+        "correlation_partial",
+        "projection_partial",
+        "strict_local_stream_kernel",
+        "strict_boundary_scalar_stream_kernel",
+        "upper_primal_saved",
+        "grad_d",
+        "grad_e",
+        "grad_chi",
+    )
+    assert all(
+        re.search(rf"\b{re.escape(name)}\b", production_reverse) is None
+        for name in forbidden_reverse_glue
+    )
 
 
 def test_single_native_training_path_is_present() -> None:
@@ -90,7 +97,7 @@ def test_single_native_training_path_is_present() -> None:
         "causallsso/ops/paired_wy.py",
         "causallsso/ops/chunk_state.py",
         "causallsso/ops/radial_compact.py",
-        "causallsso/ops/strict_chart.py",
+        "causallsso/ops/streamed_chart.py",
         "causallsso/ops/triton_geometry.py",
         "native/solvedelta_c32_forward.cu",
         "native/solvedelta_wy.cu",
@@ -103,16 +110,6 @@ def test_single_native_training_path_is_present() -> None:
     assert "_RANK = 128" in chunk_wy
     assert "_EDITS = 1" in chunk_wy
     assert "native_chunk_solvedelta" in chunk_wy
-    for forbidden in (
-        "native_geometry_wy_stage",
-        "wy_stage_statistics",
-        "wy_associative_staged",
-        "qg",
-        "kg",
-        "ag",
-        "A_ad",
-    ):
-        assert forbidden not in chunk_wy
     module = ast.parse(chunk_wy)
     entrypoint = next(
         node
@@ -125,28 +122,6 @@ def test_single_native_training_path_is_present() -> None:
         for argument in (*entrypoint.args.args, *entrypoint.args.kwonlyargs)
     }
     assert {"backend", "wy_dtype", "chunk_size"}.isdisjoint(parameters)
-
-    native_chunk = (ROOT / "causallsso/ops/native_chunk.py").read_text()
-    for symbol in (
-        "c32_solvedelta_prepare_forward",
-        "c32_solvedelta_prepare_backward",
-    ):
-        assert symbol in native_chunk
-    for symbol in (
-        "c32_frame_actions_forward",
-        "c32_frame_actions_backward",
-        "c32_wy_statistics_forward",
-        "c32_wy_solve_forward",
-        "c32_wy_solve_backward",
-        "c32_wy_pair_backward",
-        "c32_frame_wy_stage_forward",
-        "c32_frame_wy_stage_action_backward",
-        "c32_frame_compact_pair",
-        "c32_frame_compact_coefficients",
-        "c32_frame_compact_leaf",
-    ):
-        assert symbol not in native_chunk
-
 
 def test_mathdx_is_an_optional_oracle_only() -> None:
     cmake = (ROOT / "native" / "CMakeLists.txt").read_text()
@@ -168,13 +143,10 @@ def test_bf16_observable_numerical_contract_is_current() -> None:
         assert "private `q2`" in normalized
         assert "expm1" in normalized
     assert "exact zero must emit an exact zero radial component" not in validation
-
-    paired_wy = (ROOT / "causallsso" / "ops" / "paired_wy.py").read_text()
-    paired_wy_test = (ROOT / "tests" / "core" / "test_paired_wy.py").read_text()
-    assert "_twofold_bf16_dot" not in paired_wy
-    assert "_paired_wy_forward_fp32_diagnostic" not in paired_wy
-    assert "_max_eta" not in paired_wy_test
-    assert "no private inverse/residual gate" in validation
+    assert "**Hard semantic gates.**" in validation
+    assert "**Production-observable numerical gates.**" in validation
+    assert "**Private diagnostics.**" in validation
+    assert "None must pass a historical per-tile budget" in parallelism
 
 
 def test_bounded_private_fp16_contract_is_current() -> None:

@@ -241,10 +241,19 @@ def _matrix_adjoint_scan_kernel(
     matrix_size = rank * rank
     offsets = tile * tile_size + tl.arange(0, tile_size)
     mask = offsets < matrix_size
+    rows = offsets // rank
+    columns = offsets % rank
+    transpose_offsets = columns * rank + rows
     state_base = head_batch * matrix_size
-    carry_J = tl.load(
+    carry_J_direct = tl.load(
         grad_final_J + state_base + offsets, mask=mask, other=0.0
     ).to(tl.float32)
+    carry_J_transpose = tl.load(
+        grad_final_J + state_base + transpose_offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    carry_J = 0.5 * (carry_J_direct + carry_J_transpose)
     carry_D = tl.load(
         grad_final_D + state_base + offsets, mask=mask, other=0.0
     ).to(tl.float32)
@@ -266,9 +275,15 @@ def _matrix_adjoint_scan_kernel(
             tl.sum(carry_J * state_J + carry_D * state_D, axis=0),
         )
         decay = tl.load(chunk_lambda + panel).to(tl.float32)
-        local_J = tl.load(
+        local_J_direct = tl.load(
             grad_boundary_J + panel_base + offsets, mask=mask, other=0.0
         ).to(tl.float32)
+        local_J_transpose = tl.load(
+            grad_boundary_J + panel_base + transpose_offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        local_J = 0.5 * (local_J_direct + local_J_transpose)
         local_D = tl.load(
             grad_boundary_D + panel_base + offsets, mask=mask, other=0.0
         ).to(tl.float32)
@@ -707,6 +722,8 @@ def _triton_geometry_chunk_scan_forward(
             or initial_D.shape != initial_J.shape
         ):
             raise ValueError("initial geometry state shapes do not match inputs")
+        if not torch.equal(initial_J, initial_J.transpose(-1, -2)):
+            raise ValueError("initial_state.J must be exactly symmetric")
 
     boundary_m = torch.empty(batch, heads, chunks, device=u.device, dtype=state_dtype)
     final_m = torch.empty(batch, heads, device=u.device, dtype=state_dtype)

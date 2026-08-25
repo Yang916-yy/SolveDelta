@@ -98,26 +98,28 @@ The intended training path has one direction:
 \text{FLA-derived C32 WY blocks and project-owned state scan}.
 \]
 
-Its frozen rewrite target uses BF16 public/raw operands, FP32-produced private
-FP16 panels where the chart supplies an analytic range certificate, and FP32
+The native precision contract uses BF16 public/raw operands, FP32-produced
+private FP16 panels where the chart supplies an analytic range certificate, and FP32
 Tensor Core accumulation and continuation state. The FP64 oracle is evaluated
-after public runtime operands have been rounded once to BF16; a same-packed
-internal oracle separately consumes the exact declared FP16 panel bits.
+after public runtime operands have been rounded once to BF16. A same-packed
+internal oracle may consume exact FP16 panel bits to diagnose one contraction;
+it does not define the production packing or reduction schedule.
 
 In the selected rewrite, Triton normalization loads raw BF16 geometry, query,
 and key activations, computes in FP32, and writes private FP16 `u/q/k` panels;
 the affine scan consumes `u` while keeping chunk boundaries and final
 `(m,J,D)` states in FP32. Bounded frame producers likewise write erase-source,
 strict-coordinate, and certified frame-action panels directly from FP32 to
-FP16. Paired actions and their transpose accumulate
-in FP32 from those exact bits. Radial, strict-diagonal, and sensitive scalar
-reductions remain FP32, as do all state and scalar cotangents. Nonstructural
-deep cancellation is accepted at the BF16-observable chart action and VJP,
-not by requiring a private expanded norm to be bitwise exact. Structural
-identity remains exact. The current CUDA checkpoint still stores these private
-panels as BF16; the direct FP32-to-FP16 producer boundary, radial replay
-removal, and remaining pair-to-frame fusion are rewrite work, not completed
-claims.
+FP16. Paired actions and their transpose accumulate in FP32 and may use
+different algebraically equivalent private layouts. Radial, strict-diagonal,
+and sensitive scalar reductions remain FP32, as do all state and scalar
+cotangents. Nonstructural deep cancellation is accepted at the composed output,
+state, and VJP, not by requiring a private expanded norm or chart coordinate to
+be bitwise exact. Structural
+identity remains exact. Analytically bounded private action panels are written
+directly to FP16 by their FP32 producers and consumed with FP32 accumulation;
+public BF16 values are never cast to FP16 as pseudo-promotion. Remaining
+pair-to-frame fusion is rewrite work, not a completed claim.
 
 The C32 WY owner specializes FLA 0.5.2's 16+16 unit-lower inverse, wide-RHS
 application, and matrix reverse to SolveDelta's native panels. It keeps the
@@ -133,16 +135,17 @@ compatibility paths.
 On the local SM120 target profile
 `B=1,T=1024,H=8,r=d_v=128,K=1,C=32`, warmed medians are:
 
-| Complete-operator measurement | Scalar C32 at `6d4e53f` | Initial FLA C32 block | Current reuse pass |
+| Complete-operator measurement | Scalar C32 at `6d4e53f` | Initial FLA C32 block | Current symmetric streamed reverse |
 |---|---:|---:|---:|
-| forward | `1.639--1.643 ms` | `1.608--1.620 ms` | about `1.35 ms` |
-| forward + backward | `6.885--7.122 ms` | `6.443--6.497 ms` | about `5.80 ms` |
+| forward | `1.639--1.643 ms` | `1.608--1.620 ms` | about `1.634 ms` |
+| forward + backward | `6.885--7.122 ms` | `6.443--6.497 ms` | about `6.485 ms` |
 | isolated paired WY forward/reverse | scalar reverse about `0.272 ms` | `0.023 / 0.040 ms` | unchanged |
 
 The initial FLA C32 replacement improved complete forward-plus-backward by
 about `5.6--9.5%`. Original-stride frame addressing, `tl.dot` output, paired
-geometry tiles, and fused normalization then reduced the current core further.
-Current backward is about `4.45 ms` by forward subtraction; the remaining
+geometry tiles, fused normalization, symmetric-state ownership, and streamed
+strict transpose then changed the current core. Current backward is about
+`4.851 ms` by forward subtraction; the remaining
 frame/radial/strict/state/scan aggregate,
 not the roughly `0.040 ms` paired-WY reverse, is now the primary optimization
 target. The separately matched GDN2 operator remains much faster at about

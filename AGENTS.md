@@ -40,15 +40,17 @@ the decision it informed.
   is not the production execution dtype.
 - A private panel may be FP16 only when its FP32 producer has a static analytic
   magnitude bound safely inside the FP16 finite range, writes the FP16 panel
-  directly, and every consumer accumulates in FP32. Forward and reverse use
-  the same frozen panel schedule. Casting an already-rounded BF16 tensor to
-  FP16 recovers no information, may lose exponent range, and is forbidden as
-  pseudo-promotion. There is no runtime dtype selection, magnitude threshold,
-  or precision fallback.
-- Numerical acceptance is defined at BF16-observable chart actions and VJPs.
-  Structural identity interventions remain bitwise exact, but a private
-  expanded radial quadratic is not required to reproduce nonstructural
-  cancellation below BF16 action resolution.
+  directly, and every consumer accumulates in FP32. Forward and reverse may use
+  different algebraically equivalent private layouts and reduction schedules;
+  neither schedule is part of the operator contract. Casting an already-rounded
+  BF16 tensor to FP16 recovers no information, may lose exponent range, and is
+  forbidden as pseudo-promotion. There is no runtime dtype selection,
+  magnitude threshold, or precision fallback.
+- Production numerical acceptance is defined at BF16 outputs, FP32
+  continuation states, and composed VJPs. Structural identity interventions
+  remain bitwise exact, but private chart coordinates and expanded radial
+  quadratics are not required to reproduce nonstructural cancellation below
+  BF16 observable resolution.
 - Stable means finite, correct, and trainable throughout the declared dtype,
   rank, sequence-length, gate, and optimizer envelope.
 - Report residual limitations plainly. Do not hide them behind clipping,
@@ -67,6 +69,10 @@ the decision it informed.
 - Native continuation states `(m,J,D,S)` are FP32 and are never rounded to BF16
   at chunk boundaries. Such rounding would make recurrent splits change the
   numerical recurrence rather than merely its implementation.
+- `J` is a symmetric continuation state. The production API accepts only an
+  exactly symmetric `J0`, retains full FP32 matrix storage for the first native
+  implementation, and represents a full-tensor cotangent by
+  `(bar_J + bar_J^T) / 2`. `D` remains an unconstrained dense state.
 - The current token updates geometry once, constructs one shared
   transpose-dual solve adapter, performs `num_edits = K` ordered associative
   micro-edits, and is read after edit `K`. `K` is a positive, static model
@@ -125,27 +131,42 @@ the decision it informed.
   evidence, not an acceptance gate for the causal system chart.
 - The bounded LDU chart must retain its exact identity point, invertible primal
   and inverse-transpose dual actions, exact pairing, certified primal/dual and
-  similarity bounds, and full `r^2` local differential rank with respect to
-  unconstrained ambient `(X^(H),X^(R))` chart coordinates. Do not test this as
+  similarity bounds, and full `r^2` local differential rank supplied by the
+  unconstrained ambient `X^(R)` chart coordinate while `X^(H)` is symmetric.
+  Do not test this as
   `dM/dR` under the structural `gamma_g=0` reduction, and do not conflate the
   chart property with feasible-prefix reachability: `rank(D_t), rank(R_t) <= t`,
   and arbitrary local `R` directions at nonzero geometry strength require a
   remembered geometry span of rank `r`.
-- A chunkwise implementation must match the SolveDelta token oracle in outputs,
-  every returned/chunk-boundary state, invariants, and gradients under the
-  metric and per-dtype ceilings frozen in `docs/VALIDATION_PLAN.md`. Internal
-  Triton scan and MathDx solve budgets are mandatory even when the composed
-  layer passes its looser end-to-end ceiling. Do not add warning-only failures,
-  CI relaxations, architecture-specific tolerances, or sequence-length-scaled
-  allowances.
+- Numerical acceptance has three tiers. Hard semantic gates cover the FP64
+  token recurrence, causality and sequence semantics, FP32 continuation states,
+  structural identities and reductions, and the chart's mathematical
+  invariants. Production-observable gates cover BF16 outputs, every returned
+  or chunk-boundary state, and composed VJPs under the fixed ceilings in
+  `docs/VALIDATION_PLAN.md`. Private diagnostics cover intermediate reduction
+  order, packed-panel comparisons, strict-coordinate cotangents, repeatability,
+  and source-level implementation shape. A private diagnostic may localize a
+  regression or impose a broad corruption guard, but it must not reject an
+  implementation that passes the hard and production-observable gates merely
+  because it uses a different arithmetic schedule.
+- The Triton geometry scan's FP32 `(m,J,D)` boundaries are production-observable
+  continuation state and retain their dedicated state gates. The standalone
+  MathDx path retains its independent exact-solve budgets because it explicitly
+  claims FP32 exact-oracle behavior. Other strict/radial/WY intermediates do not
+  acquire production status merely because they are convenient checkpoints.
+  Do not add warning-only failures, architecture-specific public tolerances, or
+  sequence-length-scaled public allowances.
 - Runtime-oracle comparisons quantize public/raw activation operands once to
   BF16, promote those exact values to FP64, and compare against that oracle.
   A declared FP16 private panel is instead produced by the matching FP32
-  operation and rounded directly to FP16 on both native and same-packed oracle
-  paths. Tensor Core contractions use the declared BF16 or FP16
-  multiplicands and FP32 accumulators; reduced-precision accumulation is
-  outside the contract. Primal and transpose-dual actions must consume the
-  same packed factor bits.
+  operation and rounded directly to FP16. A same-packed oracle may use those
+  bits to diagnose one contraction, but it is not the operator oracle and does
+  not prescribe the production reduction tree. Tensor Core contractions use
+  declared BF16 or analytically bounded FP16 multiplicands and FP32
+  accumulators; reduced-precision accumulation is outside the contract. Primal
+  and transpose-dual implementations must realize the same mathematical factor
+  actions and pass pairing and composed-VJP gates; they need not share a private
+  packing or instruction schedule.
 - Keep structural zero distinct from algebraic cancellation. Explicit identity
   geometry, zero strength, invalid padding, and disabled components must remain
   exact. A nonstructural zero produced by cancellation is accepted through the
@@ -189,9 +210,13 @@ the decision it informed.
 7. benchmark the complete BF16/FP16/FP32 layer at the resolved `r = d_k`, including
    the first native `r = 128` target profile and at least one non-128 reference
    width;
-8. only then integrate the selected Triton--CUDA--FLA path: Triton owns prefix
+8. integrate the selected Triton--CUDA--FLA path: Triton owns prefix
    boundaries, the chunk-owned CUDA operator owns bounded frame actions, FLA
    owns the mature scan/WY exterior, and MathDx remains the exact triangular
    oracle and decode candidate without changing the chart.
 
-No optimized kernel should precede these gates.
+Optimized candidates may be written and benchmarked while later envelope tests
+are still being added. They may replace the current path only after the hard
+semantic and production-observable gates relevant to their supported surface
+pass. Private diagnostics guide that iteration; they do not freeze an older
+kernel's arithmetic structure.

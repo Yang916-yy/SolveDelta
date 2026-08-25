@@ -19,7 +19,7 @@ from causallsso.ops.radial_compact import (
     _radial_compact_forward_bthr_trusted,
     _radial_compact_reverse_accumulate_trusted,
 )
-from causallsso.ops.strict_chart import _strict_chart_direct_transpose_trusted
+from causallsso.ops.streamed_chart import streamed_chart_stage_reverse
 from causallsso.ops.triton_geometry import (
     _triton_geometry_chunk_scan_backward,
     _triton_geometry_chunk_scan_forward,
@@ -78,7 +78,9 @@ def _ops_registered() -> bool:
         hasattr(torch.ops.causallsso, name)
         for name in (
             "c32_solvedelta_prepare_forward",
-            "c32_solvedelta_prepare_backward",
+            "c32_wy_pair_backward_stage",
+            "c32_frame_upper_backward",
+            "c32_frame_lower_backward",
         )
     )
 
@@ -115,7 +117,7 @@ def _cotangent(
     return gradient.to(dtype=dtype).contiguous()
 
 
-def _finish_frame_backward(
+def _complete_radial_backward(
     u: torch.Tensor,
     h: torch.Tensor,
     geometry_log_decay: torch.Tensor,
@@ -131,30 +133,20 @@ def _finish_frame_backward(
         grad_erase,
         grad_query,
         grad_log_diagonal,
-        descriptor_bundle,
+        grad_radial_scale,
+        grad_theta,
+        grad_weights,
+        grad_u,
+        grad_h,
+        grad_boundary_j,
+        grad_boundary_d,
     ) = action
 
     batch, length, heads, rank = u.shape
     chunks = (length + _CHUNK - 1) // _CHUNK
     panels = batch * heads * chunks
-    lower_left, lower_right, upper_left, upper_right = descriptor_bundle.unbind(0)
-
     panel_boundary_j = boundary_j.reshape(panels, rank, rank)
     panel_boundary_d = boundary_d.reshape(panels, rank, rank)
-    strict = _strict_chart_direct_transpose_trusted(
-        lower_left,
-        lower_right,
-        upper_left,
-        upper_right,
-        u,
-        h,
-        panel_boundary_j,
-        panel_boundary_d,
-        frame.theta,
-        frame.weights,
-        frame.radial_scale,
-        None,
-    )
 
     radial = _radial_compact_reverse_accumulate_trusted(
         u,
@@ -178,15 +170,15 @@ def _finish_frame_backward(
             frame.radial_boundary_pair,
             frame.radial_boundary_norm,
         ),
-        strict.grad_radial_scale,
+        grad_radial_scale,
         grad_log_diagonal,
         None,
-        strict.grad_theta,
-        strict.grad_weights,
-        strict.grad_u,
-        strict.grad_h,
-        strict.grad_boundary_j,
-        strict.grad_boundary_d,
+        grad_theta,
+        grad_weights,
+        grad_u,
+        grad_h,
+        grad_boundary_j,
+        grad_boundary_d,
     )
     return _FrameGradients(
         radial.grad_u,
@@ -393,24 +385,11 @@ class _NativeChunkSolveWY(torch.autograd.Function):
             state_grad.grad_Y,
             state_grad.grad_U_z,
         )
-        prepare_grad = tuple(
-            torch.ops.causallsso.c32_solvedelta_prepare_backward(
-                u,
-                h,
-                key,
-                erase,
-                query,
-                boundary_j,
-                boundary_d,
+        frame_primal, frame_dual, grad_inclusive = tuple(
+            torch.ops.causallsso.c32_wy_pair_backward_stage(
                 frame.d,
                 frame.e,
                 frame.chi,
-                frame.lower_primal,
-                frame.lower_dual_scaled,
-                frame.inverse_mass,
-                frame.radial_scale,
-                frame.diagonal,
-                frame.alpha0,
                 inclusive_decay,
                 D_tail,
                 Q_gamma,
@@ -422,16 +401,122 @@ class _NativeChunkSolveWY(torch.autograd.Function):
                 state_grad.grad_G_last,
             )
         )
-        if len(prepare_grad) != 6:
-            raise RuntimeError(
-                "c32_solvedelta_prepare_backward returned invalid gradients"
+        (
+            upper_primal,
+            upper_dual,
+            grad_boundary_j,
+            grad_boundary_d,
+        ) = tuple(
+            torch.ops.causallsso.c32_frame_upper_backward(
+                u,
+                h,
+                key,
+                erase,
+                query,
+                boundary_j,
+                boundary_d,
+                frame.lower_primal,
+                frame.lower_dual_scaled,
+                frame.d,
+                frame.inverse_mass,
+                frame.radial_scale,
+                frame.theta,
+                frame.diagonal,
+                frame.alpha0,
+                frame_primal,
+                frame_dual,
             )
-        action = prepare_grad[:5]
-        grad_inclusive = prepare_grad[5]
+        )
+        del frame_primal
+        strict = streamed_chart_stage_reverse(
+            u,
+            h,
+            key,
+            erase,
+            query,
+            frame.d,
+            frame.lower_primal,
+            frame.lower_dual_scaled,
+            frame_dual,
+            upper_primal,
+            upper_dual,
+            boundary_j,
+            boundary_d,
+            frame.theta,
+            frame.weights,
+            frame.radial_scale,
+            upper=True,
+        )
+        del frame_dual
+        (
+            grad_key,
+            grad_erase,
+            grad_query,
+            grad_log_diagonal,
+            grad_boundary_j,
+            grad_boundary_d,
+            scaled_dual,
+            lower_action_primal,
+        ) = tuple(
+            torch.ops.causallsso.c32_frame_lower_backward(
+                u,
+                h,
+                key,
+                erase,
+                query,
+                boundary_j,
+                boundary_d,
+                frame.lower_primal,
+                frame.lower_dual_scaled,
+                frame.d,
+                frame.inverse_mass,
+                frame.radial_scale,
+                frame.theta,
+                frame.diagonal,
+                frame.alpha0,
+                upper_primal,
+                upper_dual,
+                grad_boundary_j,
+                grad_boundary_d,
+            )
+        )
+        strict = streamed_chart_stage_reverse(
+            u,
+            h,
+            key,
+            erase,
+            query,
+            frame.d,
+            frame.lower_primal,
+            frame.lower_dual_scaled,
+            scaled_dual,
+            lower_action_primal,
+            scaled_dual,
+            boundary_j,
+            boundary_d,
+            frame.theta,
+            frame.weights,
+            frame.radial_scale,
+            upper=False,
+            gradients=strict,
+        )
+        action = (
+            grad_key,
+            grad_erase,
+            grad_query,
+            grad_log_diagonal,
+            strict.radial_scale,
+            strict.theta,
+            strict.weights,
+            strict.u,
+            strict.h,
+            grad_boundary_j,
+            grad_boundary_d,
+        )
         grad_write, grad_value = wy_grad.write, wy_grad.value
         grad_associative_decay = decay_cumsum_backward(grad_inclusive)
 
-        frame_grad = _finish_frame_backward(
+        frame_grad = _complete_radial_backward(
             u,
             h,
             geometry_log_decay,

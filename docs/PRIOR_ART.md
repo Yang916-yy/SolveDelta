@@ -73,19 +73,19 @@ materialization, saving, and replay of `a`; it does not change the operator or
 claim a new WY algorithm.
 
 Decision: the direct-`e` generalized-DPLR composition above is a validated
-historical checkpoint, not the target production ABI. The selected rewrite
-fuses chunk-local SolveDelta actions directly into WY statistics, keeps the
-native action panel at `r x C` rather than constructing a synthetic `3C`
-dimension, and retains FLA's mature factorized state scan without requiring
-its generic Python staging interface. Channel-wise decay interactions are
+historical checkpoint, not a frozen target ABI. The selected rewrite evaluates
+both direct chunk-local SolveDelta-to-WY fusion and split mature kernels with
+private `d/e/chi`, transformed panels, or upstream-native staging. Native action
+panels remain `r x C`; any packed consumer dimension is an internal schedule
+choice. Channel-wise decay interactions are
 formed from the nonpositive log differences `exp(G_i-G_j)` and
 `exp(G_C-G_i)`; the algebraically convenient inverse gauge `exp(-G_j)d_j` is
 never materialized because it can overflow while the true pair interaction is
 finite. The paired backward uses the C32 transpose solve and direct
 interaction/frame/chart transpose actions rather than a chain of entrywise
 VJPs. DeltaNet's WY derivation and FLA's GDN2/Delta implementation informed
-this schedule; the exact forward, reverse, precision map, ABI, and acceptance
-conditions are frozen in `docs/PARALLELISM.md`.
+this schedule; the exact forward, reverse, precision map, model-facing ABI, and
+acceptance conditions are frozen in `docs/FROM_SCRATCH_REBUILD.md`.
 
 Decision: a source-level audit of FLA `v0.5.2` identified smaller reusable
 kernel blocks without reviving its model ABIs. The selected candidates are the
@@ -98,6 +98,27 @@ constants are explicitly not candidates. `docs/UPSTREAM_REUSE.md` records the
 function-level mapping, required specialization, transpose owner, provenance,
 and adoption gates. This audit changes implementation priorities, not the
 operator contract.
+
+Decision update (2026-08-25): the audited FLA GDN2 path is selectively fused,
+not a single-CTA pipeline. Its forward keeps gate/cumsum, intra-WY preparation,
+recurrent state, and output as distinct program owners. Its backward fuses a
+compatible WY/`dqkg` region but retains separate `dAv`, state reverse, intra
+reverse, and cumsum reverse. SolveDelta therefore does not require removal of
+an internal `d/e/chi` ABI or zero-HBM fusion. Direct frame-to-pair
+generate-use-discard competes against `d/e/chi`, transformed panels, and
+upstream-native private layouts; the decision is made from complete F+B latency
+together with registers, shared memory, spills, barriers, active CTAs/SM, and
+backward cache/recompute cost. Only model-visible outputs and continuation
+states belong to the stable public contract.
+
+Decision update (2026-08-25): `C=32`, four warps, stage count, register/shared
+budgets, spill policy, and CTAs/SM are not operator contracts. The first native
+`r=128,K=1` target evaluates numerically passing `C in {16,32,64}` candidates
+and mature four-/eight-warp schedules, then freezes one offline winner for the
+target architecture/profile from complete forward and F+B measurements. C32
+timings elsewhere in this ledger remain historical evidence and a reference
+profile, not a mandatory specialization. Runtime autotuning and
+data-dependent schedule selection remain excluded.
 
 Decision update (2026-08-25): FLA main was checked again at commit
 `3e61322b615df248e7579222d1a68260560f7c24`. Its current MESA local action still
@@ -541,14 +562,31 @@ the production training target.
 The backend screen also considered handwritten recursive/block TRSM in Triton,
 CuTe DSL, TileLang, or CUDA tile libraries; host-level batched cuBLAS;
 truncated Neumann/polynomial inverses; and replacing LDU with butterfly,
-coupling, or hierarchical nilpotent-shear factors. The first
-group duplicates architecture-specific solver work already owned by MathDx,
-host batched TRSM forces dynamic factors through global memory, and changing
-factor families would make backend convenience alter the model mathematics.
-The polynomial candidate and its standalone chunk path were deleted. A bounded
-remainder and good ordinary-case measurements were insufficient reason to keep
-a second solve contract. MathDx owns exact factor-action validation while
-Triton/CUDA/FLA own the training schedule.
+coupling, or hierarchical nilpotent-shear factors. Host batched TRSM forces
+dynamic factors through global memory, and changing factor families would make
+backend convenience alter the model mathematics. The earlier standalone
+polynomial path materialized its own panels and defined a competing solve
+surface; deleting it was correct.
+
+Decision revision (2026-08-25): select a different, resident fixed-order
+Neumann lowering for the first native training path. It keeps the exact
+bounded-LDU recurrence as the mathematical operator, reuses the matrix-free
+strict action already needed by direct primal/dual work, and holds `base` and
+all iterates inside one program. With `||N||_2 < q=1/4`, degree `p=6` has the
+static single-factor truncation bound
+
+\[
+\delta_6=\frac{q^7}{1-q}=\frac1{12288}\simeq8.138\times10^{-5}.
+\]
+
+The reverse uses the implicit solve VJP
+`z=(I+N)^(-T) bar_y`, `bar_N=-z y^T`, with `z` evaluated by the same resident
+degree-six transpose recurrence. It does not retain a six-node polynomial VJP
+chain. This route is therefore not the deleted HBM polynomial backend and does
+not change the LDU factor family. MESA's inline `chunk_update_once` and its
+resident CG-loop schedule informed the execution decision; the CG reductions,
+adaptive iteration count, denominator perturbation, ridge system, and `q_star`
+ABI are not adopted. MathDx continues to own exact factor-action validation.
 
 An isolated SM120 chart VJP prototype matched FP64 closely but materialized
 full factor cotangents and increased end-to-end time and workspace. It was
@@ -708,15 +746,34 @@ None improved complete F+B against the current path in its controlled A/B, so
 all three were deleted. This local result reinforces the ownership rule:
 traffic reduction is adopted only when the composed training path wins.
 
-One ownership-only change did survive that screen. The frame adjoint's
-unbounded rank-three descriptor bundle is now produced directly in BF16, the
-operand format consumed by the strict Tensor Core transpose, while every
-action and reduction remains FP32-accumulated. Seven target-profile repeats
-reduced median backward from about `5.172 ms` to `5.024 ms` and F+B from about
-`6.762 ms` to `6.704 ms`. The WY pair reverse also writes directly into the
-primal and two-route dual workspaces that the frame adjoint overwrites in
-place; the former `grad_d/grad_e/grad_chi` cross-kernel interface and its three
-allocations no longer exist.
+That descriptor checkpoint was subsequently deleted rather than retained as a
+BF16 ABI. The production reverse now asks the WY pair transpose for one FP32
+primal and one two-route FP32 dual action panel, performs the upper frame
+transpose, and immediately consumes the three rank-one descriptors in a
+coordinate-block Triton `tl.dot` transpose. The diagonal/lower frame stage then
+overwrites the same action panels and immediately runs the lower transpose.
+There is no `descriptor_bundle`, `correlation`, `pair_partial`,
+`projection_partial`, or `grad_d/grad_e/grad_chi` interface. The strict
+transpose writes final `grad_u`, `grad_h`, `grad_weights`, `grad_theta`, and
+`grad_radial_scale`; the native upper/lower stages accumulate into one shared
+FP32 `grad_boundary_J/grad_boundary_D` pair.
+
+The action panels remain short-lived global producer/consumer panels between
+the native triangular action and its Triton transpose; they are not chart
+descriptors or saved backward checkpoints. At most one action stage is live:
+the old `upper_primal.clone()` and simultaneous four-panel return were removed.
+This is the current honest fusion boundary. Moving the triangular action and
+Tensor Core strict transpose into one backend remains a possible later
+schedule, but it is not required to preserve the operator or to claim deletion
+of the descriptor ABI.
+
+On the SM120 target profile, changing the streamed strict kernels from eight to
+four warps and splitting the diagonal transpose by action stage passed the
+composed FP64/VJP gate. The warmed medians are about `1.634 ms` forward and
+`6.485 ms` forward plus backward, or `4.851 ms` backward by subtraction. The
+incremental allocator peaks are about `95.2 MiB` forward and `241.8 MiB` for
+forward plus backward. Across 100 identical target-profile forward/VJP runs,
+the maximum observed drift was `rho=1.81e-7` and `a_inf=1.79e-7`.
 
 ## MESA execution-graph and exterior-kernel audit
 
@@ -870,3 +927,88 @@ fixed-point and shallow coupling solve charts, piecewise-constant frames,
 recursively approximated inverse states, and unpreconditioned Krylov solves.
 Diagnostics may reproduce one of these ideas outside the model package, but
 none is a public architecture or roadmap branch.
+
+## From-scratch execution audit
+
+Decision update (2026-08-25): the current native implementation and all older
+execution documents are no longer accepted as design constraints. Their
+timings remain historical evidence, but their ABIs, kernel boundaries,
+workspaces, and compatibility requirements are presumed wrong. The FP64 token
+recurrence in `causallsso/reference.py` is the sole mathematical authority.
+Chunked geometry plus a generalized WY exterior survives only because its
+forward, final-state, and complete VJP identities were independently derived
+and checked in FP64; it is not retained by provenance or compatibility.
+
+A source audit was repeated against FLA commit `bc3b101d`, its MESA kernels,
+Mamba commit `e9594ce1`, causal-conv1d commit `cd81f041`, CUTLASS commit
+`7107b055`, and installed MathDx 26.06. The resulting ownership rule is to
+specialize complete mature kernels at their natural global-memory boundary.
+Mixing a CUTLASS collective or block-level cuBLASDx operation into a custom
+frame CTA was rejected because the two owners duplicate shared staging,
+barriers, and register lifetimes. CuTe copy/MMA atoms and CUB reductions are
+safe device-level reuse because they are instruction mappings rather than
+independent collective schedules.
+
+The selected exterior retains private direct-FP16 `d/e/chi` panels. They cost
+6 MiB at the target profile and preserve a clean boundary to FLA's complete
+pair/WY/state/output forward and transpose programs. This supersedes the
+earlier proposal to eliminate those panels by fusing chart and WY into one
+low-occupancy CTA. Synthetic `3C` panels, descriptor bundles, entrywise VJP
+workspaces, and fake DPLR gate ABIs remain forbidden. The only custom kernel
+family is the bounded-LDU frame/chart orchestration; even there, copies, MMA,
+reductions, and scans are sourced from CuTe, MESA, and CUB. The complete
+formulas, symbol-level reuse map, SM120 microprogram, precision bounds,
+forward/backward launch graph, and falsification gates are frozen in
+`docs/FROM_SCRATCH_REBUILD.md`.
+
+The same audit removed J/D state propagation from the custom-code budget.
+MESA's resident `Hkk/Hkv` forward is exactly the paired `(J,D)` recurrence under
+`k=u`, `k2=u`, `v=h`, and `beta=1`; FLA common state reverse supplies the
+resident transpose loop. The adopted specialization keeps MESA's complete
+load/dot/state/store schedule, uses FP32 state storage, gives the J and D dots
+their separately declared FP16/BF16 operand bits, and replaces the CG-specific
+reverse source with SolveDelta's direct chart cotangent. The scalar `m` scan
+remains separate. This is specialization of mature programs, not a new J/D
+kernel family.
+
+FLA DPLR's centered `chunk_A` forward/backward programs informed the frozen
+tile-local WY gauge interface: pair operands may be centered around an
+arbitrary coordinate-wise reference, while the formal reference cotangent
+cancels exactly between row and column operands. MESA's `Hkk/Hkv` Gram and
+Hadamard schedules informed the radial factorization into complete coordinate
+tiles and strict diagonal tiles. The SolveDelta gauge reverse and the H/R
+Gram transposes were derived independently from the operator and checked
+against FP64 automatic differentiation; no DPLR or MESA high-level model ABI
+is inherited.
+
+The same canonicalization applies to chart scalars. FLA
+`modules/l2norm.py` computes `rsqrt(sum(x*x)+eps)` and its exact projection
+transpose, so SolveDelta's radial map is that primitive with `eps=c^2` and an
+output scale `c`. FLA fused cross entropy already uses the identical
+`s*tanh(x/s)` soft-cap and `1-tanh(x/s)^2` reverse needed by the diagonal
+chart. The rebuild therefore reuses those scalar programs while MESA supplies
+matrix-free route norms; it never materializes a strict `r x r` chart merely
+to satisfy the public L2Norm wrapper. SolveDelta owns the composition and
+route timing, not new normalization or activation mathematics.
+
+Normalizing the two geometry accumulators by mass exposes another exact
+canonical form. On reachable states, `H=J/m` and `R=D/m` obey matrix-valued
+delta updates with step `1/m`: H tracks a decayed online `u*u^T` observation
+and R tracks `u*h^T`. A chunk merge is the corresponding weighted-mean
+residual merge. This improves interpretation and confirms the generic state
+primitive, but it does not justify a normalized continuation ABI: H/R without
+mass is not associative, and recurrent division/rounding would change the
+chunk-split numerical recurrence. The production scan therefore remains the
+paired MESA `(J,D)` accumulator. FLA common `chunk_h` independently confirms
+each route as `H <- decay*H + K^T*V`; the paired MESA program is selected over
+two generic launches because J and D share decay and the left `u` operand.
+
+The bounded LDU factors also canonicalize to standard primitives rather than
+disappearing. `L=I+N^-` and `U=I+N^+` are residual matrix actions; their direct
+transpose-dual path maps to MESA's two-dot action, while the primal path is a
+unit-triangular solve. FLA `solve_tril` and the fused GDN KKT/solve kernel
+provide the substitution code pattern, but not a drop-in high-level operator:
+they solve a token-tile triangular factor, whereas SolveDelta has one
+coordinate-triangular factor per token with nonlinear H/R route coefficients.
+The reusable unit is therefore the mature action/substitution program, not the
+MESA CG wrapper or the complete GDN ABI.

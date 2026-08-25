@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -73,6 +74,37 @@ def test_identity_chart_and_exact_primal_dual_pairing() -> None:
     torch.testing.assert_close(
         (e * d).sum(-2), (b * a).sum(-2), rtol=1e-11, atol=1e-11
     )
+
+
+def test_asymmetric_r_alone_exposes_full_ambient_chart_rank() -> None:
+    r = 3
+    H = torch.eye(r, dtype=torch.float64).reshape(1, 1, r, r) / r
+    strength = torch.tensor([0.4], dtype=torch.float64)
+
+    def chart(raw_r: torch.Tensor) -> torch.Tensor:
+        lower, diagonal, upper = bounded_ldu_reference(
+            H, raw_r.reshape(1, 1, r, r), strength
+        )
+        return (lower @ torch.diag_embed(diagonal) @ upper).reshape(-1)
+
+    origin = torch.zeros(r * r, dtype=torch.float64, requires_grad=True)
+    jacobian = torch.autograd.functional.jacobian(chart, origin)
+    assert torch.linalg.matrix_rank(jacobian).item() == r * r
+
+
+def test_reference_rejects_nonsymmetric_initial_j() -> None:
+    x = _inputs(batch=1, length=1, heads=1, edits=1, r=3, value_dim=2)
+    initial = SolveDeltaState(
+        torch.zeros(1, 1, dtype=torch.float64),
+        torch.tensor(
+            [[[[0.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]],
+            dtype=torch.float64,
+        ),
+        torch.zeros(1, 1, 3, 3, dtype=torch.float64),
+        torch.zeros(1, 1, 3, 2, dtype=torch.float64),
+    )
+    with pytest.raises(ValueError, match="exactly symmetric"):
+        solvedelta_reference(**x, initial_state=initial)
 
 
 def test_factor_bounds_hold_for_saturated_coordinates() -> None:
