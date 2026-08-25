@@ -221,23 +221,11 @@ def _output_forward_kernel(
         + panel * C * C
         + tl.arange(0, C)[:, None] * C
         + columns[None, :]
-    ).to(tl.float32)
+    ).to(tl.bfloat16)
     local_residual = tl.load(
         residual + value_offsets, mask=value_mask, other=0.0
-    ).to(tl.float32)
-    for source in tl.static_range(0, C):
-        coefficient = tl.sum(
-            tl.where(columns[None, :] == source, interaction, 0.0), axis=1
-        )
-        source_value = tl.sum(
-            tl.where(
-                tl.arange(0, C)[:, None] == source,
-                local_residual,
-                0.0,
-            ),
-            axis=0,
-        )
-        result += coefficient[:, None] * source_value[None, :]
+    ).to(tl.bfloat16)
+    result += tl.dot(interaction, local_residual)
     tl.store(
         output + value_offsets,
         result.to(tl.bfloat16),
@@ -321,25 +309,10 @@ def _state_backward_kernel(
             + panel * C * C
             + tl.arange(0, C)[:, None] * C
             + columns[None, :]
-        ).to(tl.float32)
-        for target in tl.static_range(0, C):
-            coefficient = tl.sum(
-                tl.where(
-                    tl.arange(0, C)[:, None] == target,
-                    interaction,
-                    0.0,
-                ),
-                axis=0,
-            )
-            target_value = tl.sum(
-                tl.where(
-                    tl.arange(0, C)[:, None] == target,
-                    local_grad_output,
-                    0.0,
-                ),
-                axis=0,
-            )
-            local_grad_residual += coefficient[:, None] * target_value[None, :]
+        ).to(tl.bfloat16)
+        local_grad_residual += tl.dot(
+            tl.trans(interaction), local_grad_output.to(tl.bfloat16)
+        )
         tl.store(
             grad_residual + value_offsets,
             local_grad_residual,

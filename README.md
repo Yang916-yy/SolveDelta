@@ -133,15 +133,17 @@ compatibility paths.
 On the local SM120 target profile
 `B=1,T=1024,H=8,r=d_v=128,K=1,C=32`, warmed medians are:
 
-| Complete-operator measurement | Scalar C32 solve at `6d4e53f` | FLA-derived C32 block |
-|---|---:|---:|
-| forward | `1.639--1.643 ms` | `1.608--1.620 ms` |
-| forward + backward | `6.885--7.122 ms` | `6.443--6.497 ms` |
-| isolated paired WY forward/reverse | scalar reverse about `0.272 ms` | `0.023 / 0.040 ms` |
+| Complete-operator measurement | Scalar C32 at `6d4e53f` | Initial FLA C32 block | Current reuse pass |
+|---|---:|---:|---:|
+| forward | `1.639--1.643 ms` | `1.608--1.620 ms` | about `1.35 ms` |
+| forward + backward | `6.885--7.122 ms` | `6.443--6.497 ms` | about `5.80 ms` |
+| isolated paired WY forward/reverse | scalar reverse about `0.272 ms` | `0.023 / 0.040 ms` | unchanged |
 
-Across the two matched rounds, complete forward-plus-backward improved by
-about `5.6--9.5%`. In the current run, complete backward is about `4.88 ms` by
-forward subtraction; the remaining frame/radial/strict/state/scan aggregate,
+The initial FLA C32 replacement improved complete forward-plus-backward by
+about `5.6--9.5%`. Original-stride frame addressing, `tl.dot` output, paired
+geometry tiles, and fused normalization then reduced the current core further.
+Current backward is about `4.45 ms` by forward subtraction; the remaining
+frame/radial/strict/state/scan aggregate,
 not the roughly `0.040 ms` paired-WY reverse, is now the primary optimization
 target. The separately matched GDN2 operator remains much faster at about
 `0.358 ms` forward and `1.154 ms` forward-plus-backward. The current
@@ -159,6 +161,10 @@ These are operator measurements: SolveDelta includes normalization, geometry
 scan, resident frame, WY, and final state; GDN2 includes its corresponding
 normalization/core/final-state work. Neither operator timing includes
 input/output projections or conv4.
+
+The current complete target layer, including projections, three CUDA conv4
+branches, fused gates, and all returned-state VJPs, measures about
+`1.78/7.25 ms` forward/F+B on the same device.
 
 MathDx is retained only as an optional exact `r=128` triangular validation
 oracle and possible decode candidate. It is not imported by model dispatch and

@@ -19,6 +19,55 @@ _HOST_RANK = 128
 _RADIUS = 1.0 / 8.0
 
 
+@triton.jit
+def _panel_count(panel, length, heads: tl.constexpr, chunks: tl.constexpr):
+    chunk = panel % chunks
+    return tl.minimum(_CHUNK, length - chunk * _CHUNK)
+
+
+@triton.jit
+def _raw_vector_offsets(
+    panel,
+    local_tokens,
+    coordinates,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+):
+    panel = panel.to(tl.int64)
+    chunk = panel % chunks
+    head_batch = panel // chunks
+    head = head_batch % heads
+    batch = head_batch // heads
+    tokens = chunk * _CHUNK + local_tokens
+    return (
+        (batch * length * heads + tokens * heads + head) * _RANK
+        + coordinates
+    )
+
+
+@triton.jit
+def _raw_scalar_offsets(
+    panel,
+    local_tokens,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+):
+    panel = panel.to(tl.int64)
+    chunk = panel % chunks
+    head_batch = panel // chunks
+    head = head_batch % heads
+    batch = head_batch // heads
+    tokens = chunk * _CHUNK + local_tokens
+    return batch * length * heads + tokens * heads + head
+
+
+@triton.jit
+def _panel_head(panel, heads: tl.constexpr, chunks: tl.constexpr):
+    return (panel // chunks) % heads
+
+
 class RadialCompactOutput(NamedTuple):
     """Chunk-local scalar chart data in panel-major order."""
 
@@ -57,21 +106,30 @@ def _temporal_coefficients_kernel(
     inverse_mass,
     theta,
     weights,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     sources = tl.arange(0, _CHUNK)
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     mass = tl.load(boundary_mass + panel).to(tl.float32)
     boundary_numerator = 1.0
     previous = tl.zeros((_CHUNK,), tl.float32)
 
     for target in tl.static_range(0, _CHUNK):
         active = target < count
-        log_rho = tl.load(
-            log_decay + panel * _CHUNK + target,
-            mask=active,
-            other=0.0,
+        decay_offset = (
+            _raw_scalar_offsets(panel, target, length, heads, chunks)
+            if RAW_LAYOUT
+            else panel * _CHUNK + target
         )
+        log_rho = tl.load(log_decay + decay_offset, mask=active, other=0.0)
         rho = tl.exp(log_rho.to(tl.float32))
         next_mass = rho * mass + 1.0
         inverse = 1.0 / next_mass
@@ -107,6 +165,10 @@ def _radial_pair_statistics_kernel(
     gram_partial,
     boundary_pair_partial,
     boundary_norm_partial,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     ROUTE: tl.constexpr,
 ):
     """MESA-style Gram/Hadamard statistics for one strict chart route."""
@@ -116,13 +178,24 @@ def _radial_pair_statistics_kernel(
     tokens = tl.arange(0, _CHUNK)
     local = tl.arange(0, _MATRIX_TILE)
     rows = row_block * _MATRIX_TILE + local
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     active = tokens < count
     panel_vector = panel * _CHUNK * _RANK
     panel_matrix = panel * _RANK * _RANK
 
+    row_offsets = (
+        _raw_vector_offsets(
+            panel, tokens[:, None], rows[None, :], length, heads, chunks
+        )
+        if RAW_LAYOUT
+        else panel_vector + tokens[:, None] * _RANK + rows[None, :]
+    )
     row_u = tl.load(
-        u + panel_vector + tokens[:, None] * _RANK + rows[None, :],
+        u + row_offsets,
         mask=active[:, None],
         other=0.0,
     )
@@ -135,20 +208,42 @@ def _radial_pair_statistics_kernel(
         include = column_block > row_block if ROUTE >= 2 else column_block < row_block
         columns = column_block * _MATRIX_TILE + local
         if ROUTE & 1:
-            column_values = tl.load(
-                h
-                + panel_vector
+            column_offsets = (
+                _raw_vector_offsets(
+                    panel,
+                    tokens[:, None],
+                    columns[None, :],
+                    length,
+                    heads,
+                    chunks,
+                )
+                if RAW_LAYOUT
+                else panel_vector
                 + tokens[:, None] * _RANK
-                + columns[None, :],
+                + columns[None, :]
+            )
+            column_values = tl.load(
+                h + column_offsets,
                 mask=include & active[:, None],
                 other=0.0,
             )
         else:
-            column_values = tl.load(
-                u
-                + panel_vector
+            column_offsets = (
+                _raw_vector_offsets(
+                    panel,
+                    tokens[:, None],
+                    columns[None, :],
+                    length,
+                    heads,
+                    chunks,
+                )
+                if RAW_LAYOUT
+                else panel_vector
                 + tokens[:, None] * _RANK
-                + columns[None, :],
+                + columns[None, :]
+            )
+            column_values = tl.load(
+                u + column_offsets,
                 mask=include & active[:, None],
                 other=0.0,
             )
@@ -189,7 +284,7 @@ def _radial_pair_statistics_kernel(
 
     if ROUTE & 1:
         diagonal_values = tl.load(
-            h + panel_vector + tokens[:, None] * _RANK + rows[None, :],
+            h + row_offsets,
             mask=active[:, None],
             other=0.0,
         ).to(tl.float32)
@@ -276,13 +371,21 @@ def _radial_pair_output_kernel(
     saved_gram,
     saved_boundary_pair,
     saved_boundary_norm,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     SAVE_STATISTICS: tl.constexpr,
 ):
     panel = tl.program_id(0)
     route = tl.program_id(1)
     targets = tl.arange(0, _CHUNK)
     sources = tl.arange(0, _CHUNK)
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     active_target = targets < count
     active_source = sources < count
     temporal = tl.load(
@@ -331,7 +434,10 @@ def _radial_pair_output_kernel(
         + 2.0 * local_theta * boundary_cross
         + local_norm
     )
-    panel_strength = tl.load(strength + panel).to(tl.float32)
+    strength_index = (
+        _panel_head(panel, heads, chunks) if RAW_LAYOUT else panel
+    )
+    panel_strength = tl.load(strength + strength_index).to(tl.float32)
     radius = 0.125
     q2 = radius * radius + panel_strength * panel_strength * norm
     scale = panel_strength * radius * tl.rsqrt(q2)
@@ -360,11 +466,20 @@ def _radial_scalar_reverse_kernel(
     grad_radial_scale,
     grad_norm,
     grad_strength,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     targets = tl.arange(0, _CHUNK)[:, None]
     routes = tl.arange(0, 4)[None, :]
-    active = targets < tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
+    active = targets < count
     offsets = (panel * _CHUNK + targets) * 4 + routes
     norm = tl.load(radial_norm + offsets, mask=active, other=0.0)
     q2 = tl.load(radial_q2 + offsets, mask=active, other=1.0)
@@ -374,7 +489,10 @@ def _radial_scalar_reverse_kernel(
         mask=active,
         other=0.0,
     )
-    panel_strength = tl.load(strength + panel).to(tl.float32)
+    strength_index = (
+        _panel_head(panel, heads, chunks) if RAW_LAYOUT else panel
+    )
+    panel_strength = tl.load(strength + strength_index).to(tl.float32)
     radius = 0.125
     grad_q2 = -0.5 * grad_scale * scale / q2
     # A zero from the Gram/Hadamard expansion may be a rounded cancellation,
@@ -403,6 +521,10 @@ def _radial_pair_boundary_leaf_transpose_kernel(
     valid_count,
     grad_u,
     grad_h,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     ADD_TO_GRAD: tl.constexpr,
 ):
     """Apply the four boundary-pair cotangents as broad C32 products."""
@@ -411,7 +533,11 @@ def _radial_pair_boundary_leaf_transpose_kernel(
     row_block = tl.program_id(1)
     rows = row_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
     sources = tl.arange(0, _CHUNK)
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     active_source = sources < count
     coefficient_lj = tl.load(
         boundary_coefficient + panel * 4 * _CHUNK + sources,
@@ -441,13 +567,27 @@ def _radial_pair_boundary_leaf_transpose_kernel(
 
     for start in tl.static_range(0, _RANK, 32):
         columns = start + tl.arange(0, 32)
+        source_offsets = (
+            _raw_vector_offsets(
+                panel,
+                sources[:, None],
+                columns[None, :],
+                length,
+                heads,
+                chunks,
+            )
+            if RAW_LAYOUT
+            else panel_vector
+            + sources[:, None] * _RANK
+            + columns[None, :]
+        )
         u_columns = tl.load(
-            u + panel_vector + sources[:, None] * _RANK + columns[None, :],
+            u + source_offsets,
             mask=active_source[:, None],
             other=0.0,
         ).to(tl.bfloat16)
         h_columns = tl.load(
-            h + panel_vector + sources[:, None] * _RANK + columns[None, :],
+            h + source_offsets,
             mask=active_source[:, None],
             other=0.0,
         ).to(tl.bfloat16)
@@ -493,7 +633,18 @@ def _radial_pair_boundary_leaf_transpose_kernel(
             dlt_u * coefficient_ld[None, :]
             + dut_u * coefficient_ud[None, :]
         )
-    output = panel_vector + sources[:, None] * _RANK + rows[None, :]
+    output = (
+        _raw_vector_offsets(
+            panel,
+            sources[:, None],
+            rows[None, :],
+            length,
+            heads,
+            chunks,
+        )
+        if RAW_LAYOUT
+        else panel_vector + sources[:, None] * _RANK + rows[None, :]
+    )
     result_u = tl.trans(grad_u_rows)
     result_h = tl.trans(grad_h_rows)
     if ADD_TO_GRAD:
@@ -507,8 +658,22 @@ def _radial_pair_boundary_leaf_transpose_kernel(
             mask=active_source[:, None],
             other=0.0,
         ).to(tl.float32)
-    tl.store(grad_u + output, tl.where(active_source[:, None], result_u, 0.0))
-    tl.store(grad_h + output, tl.where(active_source[:, None], result_h, 0.0))
+    if RAW_LAYOUT:
+        tl.store(
+            grad_u + output, result_u, mask=active_source[:, None]
+        )
+        tl.store(
+            grad_h + output, result_h, mask=active_source[:, None]
+        )
+    else:
+        tl.store(
+            grad_u + output,
+            tl.where(active_source[:, None], result_u, 0.0),
+        )
+        tl.store(
+            grad_h + output,
+            tl.where(active_source[:, None], result_h, 0.0),
+        )
 
 
 @triton.jit
@@ -523,6 +688,10 @@ def _radial_pair_boundary_transpose_kernel(
     valid_count,
     grad_boundary_j,
     grad_boundary_d,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     ADD_TO_GRAD: tl.constexpr,
 ):
     panel = tl.program_id(0)
@@ -531,26 +700,49 @@ def _radial_pair_boundary_transpose_kernel(
     rows = row_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
     columns = column_block * _MATRIX_TILE + tl.arange(0, _MATRIX_TILE)
     tokens = tl.arange(0, _CHUNK)
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     active = tokens < count
     panel_vector = panel * _CHUNK * _RANK
+    row_offsets = (
+        _raw_vector_offsets(
+            panel, tokens[:, None], rows[None, :], length, heads, chunks
+        )
+        if RAW_LAYOUT
+        else panel_vector + tokens[:, None] * _RANK + rows[None, :]
+    )
+    column_offsets = (
+        _raw_vector_offsets(
+            panel,
+            tokens[:, None],
+            columns[None, :],
+            length,
+            heads,
+            chunks,
+        )
+        if RAW_LAYOUT
+        else panel_vector + tokens[:, None] * _RANK + columns[None, :]
+    )
     matrix_offset = (
         panel * _RANK * _RANK
         + rows[:, None] * _RANK
         + columns[None, :]
     )
     local_u_rows = tl.load(
-        u + panel_vector + tokens[:, None] * _RANK + rows[None, :],
+        u + row_offsets,
         mask=active[:, None],
         other=0.0,
     )
     local_u_columns = tl.load(
-        u + panel_vector + tokens[:, None] * _RANK + columns[None, :],
+        u + column_offsets,
         mask=active[:, None],
         other=0.0,
     )
     local_h_columns = tl.load(
-        h + panel_vector + tokens[:, None] * _RANK + columns[None, :],
+        h + column_offsets,
         mask=active[:, None],
         other=0.0,
     )
@@ -613,12 +805,20 @@ def _radial_pair_scalar_reverse_kernel(
     grad_weights_partial,
     boundary_coefficient,
     local_coefficient,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     route = tl.program_id(1)
     targets = tl.arange(0, _CHUNK)
     sources = tl.arange(0, _CHUNK)
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     active_target = targets < count
     active_source = sources < count
     temporal = tl.load(
@@ -740,28 +940,44 @@ def _radial_pair_offdiagonal_transpose_kernel(
     valid_count,
     grad_u,
     grad_h,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     output_block = tl.program_id(1)
     tokens = tl.arange(0, _CHUNK)
     local = tl.arange(0, _MATRIX_TILE)
     output_coordinates = output_block * _MATRIX_TILE + local
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     active = tokens < count
     panel_vector = panel * _CHUNK * _RANK
-    output_u = tl.load(
-        u
-        + panel_vector
+    output_offsets = (
+        _raw_vector_offsets(
+            panel,
+            tokens[:, None],
+            output_coordinates[None, :],
+            length,
+            heads,
+            chunks,
+        )
+        if RAW_LAYOUT
+        else panel_vector
         + tokens[:, None] * _RANK
-        + output_coordinates[None, :],
+        + output_coordinates[None, :]
+    )
+    output_u = tl.load(
+        u + output_offsets,
         mask=active[:, None],
         other=0.0,
     )
     output_h = tl.load(
-        h
-        + panel_vector
-        + tokens[:, None] * _RANK
-        + output_coordinates[None, :],
+        h + output_offsets,
         mask=active[:, None],
         other=0.0,
     )
@@ -779,6 +995,20 @@ def _radial_pair_offdiagonal_transpose_kernel(
         ).to(tl.float32)
         for other_block in tl.static_range(0, 8):
             other_coordinates = other_block * _MATRIX_TILE + local
+            other_offsets = (
+                _raw_vector_offsets(
+                    panel,
+                    tokens[:, None],
+                    other_coordinates[None, :],
+                    length,
+                    heads,
+                    chunks,
+                )
+                if RAW_LAYOUT
+                else panel_vector
+                + tokens[:, None] * _RANK
+                + other_coordinates[None, :]
+            )
             row_active = (
                 other_block < output_block
                 if route < 2
@@ -791,19 +1021,13 @@ def _radial_pair_offdiagonal_transpose_kernel(
             )
             if route & 1:
                 other_right = tl.load(
-                    h
-                    + panel_vector
-                    + tokens[:, None] * _RANK
-                    + other_coordinates[None, :],
+                    h + other_offsets,
                     mask=row_active & active[:, None],
                     other=0.0,
                 )
             else:
                 other_right = tl.load(
-                    u
-                    + panel_vector
-                    + tokens[:, None] * _RANK
-                    + other_coordinates[None, :],
+                    u + other_offsets,
                     mask=row_active & active[:, None],
                     other=0.0,
                 )
@@ -815,10 +1039,7 @@ def _radial_pair_offdiagonal_transpose_kernel(
             result_u += tl.where(row_active, row_action, 0.0)
 
             other_left = tl.load(
-                u
-                + panel_vector
-                + tokens[:, None] * _RANK
-                + other_coordinates[None, :],
+                u + other_offsets,
                 mask=column_active & active[:, None],
                 other=0.0,
             )
@@ -833,15 +1054,24 @@ def _radial_pair_offdiagonal_transpose_kernel(
             else:
                 result_u += tl.where(column_active, column_action, 0.0)
 
-    output = (
-        panel_vector
-        + tokens[:, None] * _RANK
-        + output_coordinates[None, :]
+    result_u += tl.load(
+        grad_u + output_offsets, mask=active[:, None], other=0.0
     )
-    result_u += tl.load(grad_u + output, mask=active[:, None], other=0.0)
-    result_h += tl.load(grad_h + output, mask=active[:, None], other=0.0)
-    tl.store(grad_u + output, tl.where(active[:, None], result_u, 0.0))
-    tl.store(grad_h + output, tl.where(active[:, None], result_h, 0.0))
+    result_h += tl.load(
+        grad_h + output_offsets, mask=active[:, None], other=0.0
+    )
+    if RAW_LAYOUT:
+        tl.store(grad_u + output_offsets, result_u, mask=active[:, None])
+        tl.store(grad_h + output_offsets, result_h, mask=active[:, None])
+    else:
+        tl.store(
+            grad_u + output_offsets,
+            tl.where(active[:, None], result_u, 0.0),
+        )
+        tl.store(
+            grad_h + output_offsets,
+            tl.where(active[:, None], result_h, 0.0),
+        )
 
 
 @triton.jit
@@ -852,35 +1082,57 @@ def _radial_pair_diagonal_transpose_kernel(
     valid_count,
     grad_u,
     grad_h,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     source = tl.program_id(1)
     partners = tl.arange(0, _CHUNK)[:, None]
     local = tl.arange(0, _MATRIX_TILE)[None, :]
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     source_active = source < count
     partner_active = partners < count
     panel_vector = panel * _CHUNK * _RANK
 
     for block in tl.static_range(0, 8):
         coordinates = block * _MATRIX_TILE + local
+        source_offsets = (
+            _raw_vector_offsets(
+                panel, source, coordinates, length, heads, chunks
+            )
+            if RAW_LAYOUT
+            else panel_vector + source * _RANK + coordinates
+        )
+        partner_offsets = (
+            _raw_vector_offsets(
+                panel, partners, coordinates, length, heads, chunks
+            )
+            if RAW_LAYOUT
+            else panel_vector + partners * _RANK + coordinates
+        )
         source_u = tl.load(
-            u + panel_vector + source * _RANK + coordinates,
+            u + source_offsets,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
         source_h = tl.load(
-            h + panel_vector + source * _RANK + coordinates,
+            h + source_offsets,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
         partner_u = tl.load(
-            u + panel_vector + partners * _RANK + coordinates,
+            u + partner_offsets,
             mask=partner_active,
             other=0.0,
         ).to(tl.float32)
         partner_h = tl.load(
-            h + panel_vector + partners * _RANK + coordinates,
+            h + partner_offsets,
             mask=partner_active,
             other=0.0,
         ).to(tl.float32)
@@ -937,7 +1189,7 @@ def _radial_pair_diagonal_transpose_kernel(
             ),
             axis=0,
         )
-        output = panel_vector + source * _RANK + coordinates
+        output = source_offsets
         tl.store(
             grad_u + output,
             tl.load(grad_u + output, mask=source_active, other=0.0)
@@ -963,6 +1215,10 @@ def _diagonal_kernel(
     strength,
     valid_count,
     diagonal,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     targets = (
@@ -973,7 +1229,11 @@ def _diagonal_kernel(
         tl.program_id(2) * _DIAGONAL_R
         + tl.arange(0, _DIAGONAL_R)
     )[None, :]
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     local_theta = tl.load(theta + panel * _CHUNK + targets)
     boundary_offset = panel * _RANK * _RANK + coordinates * (_RANK + 1)
     moment_j = local_theta * tl.load(boundary_j + boundary_offset)
@@ -986,20 +1246,30 @@ def _diagonal_kernel(
             + (panel * _CHUNK + targets) * _CHUNK
             + source
         )
+        vector_offset = (
+            _raw_vector_offsets(
+                panel, source, coordinates, length, heads, chunks
+            )
+            if RAW_LAYOUT
+            else (panel * _CHUNK + source) * _RANK + coordinates
+        )
         local_u = tl.load(
-            u + (panel * _CHUNK + source) * _RANK + coordinates,
+            u + vector_offset,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
         local_h = tl.load(
-            h + (panel * _CHUNK + source) * _RANK + coordinates,
+            h + vector_offset,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
         moment_j += local_weight * local_u * local_u
         moment_d += local_weight * local_u * local_h
 
-    panel_strength = tl.load(strength + panel).to(tl.float32)
+    strength_index = (
+        _panel_head(panel, heads, chunks) if RAW_LAYOUT else panel
+    )
+    panel_strength = tl.load(strength + strength_index).to(tl.float32)
     radius = 0.125
     centered_j = moment_j - 1.0 / 128.0
     log_diagonal = (
@@ -1028,6 +1298,10 @@ def _diagonal_moment_reverse_kernel(
     grad_moment_j,
     grad_moment_d,
     grad_strength_partial,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     target_block = tl.program_id(1)
@@ -1041,7 +1315,11 @@ def _diagonal_moment_reverse_kernel(
         coordinate_block * _DIAGONAL_R
         + tl.arange(0, _DIAGONAL_R)
     )[None, :]
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     target_active = targets < count
     local_theta = tl.load(
         theta + panel * _CHUNK + targets,
@@ -1058,30 +1336,45 @@ def _diagonal_moment_reverse_kernel(
             + (panel * _CHUNK + targets) * _CHUNK
             + source
         )
+        vector_offset = (
+            _raw_vector_offsets(
+                panel, source, coordinates, length, heads, chunks
+            )
+            if RAW_LAYOUT
+            else (panel * _CHUNK + source) * _RANK + coordinates
+        )
         local_u = tl.load(
-            u + (panel * _CHUNK + source) * _RANK + coordinates,
+            u + vector_offset,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
         local_h = tl.load(
-            h + (panel * _CHUNK + source) * _RANK + coordinates,
+            h + vector_offset,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
         moment_j += local_weight * local_u * local_u
         moment_d += local_weight * local_u * local_h
 
-    panel_strength = tl.load(strength + panel).to(tl.float32)
+    strength_index = (
+        _panel_head(panel, heads, chunks) if RAW_LAYOUT else panel
+    )
+    panel_strength = tl.load(strength + strength_index).to(tl.float32)
     radius = 0.125
     centered_j = moment_j - 1.0 / 128.0
     tanh_j = libdevice.tanh(panel_strength * centered_j / radius)
     tanh_d = libdevice.tanh(panel_strength * moment_d / radius)
     sech_j = 1.0 - tanh_j * tanh_j
     sech_d = 1.0 - tanh_d * tanh_d
+    grad_log_offset = (
+        _raw_vector_offsets(
+            panel, targets, coordinates, length, heads, chunks
+        )
+        if RAW_LAYOUT
+        else (panel * _CHUNK + targets) * _RANK + coordinates
+    )
     grad_log = tl.load(
-        grad_log_diagonal
-        + (panel * _CHUNK + targets) * _RANK
-        + coordinates,
+        grad_log_diagonal + grad_log_offset,
         mask=target_active,
         other=0.0,
     )
@@ -1117,6 +1410,10 @@ def _diagonal_coefficient_reverse_kernel(
     grad_theta,
     grad_weights,
     valid_count,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     target_block = tl.program_id(1)
@@ -1125,7 +1422,11 @@ def _diagonal_coefficient_reverse_kernel(
     sources_vector = source_block * 8 + tl.arange(0, 8)
     targets = targets_vector[:, None, None]
     sources = sources_vector[None, :, None]
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     target_active = targets < count
     source_active = sources < count
     weight_accumulator = tl.zeros((4, 8), tl.float32)
@@ -1146,13 +1447,20 @@ def _diagonal_coefficient_reverse_kernel(
         grad_j = grad_j_2d[:, None, :]
         grad_d = grad_d_2d[:, None, :]
         coordinates = coordinate_vector[None, None, :]
+        vector_offset = (
+            _raw_vector_offsets(
+                panel, sources, coordinates, length, heads, chunks
+            )
+            if RAW_LAYOUT
+            else (panel * _CHUNK + sources) * _RANK + coordinates
+        )
         local_u = tl.load(
-            u + (panel * _CHUNK + sources) * _RANK + coordinates,
+            u + vector_offset,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
         local_h = tl.load(
-            h + (panel * _CHUNK + sources) * _RANK + coordinates,
+            h + vector_offset,
             mask=source_active,
             other=0.0,
         ).to(tl.float32)
@@ -1199,11 +1507,20 @@ def _diagonal_leaf_reverse_kernel(
     grad_u,
     grad_h,
     valid_count,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     source = tl.program_id(1)
     coordinates = tl.arange(0, _RANK)
-    source_active = source < tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
+    source_active = source < count
     sum_j = tl.zeros((_RANK,), tl.float32)
     sum_d = tl.zeros((_RANK,), tl.float32)
     for target in tl.static_range(0, _CHUNK):
@@ -1220,31 +1537,39 @@ def _diagonal_leaf_reverse_kernel(
             + (panel * _CHUNK + target) * _RANK
             + coordinates
         )
+    output = (
+        _raw_vector_offsets(
+            panel, source, coordinates, length, heads, chunks
+        )
+        if RAW_LAYOUT
+        else (panel * _CHUNK + source) * _RANK + coordinates
+    )
     local_u = tl.load(
-        u + (panel * _CHUNK + source) * _RANK + coordinates,
+        u + output,
         mask=source_active,
         other=0.0,
     ).to(tl.float32)
     local_h = tl.load(
-        h + (panel * _CHUNK + source) * _RANK + coordinates,
+        h + output,
         mask=source_active,
         other=0.0,
     ).to(tl.float32)
-    output = (panel * _CHUNK + source) * _RANK + coordinates
     previous_u = tl.load(grad_u + output, mask=source_active, other=0.0)
     previous_h = tl.load(grad_h + output, mask=source_active, other=0.0)
-    tl.store(
-        grad_u + output,
-        tl.where(
-            source_active,
-            previous_u + 2.0 * local_u * sum_j + local_h * sum_d,
-            0.0,
-        ),
-    )
-    tl.store(
-        grad_h + output,
-        tl.where(source_active, previous_h + local_u * sum_d, 0.0),
-    )
+    result_u = previous_u + 2.0 * local_u * sum_j + local_h * sum_d
+    result_h = previous_h + local_u * sum_d
+    if RAW_LAYOUT:
+        tl.store(grad_u + output, result_u, mask=source_active)
+        tl.store(grad_h + output, result_h, mask=source_active)
+    else:
+        tl.store(
+            grad_u + output,
+            tl.where(source_active, result_u, 0.0),
+        )
+        tl.store(
+            grad_h + output,
+            tl.where(source_active, result_h, 0.0),
+        )
 
 
 @triton.jit
@@ -1301,13 +1626,21 @@ def _temporal_reverse_kernel(
     grad_weights_action,
     grad_log_decay,
     grad_boundary_mass,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     HAS_ACTION: tl.constexpr,
 ):
     """Reverse the scalar affine normalization in strict token order."""
 
     panel = tl.program_id(0)
     sources = tl.arange(0, _CHUNK)
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     carry_mass = 0.0
     carry_boundary_numerator = 0.0
     carry_row = tl.zeros((_CHUNK,), tl.float32)
@@ -1319,12 +1652,15 @@ def _temporal_reverse_kernel(
         safe_inverse = tl.where(active, inverse, 1.0)
         local_theta = tl.load(theta + panel * _CHUNK + target)
         next_boundary_numerator = local_theta / safe_inverse
+        decay_offset = (
+            _raw_scalar_offsets(panel, target, length, heads, chunks)
+            if RAW_LAYOUT
+            else panel * _CHUNK + target
+        )
         rho = tl.exp(
-            tl.load(
-                log_decay + panel * _CHUNK + target,
-                mask=active,
-                other=0.0,
-            ).to(tl.float32)
+            tl.load(log_decay + decay_offset, mask=active, other=0.0).to(
+                tl.float32
+            )
         )
         if target == 0:
             previous_mass = tl.load(boundary_mass + panel).to(tl.float32)
@@ -1413,10 +1749,17 @@ def _temporal_reverse_kernel(
         )
         next_carry_mass = grad_next_mass * rho
         next_carry_boundary_numerator = grad_next_boundary_numerator * rho
-        tl.store(
-            grad_log_decay + panel * _CHUNK + target,
-            tl.where(active, grad_rho * rho, 0.0),
-        )
+        if RAW_LAYOUT:
+            tl.store(
+                grad_log_decay + decay_offset,
+                grad_rho * rho,
+                mask=active,
+            )
+        else:
+            tl.store(
+                grad_log_decay + decay_offset,
+                tl.where(active, grad_rho * rho, 0.0),
+            )
         carry_mass = tl.where(active, next_carry_mass, carry_mass)
         carry_boundary_numerator = tl.where(
             active,
@@ -1475,10 +1818,20 @@ def _radial_compact_forward_launch(
     boundary_m: torch.Tensor,
     boundary_j: torch.Tensor,
     boundary_d: torch.Tensor,
-    valid_count: torch.Tensor,
+    valid_count: torch.Tensor | None,
     return_saved: bool,
+    *,
+    raw_layout: bool = False,
 ) -> RadialCompactOutput | tuple[RadialCompactOutput, RadialCompactSaved]:
-    panels = u.shape[0]
+    if raw_layout:
+        batch, length, heads, _ = u.shape
+        chunks = triton.cdiv(length, _HOST_CHUNK)
+        panels = batch * heads * chunks
+        metadata = boundary_m
+    else:
+        panels = u.shape[0]
+        length, heads, chunks = _HOST_CHUNK, 1, 1
+        metadata = valid_count
     inverse_mass = torch.empty(
         panels, _HOST_CHUNK, device=u.device, dtype=torch.float32
     )
@@ -1493,10 +1846,14 @@ def _radial_compact_forward_launch(
     _temporal_coefficients_kernel[(panels,)](
         log_decay,
         boundary_m,
-        valid_count,
+        metadata,
         inverse_mass,
         theta,
         weights,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=1,
     )
 
@@ -1526,10 +1883,14 @@ def _radial_compact_forward_launch(
             h,
             boundary_j,
             boundary_d,
-            valid_count,
+            metadata,
             gram_partial,
             boundary_pair_partial,
             boundary_norm_partial,
+            length,
+            heads=heads,
+            chunks=chunks,
+            RAW_LAYOUT=raw_layout,
             ROUTE=route,
             num_warps=4,
             num_stages=2,
@@ -1571,7 +1932,7 @@ def _radial_compact_forward_launch(
         theta,
         weights,
         strength,
-        valid_count,
+        metadata,
         gram_partial,
         boundary_pair_partial,
         boundary_norm_partial,
@@ -1581,6 +1942,10 @@ def _radial_compact_forward_launch(
         saved_gram,
         saved_boundary_pair,
         saved_boundary_norm,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         SAVE_STATISTICS=return_saved,
         num_warps=8,
         num_stages=2,
@@ -1601,8 +1966,12 @@ def _radial_compact_forward_launch(
         boundary_j,
         boundary_d,
         strength,
-        valid_count,
+        metadata,
         diagonal,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=4,
     )
     output = RadialCompactOutput(
@@ -1709,6 +2078,34 @@ def radial_compact_forward(
         )
 
 
+def _radial_compact_forward_bthr_trusted(
+    u: torch.Tensor,
+    h: torch.Tensor,
+    log_decay: torch.Tensor,
+    strength: torch.Tensor,
+    boundary_m: torch.Tensor,
+    boundary_j: torch.Tensor,
+    boundary_d: torch.Tensor,
+    *,
+    return_saved: bool,
+) -> RadialCompactOutput | tuple[RadialCompactOutput, RadialCompactSaved]:
+    """Production raw-stride entry; outputs retain panel-major chunk ownership."""
+
+    with torch.cuda.device(u.device):
+        return _radial_compact_forward_launch(
+            u,
+            h,
+            log_decay,
+            strength,
+            boundary_m,
+            boundary_j,
+            boundary_d,
+            None,
+            return_saved,
+            raw_layout=True,
+        )
+
+
 def _radial_compact_reverse_launch(
     u: torch.Tensor,
     h: torch.Tensor,
@@ -1721,7 +2118,7 @@ def _radial_compact_reverse_launch(
     saved: RadialCompactSaved,
     grad_radial_scale: torch.Tensor,
     grad_log_diagonal: torch.Tensor,
-    valid_count: torch.Tensor,
+    valid_count: torch.Tensor | None,
     grad_theta_action: torch.Tensor | None,
     grad_weights_action: torch.Tensor | None,
     accumulated_gradients: tuple[
@@ -1731,19 +2128,35 @@ def _radial_compact_reverse_launch(
         torch.Tensor,
     ]
     | None = None,
+    *,
+    raw_layout: bool = False,
 ) -> RadialCompactGradients:
-    panels = u.shape[0]
+    if raw_layout:
+        batch, length, heads, _ = u.shape
+        chunks = triton.cdiv(length, _HOST_CHUNK)
+        panels = batch * heads * chunks
+        metadata = boundary_m
+    else:
+        panels = u.shape[0]
+        length, heads, chunks = _HOST_CHUNK, 1, 1
+        metadata = valid_count
     grad_norm = torch.empty_like(saved.radial_norm)
-    grad_strength_radial = torch.empty_like(strength)
+    grad_strength_radial = torch.empty(
+        panels, device=u.device, dtype=torch.float32
+    )
     _radial_scalar_reverse_kernel[(panels,)](
         saved.radial_norm,
         output.radial_scale,
         output.radial_q2,
         strength,
-        valid_count,
+        metadata,
         grad_radial_scale,
         grad_norm,
         grad_strength_radial,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=4,
     )
 
@@ -1764,7 +2177,7 @@ def _radial_compact_reverse_launch(
         output.theta,
         output.weights,
         grad_norm,
-        valid_count,
+        metadata,
         saved.gram,
         saved.boundary_pair,
         saved.boundary_norm,
@@ -1772,6 +2185,10 @@ def _radial_compact_reverse_launch(
         grad_weights_partial,
         boundary_coefficient,
         local_coefficient,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=8,
         num_stages=2,
     )
@@ -1786,7 +2203,7 @@ def _radial_compact_reverse_launch(
         num_stages=2,
     )
 
-    vector_shape = (panels, _HOST_CHUNK, _HOST_RANK)
+    vector_shape = u.shape
     add_to_grad = accumulated_gradients is not None
     if accumulated_gradients is None:
         grad_u = torch.empty(vector_shape, device=u.device, dtype=torch.float32)
@@ -1801,9 +2218,13 @@ def _radial_compact_reverse_launch(
         boundary_j,
         boundary_d,
         boundary_coefficient,
-        valid_count,
+        metadata,
         grad_u,
         grad_h,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         ADD_TO_GRAD=add_to_grad,
         num_warps=4,
         num_stages=3,
@@ -1816,9 +2237,13 @@ def _radial_compact_reverse_launch(
         output.theta,
         grad_norm,
         boundary_coefficient,
-        valid_count,
+        metadata,
         grad_boundary_j,
         grad_boundary_d,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         ADD_TO_GRAD=add_to_grad,
         num_warps=4,
         num_stages=2,
@@ -1827,9 +2252,13 @@ def _radial_compact_reverse_launch(
         u,
         h,
         local_coefficient,
-        valid_count,
+        metadata,
         grad_u,
         grad_h,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=4,
         num_stages=2,
     )
@@ -1837,9 +2266,13 @@ def _radial_compact_reverse_launch(
         u,
         h,
         local_coefficient,
-        valid_count,
+        metadata,
         grad_u,
         grad_h,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=4,
     )
     grad_inverse = torch.zeros_like(output.inverse_mass)
@@ -1867,11 +2300,15 @@ def _radial_compact_reverse_launch(
         boundary_j,
         boundary_d,
         strength,
-        valid_count,
+        metadata,
         grad_log_diagonal,
         grad_moment_j,
         grad_moment_d,
         grad_strength_diagonal_partial,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=4,
     )
     grad_theta_diagonal = torch.empty_like(output.theta)
@@ -1885,7 +2322,11 @@ def _radial_compact_reverse_launch(
         grad_moment_d,
         grad_theta_diagonal,
         grad_weights_diagonal,
-        valid_count,
+        metadata,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=2,
     )
     _diagonal_leaf_reverse_kernel[(panels, _HOST_CHUNK)](
@@ -1896,7 +2337,11 @@ def _radial_compact_reverse_launch(
         grad_moment_d,
         grad_u,
         grad_h,
-        valid_count,
+        metadata,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=4,
     )
     _diagonal_boundary_reverse_kernel[(panels,)](
@@ -1913,7 +2358,7 @@ def _radial_compact_reverse_launch(
     _temporal_reverse_kernel[(panels,)](
         log_decay,
         boundary_m,
-        valid_count,
+        metadata,
         output.inverse_mass,
         output.theta,
         output.weights,
@@ -1926,11 +2371,17 @@ def _radial_compact_reverse_launch(
         grad_weights_action if grad_weights_action is not None else output.weights,
         grad_log_decay,
         grad_boundary_m,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         HAS_ACTION=grad_theta_action is not None,
         num_warps=1,
     )
 
-    grad_strength = torch.empty_like(strength)
+    grad_strength = torch.empty(
+        panels, device=u.device, dtype=torch.float32
+    )
     _combine_strength_reverse_kernel[(panels,)](
         grad_strength_radial,
         grad_strength_diagonal_partial,
@@ -2145,7 +2596,7 @@ def _radial_compact_reverse_accumulate_trusted(
     saved: RadialCompactSaved,
     grad_radial_scale: torch.Tensor,
     grad_log_diagonal: torch.Tensor,
-    valid_count: torch.Tensor,
+    valid_count: torch.Tensor | None,
     grad_theta_action: torch.Tensor,
     grad_weights_action: torch.Tensor,
     grad_u: torch.Tensor,
@@ -2172,6 +2623,7 @@ def _radial_compact_reverse_accumulate_trusted(
             grad_theta_action,
             grad_weights_action,
             (grad_u, grad_h, grad_boundary_j, grad_boundary_d),
+            raw_layout=u.ndim == 4,
         )
 
 __all__ = [

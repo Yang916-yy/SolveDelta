@@ -303,10 +303,16 @@ D\leftarrow\lambda D+uh^T.
 
 - [x] The FP32 resident tile plus low-precision `safe_dot` update is structurally
   compatible with SolveDelta moment generation.
-- [ ] Reuse it only inside frame/radial tile production. Do not replace the
+- [x] Reuse its paired 64-rank tile only inside frame/radial tile production.
+  The geometry scan remains unchanged.
+- [x] Do not replace the
   already fast exact affine boundary scan without a measured reason.
-- [ ] Preserve separate J and D states and their separate nonlinear chart maps.
-- [ ] Preserve mass normalization and update-before-read token order.
+- [x] Preserve separate J and D states and their separate nonlinear chart maps.
+- [x] Preserve mass normalization and update-before-read token order.
+
+The adopted four-warp tile reduced the target summary kernel from about
+`28.3 us` to `23.2 us` and its transpose from about `126.1 us` to `44.4 us`.
+An eight-warp form was slower and was deleted.
 
 ### Radial Gram and pair reductions
 
@@ -384,12 +390,14 @@ Upstream:
 - [x] The native recurrence maps directly as
   `k=D_tail`, `w=Y`, `u=U_z`, `v_new=U_z-Y@S`, with the existing vector
   `G_last`; no DPLR staging adapter is algebraically required.
-- [ ] Specialize the load and `tl.dot` bodies to these native names and signs;
-  do not call the allocation-owning FLA wrapper.
-- [ ] Preserve FP32 state at every chunk boundary and both initial/final-state
+- [x] A 64+64-rank specialization was implemented and A/B tested without the
+  allocation-owning FLA wrapper, then deleted: one 128-rank reverse block took
+  about `47.7 us`, while two 64-rank blocks took about `110.0 us` and worsened
+  complete F+B.
+- [x] Preserve FP32 state at every chunk boundary and both initial/final-state
   cotangents.
-- [ ] Benchmark against the current dedicated `chunk_state.py`; do not assume
-  the generic FLA kernel is faster at `r=d_v=128,C=32`.
+- [x] Keep the current dedicated 128-rank `chunk_state.py` after the matched
+  target-profile rejection above.
 
 ### Output contraction and reverse
 
@@ -402,12 +410,15 @@ Upstream:
 
 - [x] The `C x r` state term and `C x C` residual term already use the desired
   `tl.dot` structure upstream.
-- [ ] Adapt the contraction body to native `Q_gamma`, `A_qd`, state boundary,
-  and residual tensors; do not retain DPLR argument names or unused terms.
+- [x] Adapt the `A_qd @ residual` forward and exact transpose to native tensors
+  with `tl.dot`; no DPLR argument names or unused terms remain.
 - [ ] A/B a separate output kernel against state-plus-output fusion. The latter
   loses chunk-parallel CTAs and is not presumed faster.
-- [ ] Implement output reverse with the same operand rounding and causal mask
+- [x] Implement output reverse with the same operand rounding and causal mask
   as forward.
+
+This change moved complete target-profile timing from about
+`1.753/6.943 ms` to `1.669/6.402 ms` forward/F+B and is retained.
 
 ### Fused state/output and streaming reverse
 
@@ -470,18 +481,23 @@ Upstream:
   [`ssd_combined.py`](https://github.com/state-spaces/mamba/blob/e9594ce1c732d97440f0332fdc43170a2294dbfa/mamba_ssm/ops/triton/ssd_combined.py)
 - FLA common state/output kernels linked above
 
-The current `native_chunk.py` uses `_panelize` to pad with `torch.cat`, then
-`permute(...).contiguous()`, and separately materializes `valid_count` and an
-expanded `panel_strength`. Mamba and FLA instead pass source strides and derive
+The displaced `native_chunk.py` path used `_panelize` to pad with `torch.cat`,
+then `permute(...).contiguous()`, and separately materialized `valid_count` and
+an expanded `panel_strength`. Mamba and FLA instead pass source strides and derive
 `batch/head/chunk/token` offsets in the consumer kernel, copying only when no
 supported contiguous dimension exists.
 
 - [x] The native `[B,T,H,r]` layout has a contiguous `r` dimension and is
   directly addressable by every C32 frame/radial tile.
-- [ ] Make radial and strict owners consume original strides and a scalar
+- [x] Make radial and strict owners consume original strides and a structural
   tail mask; remove the panel HBM round trip and expanded metadata tensors.
-- [ ] Keep a copy only when an actual unsupported input stride reaches the
+- [x] Keep a copy only when an actual unsupported input stride reaches the
   public boundary, and measure that path separately from the contiguous target.
+
+The production frame now derives batch/head/chunk offsets directly from panel
+ids. Target forward/F+B changed from about `1.665/6.354 ms` to
+`1.517--1.535/5.969--6.071 ms`; `aten::copy_` fell from 16 launches and about
+`52.7 us` to five launches and about `16.4 us`.
 
 ### Gate, sigmoid, and local cumsum fusion
 
@@ -492,18 +508,25 @@ Upstream, FLA main `3e61322b`:
 - [`fused_beta_sigmoid`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/common/gate.py)
 - vector [`chunk_local_cumsum`](https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/utils/cumsum.py)
 
-The layer currently forms erase/write sigmoid panels and both log-decays with
-ordinary PyTorch pointwise graphs, then launches a separate native vector
+The displaced layer formed erase/write sigmoid panels and both log-decays with
+ordinary PyTorch pointwise graphs, then launched a separate native vector
 cumsum. The FLA blocks provide the same FP32 `exp/softplus/sigmoid`, local
 cumsum, and strict reverse formulas.
 
 - [x] The scalar geometry gate and vector associative gate formulas match the
   corresponding FLA producer blocks after substituting native parameters.
-- [ ] Fuse gate production with local cumsum and its reverse; fuse the two
-  `2*sigmoid` panels only if the complete layer profile shows a launch-bound
-  frontend.
-- [ ] Preserve FP32 gate evaluation and output. This reuse is scheduling only;
+- [x] Fuse the two `2*sigmoid` panels and specialize the scalar/vector gate
+  forward and fixed-tree reverse under one SolveDelta autograd owner.
+- [x] Keep the existing vector cumsum owner: it measures only about
+  `7.2/9.5 us` forward/reverse, so crossing the operator ABI to fuse it did not
+  justify a rewrite.
+- [x] Preserve FP32 gate evaluation and output. This reuse is scheduling only;
   it must not adopt FLA's optional bounded-gate semantics.
+
+Direct use of FLA's general wrappers improved gate forward but regressed its
+wall-clock F+B from about `0.418 ms` to `0.583 ms` and was deleted. The retained
+specialization measures about `0.055 ms` forward and `0.147 ms` F+B versus
+`0.154/0.393 ms` for the original PyTorch graph.
 
 ### Normalization
 
@@ -513,8 +536,9 @@ Upstream:
 
 - [x] FLA already supports FP32 reduction from BF16 input and direct FP16
   normalized output, which is SolveDelta's declared private-panel boundary.
-- [ ] Prefer a three-panel specialization for `u/q/key` over three wrapper
-  calls. The current total is only about `70 us`, so do this after state/output.
+- [x] Use one three-panel `u/q/key` forward and one strict-transpose backward
+  launch, with a single `[3,N]` FP32 inverse-norm cache and no zero cotangent
+  materialization.
 
 ### Conv4 and recurrent cache
 
@@ -528,11 +552,18 @@ final states, `dfinal_state`, `dinitial_state`, and deterministic or atomic
 weight-gradient reductions. This closes the final-cache VJP gap present in
 FLA 0.5.2's Triton wrapper.
 
-- [x] It can replace the manual `cat(...)[...,-4:]` final-cache construction
+- [x] It replaces the manual `cat(...)[...,-4:]` final-cache construction
   in the no-reset CUDA layer path without changing conv4 semantics.
-- [ ] Install and A/B the CUDA backend for the complete layer, including cache
+- [x] Install and A/B the CUDA backend, including cache
   cotangents. This is not part of the core-operator timing and cannot close the
   current frame/state gap by itself.
+
+The continuation cache is now the algebraically minimal `width-1=3` raw
+inputs required by upstream's exact initial/final-state ABI. At
+`B=1,T=1024,D=1024`, one branch changed from about `0.012/0.285 ms` for FLA
+Triton plus a manual cache VJP to `0.008/0.118 ms` for the CUDA
+forward-plus-complete-state VJP. Outputs and final states were bitwise equal in
+the matched BF16 probe.
 
 ### Reduction ownership
 
@@ -544,9 +575,11 @@ Upstream:
 
 - [x] The upstream policy supports both FP32 atomics and deterministic
   per-tile workspaces followed by a fixed reduction, selected structurally.
-- [ ] Reuse the allocation/finalization pattern for route or coordinate-block
-  cotangents. The fixed SolveDelta repeatability and complete-path gates, not a
-  blanket preference, choose between atomics and workspace reduction.
+- [x] A/B the pattern for strict coordinate-block and decay-parameter
+  cotangents. Strict atomic replay had `rho_repeat` about `1.2e-7` but did not
+  improve complete F+B; the later decay atomic had at most `1.5e-7` repeat
+  drift and measured `0.149 ms` versus `0.147 ms` for the fixed tree. Both
+  atomic implementations were deleted, so production remains deterministic.
 
 ### Lower-priority CUDA templates
 
@@ -558,6 +591,16 @@ and launch chaining. The Blackwell SSD example is SM100 `tcgen05/TMEM` code,
 not a directly reusable SM120 kernel. Previous SolveDelta CuTe broad-action
 attempts also lost occupancy, so no CUTLASS/CuTe port precedes the direct FLA
 state/output and original-stride rewrites.
+
+The post-rewrite screen found no directly reusable SM120 back-to-back grouped
+kernel. CUTLASS's grouped SM120 collectives schedule independent GEMMs, while
+the available register-resident back-to-back grouped example is SM80. The
+SolveDelta chain includes factor recurrence, a sequential diagonal solve, and
+tile-to-tile primal/dual dependencies. Its current resident action already
+uses `42.6 KiB` shared with `__launch_bounds__(512,2)`; the rejected CuTe form
+used `50.8 KiB` and fell to one CTA per SM. A separate grouped launch would
+also materialize factors and pointer metadata, so it was rejected before a
+production port rather than retained as another backend.
 
 ## Explicit Non-Reuse
 

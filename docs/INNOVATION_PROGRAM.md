@@ -56,11 +56,12 @@ SiLU independently to the projected query, packed edit keys, and packed edit
 values before head reshape and normalization. This frontend is enabled by
 default and has one structural off switch. Geometry features, drives, decay,
 erase/write logits, and output gates are not convolved. Recurrent layer
-state therefore owns the operator state plus the three four-token convolution
+state therefore owns the operator state plus three minimal convolution
 caches; convolution does not alter the four-tensor operator recurrence below.
-For a batch of size `B`, those caches are `C_q:[B,Hr,4]`,
-`C_k:[B,HKr,4]`, and `C_v:[B,HKd_v,4]`, with the last axis ordered oldest to
-newest. They store raw projected inputs in the projection activation dtype,
+For a batch of size `B`, the minimal conv4 continuation caches are
+`C_q:[B,Hr,3]`, `C_k:[B,HKr,3]`, and `C_v:[B,HKd_v,3]`, with
+the last axis ordered oldest to newest. They store raw projected inputs in
+the projection activation dtype,
 are zero-initialized, hold on invalid tokens, and reset immediately before a
 valid reset token is shifted in. Their gradient contract includes dependence
 through both convolution outputs and returned final caches. When the structural

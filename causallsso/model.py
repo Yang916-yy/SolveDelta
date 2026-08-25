@@ -37,7 +37,8 @@ class _CausalShortConvolution(nn.Conv1d):
         cache: torch.Tensor | None = None,
         output_final_state: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        expected_cache = (x.shape[0], x.shape[-1], 4)
+        state_width = self.kernel_size[0] - 1
+        expected_cache = (x.shape[0], x.shape[-1], state_width)
         if cache is not None and cache.shape != expected_cache:
             raise ValueError(
                 f"short-convolution cache must have shape {expected_cache}, "
@@ -45,36 +46,45 @@ class _CausalShortConvolution(nn.Conv1d):
             )
         if x.device.type == "cuda":
             try:
-                from fla.modules.conv.causal_conv1d import causal_conv1d
+                from causal_conv1d import causal_conv1d_fn
             except ImportError as error:
                 raise RuntimeError(
-                    "CUDA short convolution requires flash-linear-attention"
+                    "CUDA short convolution requires causal-conv1d>=1.7.0"
                 ) from error
-            output, _ = causal_conv1d(
-                x=x,
+            transposed = x.transpose(1, 2)
+            if transposed.stride(0) % 8 or transposed.stride(2) % 8:
+                transposed = x.contiguous().transpose(1, 2)
+            if cache is not None and cache.stride(1) != 1:
+                cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
+            result = causal_conv1d_fn(
+                x=transposed,
                 weight=self.weight[:, 0, :],
-                initial_state=cache,
-                output_final_state=False,
+                initial_states=cache,
+                return_final_states=output_final_state,
                 activation="silu",
-                backend="triton",
             )
-            if not output_final_state:
-                return output, None
-            if cache is None:
-                cache = x.new_zeros(expected_cache)
-            # FLA 0.5.2's Triton convolution has the correct output VJP, but
-            # its final-state VJP omits part of d(final_state)/dx. This exact
-            # four-token slice keeps the fast convolution while restoring the
-            # recurrent-state gradient contract.
-            final_state = torch.cat((cache, x.transpose(1, 2)), dim=-1)[..., -4:]
-            return output, final_state.contiguous()
+            if output_final_state:
+                output, final_state = result
+                return output.transpose(1, 2), final_state
+            return result.transpose(1, 2), None
 
         batch, length, width = x.shape
-        state = x.new_zeros(batch, width, 4) if cache is None else cache
+        state = (
+            x.new_zeros(batch, width, state_width) if cache is None else cache
+        )
         outputs = []
         for token in range(length):
-            state = torch.cat((state[..., 1:], x[:, token].unsqueeze(-1)), dim=-1)
-            outputs.append(F.silu(torch.einsum("bdw,dw->bd", state, self.weight[:, 0, :])))
+            window = torch.cat(
+                (state, x[:, token].unsqueeze(-1)), dim=-1
+            )
+            outputs.append(
+                F.silu(
+                    torch.einsum(
+                        "bdw,dw->bd", window, self.weight[:, 0, :]
+                    )
+                )
+            )
+            state = window[..., 1:]
         return torch.stack(outputs, dim=1), state if output_final_state else None
 
 
@@ -148,6 +158,15 @@ class SolveDelta(nn.Module):
             raise NotImplementedError(
                 "the native BF16 SolveDelta path requires r=128 and K=1"
             )
+        if (
+            use_native
+            and self.config.use_short_conv
+            and (h_count * v_dim) % 8
+        ):
+            raise NotImplementedError(
+                "the native CUDA conv4 path requires the projected value "
+                "width H*d_v to be divisible by 8"
+            )
         if use_native and (valid_mask is not None or reset_mask is not None):
             raise NotImplementedError(
                 "the native BF16 SolveDelta path does not yet support "
@@ -192,40 +211,25 @@ class SolveDelta(nn.Module):
         keys = key_raw.view(batch, length, h_count, edits, r)
         values = value_raw.view(batch, length, h_count, edits, v_dim)
         if use_native:
+            from .ops.fused_gates import fused_native_solvedelta_gates
+
             u = u.to(torch.bfloat16)
             h = h.to(torch.bfloat16)
             q = q.to(torch.bfloat16)
             keys = keys.to(torch.bfloat16)
             values = values.to(torch.bfloat16)
-            erase = (
-                2.0
-                * torch.sigmoid(
-                    erase_raw.view(batch, length, h_count, edits, r).float()
-                )
-            ).to(torch.bfloat16)
-            write = (
-                2.0
-                * torch.sigmoid(
+            erase, write, geometry_log_decay, associative_log_decay = (
+                fused_native_solvedelta_gates(
+                    erase_raw.view(batch, length, h_count, edits, r),
                     write_raw.view(
                         batch, length, h_count, edits, v_dim
-                    ).float()
-                )
-            ).to(torch.bfloat16)
-            geometry_log_decay = -torch.exp(
-                self.geometry_log_rate.float()
-            ).view(1, 1, h_count)
-            geometry_log_decay = geometry_log_decay * F.softplus(
-                geometry_raw.float()
-                + self.geometry_decay_bias.float().view(1, 1, h_count)
-            )
-            associative_raw = view_head(associative_raw.float(), r)
-            associative_log_decay = -torch.exp(
-                self.associative_log_rate.float()
-            ).view(1, 1, h_count, r)
-            associative_log_decay = associative_log_decay * F.softplus(
-                associative_raw
-                + self.associative_decay_bias.float().view(
-                    1, 1, h_count, r
+                    ),
+                    geometry_raw,
+                    associative_raw.view(batch, length, h_count, r),
+                    self.geometry_log_rate,
+                    self.associative_log_rate,
+                    self.geometry_decay_bias,
+                    self.associative_decay_bias,
                 )
             )
             strength = torch.sigmoid(self.geometry_strength_logit.float())
@@ -313,10 +317,11 @@ class SolveDelta(nn.Module):
 
         batch, length, width = x.shape
         kernel_size = convolution.kernel_size[0]
+        state_width = kernel_size - 1
         if initial_cache is None:
-            cache = x.new_zeros(batch, width, kernel_size)
+            cache = x.new_zeros(batch, width, state_width)
         else:
-            expected = (batch, width, kernel_size)
+            expected = (batch, width, state_width)
             if initial_cache.shape != expected:
                 raise ValueError(
                     f"short-convolution cache must have shape {expected}, "
@@ -335,11 +340,14 @@ class SolveDelta(nn.Module):
             valid = valid_mask[:, token]
             reset = reset_mask[:, token] & valid
             cache = torch.where(reset[:, None, None], torch.zeros_like(cache), cache)
-            candidate = torch.cat((cache[..., 1:], x[:, token].unsqueeze(-1)), dim=-1)
-            preactivation = torch.einsum("bdw,dw->bd", candidate, weight)
+            window = torch.cat(
+                (cache, x[:, token].unsqueeze(-1)), dim=-1
+            )
+            preactivation = torch.einsum("bdw,dw->bd", window, weight)
             if bias is not None:
                 preactivation = preactivation + bias
             output = F.silu(preactivation)
             outputs.append(torch.where(valid[:, None], output, torch.zeros_like(output)))
+            candidate = window[..., 1:]
             cache = torch.where(valid[:, None, None], candidate, cache)
         return torch.stack(outputs, dim=1), cache if output_final_state else None

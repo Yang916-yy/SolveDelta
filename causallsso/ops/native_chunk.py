@@ -16,8 +16,8 @@ from causallsso.ops.paired_wy import paired_wy_backward, paired_wy_forward
 from causallsso.ops.radial_compact import (
     RadialCompactOutput,
     RadialCompactSaved,
+    _radial_compact_forward_bthr_trusted,
     _radial_compact_reverse_accumulate_trusted,
-    radial_compact_forward,
 )
 from causallsso.ops.strict_chart import _strict_chart_direct_transpose_trusted
 from causallsso.ops.triton_geometry import (
@@ -102,50 +102,6 @@ def _load_chunk_library() -> None:
     )
 
 
-def _panelize(tensor: torch.Tensor, padded_length: int) -> torch.Tensor:
-    batch, length, heads = tensor.shape[:3]
-    if length != padded_length:
-        tensor = torch.cat(
-            (
-                tensor,
-                tensor.new_zeros(
-                    batch,
-                    padded_length - length,
-                    heads,
-                    *tensor.shape[3:],
-                ),
-            ),
-            dim=1,
-        )
-    chunks = padded_length // _CHUNK
-    tail = tensor.shape[3:]
-    return (
-        tensor.reshape(batch, chunks, _CHUNK, heads, *tail)
-        .permute(0, 3, 1, 2, *range(4, 4 + len(tail)))
-        .reshape(batch * heads * chunks, _CHUNK, *tail)
-        .contiguous()
-    )
-
-
-def _valid_counts(
-    batch: int,
-    length: int,
-    heads: int,
-    device: torch.device,
-) -> torch.Tensor:
-    chunks = (length + _CHUNK - 1) // _CHUNK
-    count = (
-        length
-        - torch.arange(chunks, device=device, dtype=torch.int32) * _CHUNK
-    ).clamp_(min=1, max=_CHUNK)
-    return (
-        count[None, None]
-        .expand(batch, heads, chunks)
-        .reshape(batch * heads * chunks)
-        .contiguous()
-    )
-
-
 def _cotangent(
     gradient: torch.Tensor | None,
     reference: torch.Tensor,
@@ -180,41 +136,31 @@ def _finish_frame_backward(
 
     batch, length, heads, rank = u.shape
     chunks = (length + _CHUNK - 1) // _CHUNK
-    padded_length = chunks * _CHUNK
     panels = batch * heads * chunks
     lower_left, lower_right, upper_left, upper_right = descriptor_bundle.unbind(0)
 
-    panel_u = _panelize(u, padded_length)
-    panel_h = _panelize(h, padded_length)
     panel_boundary_j = boundary_j.reshape(panels, rank, rank)
     panel_boundary_d = boundary_d.reshape(panels, rank, rank)
-    valid_count = _valid_counts(batch, length, heads, u.device)
     strict = _strict_chart_direct_transpose_trusted(
         lower_left,
         lower_right,
         upper_left,
         upper_right,
-        panel_u,
-        panel_h,
+        u,
+        h,
         panel_boundary_j,
         panel_boundary_d,
         frame.theta,
         frame.weights,
         frame.radial_scale,
-        valid_count,
+        None,
     )
 
-    panel_strength = (
-        geometry_strength[None, :, None]
-        .expand(batch, heads, chunks)
-        .reshape(panels)
-        .contiguous()
-    )
     radial = _radial_compact_reverse_accumulate_trusted(
-        panel_u,
-        panel_h,
-        _panelize(geometry_log_decay[..., None], padded_length).squeeze(-1),
-        panel_strength,
+        u,
+        h,
+        geometry_log_decay,
+        geometry_strength,
         boundary_m.reshape(panels),
         panel_boundary_j,
         panel_boundary_d,
@@ -233,8 +179,8 @@ def _finish_frame_backward(
             frame.radial_boundary_norm,
         ),
         strict.grad_radial_scale,
-        _panelize(grad_log_diagonal, padded_length),
-        valid_count,
+        grad_log_diagonal,
+        None,
         strict.grad_theta,
         strict.grad_weights,
         strict.grad_u,
@@ -288,24 +234,15 @@ class _NativeChunkSolveWY(torch.autograd.Function):
         inclusive_decay = decay_cumsum_forward(associative_log_decay)
         batch, length, heads, rank = u.shape
         chunks = (length + _CHUNK - 1) // _CHUNK
-        padded_length = chunks * _CHUNK
         panels = batch * heads * chunks
-        valid_count = _valid_counts(batch, length, heads, u.device)
-        panel_strength = (
-            geometry_strength[None, :, None]
-            .expand(batch, heads, chunks)
-            .reshape(panels)
-            .contiguous()
-        )
-        radial, radial_saved = radial_compact_forward(
-            _panelize(u, padded_length),
-            _panelize(h, padded_length),
-            _panelize(geometry_log_decay[..., None], padded_length).squeeze(-1),
-            panel_strength,
+        radial, radial_saved = _radial_compact_forward_bthr_trusted(
+            u,
+            h,
+            geometry_log_decay,
+            geometry_strength,
             boundary.m.reshape(panels),
             boundary.J.reshape(panels, rank, rank),
             boundary.D.reshape(panels, rank, rank),
-            valid_count=valid_count,
             return_saved=True,
         )
         alpha0 = radial.theta[:, 0].contiguous()
@@ -519,11 +456,9 @@ class _NativeChunkSolveWY(torch.autograd.Function):
             _cotangent(grad_final_j, initial_j, dtype=torch.float32),
             _cotangent(grad_final_d, initial_d, dtype=torch.float32),
             _CHUNK,
-            panel_gradients=(
-                frame_grad.u,
-                frame_grad.h,
-                frame_grad.log_decay,
-            ),
+            local_grad_u=frame_grad.u,
+            local_grad_h=frame_grad.h,
+            local_grad_log_decay=frame_grad.log_decay,
         )
         gradients = (
             scan_grad[0],

@@ -9,7 +9,9 @@ from causallsso.model import _CausalShortConvolution
 
 
 _NATIVE_AVAILABLE = (
-    torch.cuda.is_available() and importlib.util.find_spec("fla") is not None
+    torch.cuda.is_available()
+    and importlib.util.find_spec("fla") is not None
+    and importlib.util.find_spec("causal_conv1d") is not None
 )
 
 
@@ -40,9 +42,9 @@ def test_model_owns_projections_and_supports_non_128_reference_width() -> None:
     assert state.operator.m.shape == (2, 3)
     assert state.operator.J.shape == state.operator.D.shape == (2, 3, 5, 5)
     assert state.operator.S.shape == (2, 3, 5, 4)
-    assert state.conv_q.shape == (2, 15, 4)
-    assert state.conv_k.shape == (2, 30, 4)
-    assert state.conv_v.shape == (2, 24, 4)
+    assert state.conv_q.shape == (2, 15, 3)
+    assert state.conv_k.shape == (2, 30, 3)
+    assert state.conv_v.shape == (2, 24, 3)
     (output.square().mean() + state.operator.S.square().mean()).backward()
     assert torch.isfinite(hidden.grad).all()
 
@@ -166,20 +168,20 @@ def test_short_conv_matches_explicit_causal_formula() -> None:
     ).transpose(1, 2)
     expected = torch.nn.functional.silu(expected)
     torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(state, x[:, -4:].transpose(1, 2))
+    torch.testing.assert_close(state, x[:, -3:].transpose(1, 2))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_short_conv_matches_explicit_recurrence_and_gradients() -> None:
     torch.manual_seed(21)
-    batch, length, width = 2, 7, 5
+    batch, length, width = 2, 7, 8
     convolution = _CausalShortConvolution(width).cuda().float()
     x = torch.randn(
         batch, length, width, device="cuda", dtype=torch.float32,
         requires_grad=True,
     )
     cache = torch.randn(
-        batch, width, 4, device="cuda", dtype=torch.float32,
+        batch, width, 3, device="cuda", dtype=torch.float32,
         requires_grad=True,
     )
     output_grad = torch.randn_like(x)
@@ -199,13 +201,14 @@ def test_cuda_short_conv_matches_explicit_recurrence_and_gradients() -> None:
     state = reference_cache
     outputs = []
     for token in range(length):
-        state = torch.cat(
-            (state[..., 1:], reference_x[:, token].unsqueeze(-1)), dim=-1
+        window = torch.cat(
+            (state, reference_x[:, token].unsqueeze(-1)), dim=-1
         )
         preactivation = torch.einsum(
-            "bdw,dw->bd", state, reference_weight[:, 0, :]
+            "bdw,dw->bd", window, reference_weight[:, 0, :]
         )
         outputs.append(torch.nn.functional.silu(preactivation))
+        state = window[..., 1:]
     expected = torch.stack(outputs, dim=1)
     expected_loss = (expected * output_grad).sum() + (state * state_grad).sum()
     expected_grads = torch.autograd.grad(

@@ -28,6 +28,9 @@ and generalized Delta Rule DPLR/WY wide-RHS application and matrix reverse.
 The local specialization uses SolveDelta's contiguous panel layout, keeps the
 inverse private to one kernel, applies it to the native edit/value RHS panels,
 and fuses the `write * value` pullback without importing FLA's model ABI.
+[`causallsso/ops/fused_gates.py`](causallsso/ops/fused_gates.py) specializes
+FLA's paired beta-sigmoid and scalar/vector GDN gate formulas, tiling, and
+strict VJP to one SolveDelta owner while omitting the general dispatch ABI.
 
 > MIT License
 >
@@ -41,6 +44,10 @@ and `wu_fwd_kernel` in
 <https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/generalized_delta_rule/dplr/wy_fast_fwd.py>
 and `prepare_wy_repr_bwd_kernel` in
 <https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/generalized_delta_rule/dplr/wy_fast_bwd.py>.
+The gate sources were reviewed at commit `3e61322b` in
+<https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/common/gate.py>
+and
+<https://github.com/fla-org/flash-linear-attention/blob/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/gated_delta_rule/gate.py>.
 
 This notice applies only to the identified third-party-derived portions. No
 repository-wide license has been selected for the remaining SolveDelta code.

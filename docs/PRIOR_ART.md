@@ -153,13 +153,12 @@ three independent depthwise causal `conv4`, bias-free, SiLU branches over the
 projected query, packed keys, and packed values. Convolution precedes head
 reshape and query/key normalization; geometry and gate branches bypass it.
 SolveDelta adopts exactly that fixed frontend with one structural enable switch
-and carries all three caches in its layer state. A local output/state/VJP audit
-of FLA's Triton causal convolution found that its main output VJP is correct,
-but a cotangent on the returned final cache omits part of
-`d(final_state)/dx`. SolveDelta therefore asks FLA only for the convolution
-output and constructs the exact four-token final cache by slicing
-`concat(initial_cache, x)`; the CUDA parity test covers output, cache, input,
-initial-cache, and weight gradients.
+and carries all three minimal caches in its layer state. A local output/state/VJP
+audit of FLA's Triton causal convolution found that its main output VJP is
+correct, but a cotangent on the returned final cache omits part of
+`d(final_state)/dx`. The later `causal-conv1d` 1.7.0 integration recorded below
+supersedes that wrapper: its CUDA kernel owns the exact three-input conv4
+continuation cache and complete final-state VJP.
 
 ## Mixed precision and Tensor Core arithmetic
 
@@ -712,13 +711,13 @@ matrix-free action only accelerates one algebraic subexpression; it neither
 removes SolveDelta's additional geometry nor gives the surrounding kernels
 MESA's residency, precision, or launch schedule.
 
-The audit found a concrete non-core bottleneck. SolveDelta's current output
+The audit found a concrete non-core bottleneck. At that checkpoint the output
 kernel computes `A_qd @ residual` through 32 static `where/sum` selections and
 used about `131.5 us`; FLA's Tensor-Core `chunk_gla_fwd_kernel_o` probe used
 about `7.2 us`. Current state forward/reverse used about `59.2/335.9 us`, while
 FLA common state forward/transpose probes used about `50.2/75.9 us`. Paired WY
 itself used only about `21/36 us` forward/reverse. The next engineering target
-is consequently the state/output exterior and its transpose, not another WY
+was consequently the state/output exterior and its transpose, not another WY
 micro-optimization.
 
 FLA main was inspected at
@@ -756,6 +755,68 @@ slice only with the latest CUDA convolution's now-complete state VJP; and keep
 CUTLASS back-to-back/grouped examples as lower-priority scheduling references.
 The function-level inventory and adoption gates are in
 `docs/UPSTREAM_REUSE.md`.
+
+## Exterior and frontend reuse decisions
+
+The prioritized reuse pass then implemented and measured each item at
+`B=1,T=1024,H=8,r=d_v=128,C=32`. FLA's output `tl.dot` schedule replaced the
+32 static `A_qd` selections in both forward and exact transpose, moving the
+complete operator from about `1.753/6.943 ms` to `1.669/6.402 ms`. In contrast,
+splitting the FP32 state carry into FLA-style 64+64 blocks was rejected: one
+128-rank reverse block took about `47.7 us`, while two 64-rank blocks took
+about `110.0 us` and worsened complete F+B.
+
+Mamba-style original-stride addressing was adopted next. Radial and strict
+owners now derive batch, head, chunk, token, and tail masks from the original
+`[B,T,H,r]` tensors; `_panelize`, `valid_count`, expanded strength, and the
+production `cat/permute/contiguous` round trip were deleted. Target timing
+moved from about `1.665/6.354 ms` to `1.517--1.535/5.969--6.071 ms`, while
+`aten::copy_` fell from 16 launches and about `52.7 us` to five launches and
+about `16.4 us`. MESA's paired `Hkk/Hkv` tile schedule then changed the J/D
+summary and transpose from 32-rank to four-warp 64-rank tiles. Their isolated
+times changed from about `28.3/126.1 us` to `23.2/44.4 us`; an eight-warp form
+was slower and was deleted.
+
+FLA's L2, beta-sigmoid, and GDN gate sources informed two specialized native
+owners. Three BF16 `u/q/key` inputs are normalized in one forward and one
+strict-transpose launch, with FP32 norm reductions and direct FP16 panel
+stores. The gate owner fuses erase/write sigmoid production and specializes
+scalar/vector decay forward and fixed-tree VJP. Direct use of FLA's general
+gate wrappers regressed gate F+B from about `0.418 ms` to `0.583 ms` despite a
+faster forward and was deleted; the native specialization measures about
+`0.055/0.147 ms` versus `0.154/0.393 ms` for the original PyTorch graph. The
+existing vector cumsum was retained because its dedicated forward/reverse are
+already only about `7.2/9.5 us`; crossing the core ABI to fuse it was not
+justified by that ceiling.
+
+The audited `causal-conv1d` commit was built for SM120 and now owns conv4 SiLU,
+initial state, final state, `dfinal_state`, and `dinitial_state`. The old FLA
+Triton output plus manual `cat(...)[...,-4:]` cache graph was deleted. A width-4
+causal convolution needs only the previous three raw inputs, so layer caches
+are now the minimal `[B,D,3]` state accepted by upstream rather than carrying
+one coordinate that is discarded before every future action. This changes no
+convolution output or model expression. At `B=1,T=1024,D=1024`, a matched BF16
+branch changed from about `0.012/0.285 ms` forward/F+B to `0.008/0.118 ms`, with
+bitwise equal outputs and minimal final state.
+
+Mamba's atomic/workspace policy was screened twice. The earlier strict
+coordinate-block atomic had repeat drift near `rho=1.2e-7` but no complete
+F+B win. A later decay-parameter atomic had at most `1.5e-7` drift and measured
+about `0.149 ms`, statistically no better than the fixed tree's `0.147 ms`.
+Both were deleted; production remains deterministic. CUTLASS 3.x supplies
+SM120 grouped collectives, but its register-resident grouped back-to-back
+example remains SM80 and schedules independent GEMMs. It cannot directly own
+SolveDelta's factor recurrence, diagonal solve, and tile-dependent action.
+The resident action already uses `42.6 KiB` shared with two-CTA launch bounds;
+the prior `50.8 KiB` CuTe schedule fell to one CTA and regressed. A separate
+grouped launch would materialize factors and pointer metadata, so no CUTLASS
+backend was added.
+
+After these retained changes, the target operator measures about
+`1.35/5.80 ms` forward/F+B. The complete target layer including projections,
+three conv4 branches, gates, and all returned-state VJPs measures about
+`1.78/7.25 ms`. These frontend wins do not remove the remaining bounded-chart
+and exact-transpose cost identified in the MESA comparison above.
 
 ## Explicitly closed directions
 

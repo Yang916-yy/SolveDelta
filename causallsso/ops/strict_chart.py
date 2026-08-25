@@ -15,6 +15,32 @@ _BOUNDARY_K = 32
 _TOKEN_TILE = 16
 _ROW_BLOCKS = _RANK // _BOUNDARY_TILE
 
+
+@triton.jit
+def _panel_count(panel, length, heads: tl.constexpr, chunks: tl.constexpr):
+    return tl.minimum(_DEVICE_CHUNK, length - (panel % chunks) * _DEVICE_CHUNK)
+
+
+@triton.jit
+def _raw_vector_offsets(
+    panel,
+    local_tokens,
+    coordinates,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+):
+    panel = panel.to(tl.int64)
+    chunk = panel % chunks
+    head_batch = panel // chunks
+    head = head_batch % heads
+    batch = head_batch // heads
+    tokens = chunk * _DEVICE_CHUNK + local_tokens
+    return (
+        (batch * length * heads + tokens * heads + head) * _DEVICE_RANK
+        + coordinates
+    )
+
 _DEVICE_CHUNK = tl.constexpr(32)
 _DEVICE_RANK = tl.constexpr(128)
 _DEVICE_ROUTES = tl.constexpr(3)
@@ -54,6 +80,10 @@ def _boundary_projection_kernel(
     boundary_d,
     valid_count,
     projection_partial,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     UPPER: tl.constexpr,
 ):
     """Compute paired J/D row-block projections from one descriptor load."""
@@ -69,7 +99,11 @@ def _boundary_projection_kernel(
         token_block * _DEVICE_TOKEN_TILE
         + tl.arange(0, _DEVICE_TOKEN_TILE)
     )
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     valid_target = targets < count
     panel_matrix = panel * _DEVICE_RANK * _DEVICE_RANK
     projection_j = tl.zeros((_DEVICE_TOKEN_TILE,), tl.float32)
@@ -162,6 +196,10 @@ def _boundary_gradient_kernel(
     valid_count,
     grad_boundary_j,
     grad_boundary_d,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     UPPER: tl.constexpr,
 ):
     """Contract paired J/D boundary gradients from one descriptor load."""
@@ -177,7 +215,11 @@ def _boundary_gradient_kernel(
         column_block * _DEVICE_BOUNDARY_TILE
         + tl.arange(0, _DEVICE_BOUNDARY_TILE)
     )
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     accumulator_j = tl.zeros(
         (_DEVICE_BOUNDARY_TILE, _DEVICE_BOUNDARY_TILE), tl.float32
     )
@@ -275,6 +317,10 @@ def _strict_cross_correlation_kernel(
     h,
     valid_count,
     correlation,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     UPPER: tl.constexpr,
 ):
     """Build strict prefix/suffix correlations once per panel and route."""
@@ -286,7 +332,11 @@ def _strict_cross_correlation_kernel(
     target = target_vector[:, None]
     source = source_vector[None, :]
     local = tl.arange(0, _DEVICE_BOUNDARY_TILE)[None, :]
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     valid_target = target < count
     valid_source = source < count
     valid_pair = valid_target & valid_source
@@ -322,19 +372,27 @@ def _strict_cross_correlation_kernel(
             mask=valid_target,
             other=0.0,
         ).to(tl.bfloat16)
-        block_u = tl.load(
-            u
-            + (panel * _DEVICE_CHUNK + source_vector[:, None])
+        vector_offsets = (
+            _raw_vector_offsets(
+                panel,
+                source_vector[:, None],
+                coordinate,
+                length,
+                heads,
+                chunks,
+            )
+            if RAW_LAYOUT
+            else (panel * _DEVICE_CHUNK + source_vector[:, None])
             * _DEVICE_RANK
-            + coordinate,
+            + coordinate
+        )
+        block_u = tl.load(
+            u + vector_offsets,
             mask=(source_vector < count)[:, None],
             other=0.0,
         ).to(tl.bfloat16)
         block_h = tl.load(
-            h
-            + (panel * _DEVICE_CHUNK + source_vector[:, None])
-            * _DEVICE_RANK
-            + coordinate,
+            h + vector_offsets,
             mask=(source_vector < count)[:, None],
             other=0.0,
         ).to(tl.bfloat16)
@@ -364,11 +422,22 @@ def _strict_cross_correlation_kernel(
             mask=valid_target,
             other=0.0,
         ).to(tl.bfloat16)
-        block_u = tl.load(
-            u
-            + (panel * _DEVICE_CHUNK + source_vector[:, None])
+        vector_offsets = (
+            _raw_vector_offsets(
+                panel,
+                source_vector[:, None],
+                coordinate,
+                length,
+                heads,
+                chunks,
+            )
+            if RAW_LAYOUT
+            else (panel * _DEVICE_CHUNK + source_vector[:, None])
             * _DEVICE_RANK
-            + coordinate,
+            + coordinate
+        )
+        block_u = tl.load(
+            u + vector_offsets,
             mask=(source_vector < count)[:, None],
             other=0.0,
         ).to(tl.bfloat16)
@@ -390,6 +459,10 @@ def _strict_cross_action_kernel(
     pair_partial,
     grad_u,
     grad_h,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
     UPPER: tl.constexpr,
 ):
     """Apply off-diagonal blocks from pre-aggregated strict correlations."""
@@ -400,13 +473,28 @@ def _strict_cross_action_kernel(
     source = tl.arange(0, _DEVICE_CHUNK)
     local = tl.arange(0, _DEVICE_BOUNDARY_TILE)
     coordinate = coordinate_block * _DEVICE_BOUNDARY_TILE + local
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     valid_target = target < count
     valid_source = source < count
+    vector_offsets = (
+        _raw_vector_offsets(
+            panel,
+            source[:, None],
+            coordinate[None, :],
+            length,
+            heads,
+            chunks,
+        )
+        if RAW_LAYOUT
+        else (panel * _DEVICE_CHUNK + source[:, None]) * _DEVICE_RANK
+        + coordinate[None, :]
+    )
     current_u = tl.load(
-        u
-        + (panel * _DEVICE_CHUNK + source[:, None]) * _DEVICE_RANK
-        + coordinate[None, :],
+        u + vector_offsets,
         mask=valid_source[:, None],
         other=0.0,
     ).to(tl.bfloat16)
@@ -515,30 +603,22 @@ def _strict_cross_action_kernel(
 
     if UPPER:
         output_u += tl.load(
-            grad_u
-            + (panel * _DEVICE_CHUNK + source[:, None]) * _DEVICE_RANK
-            + coordinate[None, :],
+            grad_u + vector_offsets,
             mask=valid_source[:, None],
             other=0.0,
         ).to(tl.float32)
         output_h += tl.load(
-            grad_h
-            + (panel * _DEVICE_CHUNK + source[:, None]) * _DEVICE_RANK
-            + coordinate[None, :],
+            grad_h + vector_offsets,
             mask=valid_source[:, None],
             other=0.0,
         ).to(tl.float32)
     tl.store(
-        grad_u
-        + (panel * _DEVICE_CHUNK + source[:, None]) * _DEVICE_RANK
-        + coordinate[None, :],
+        grad_u + vector_offsets,
         output_u,
         mask=valid_source[:, None],
     )
     tl.store(
-        grad_h
-        + (panel * _DEVICE_CHUNK + source[:, None]) * _DEVICE_RANK
-        + coordinate[None, :],
+        grad_h + vector_offsets,
         output_h,
         mask=valid_source[:, None],
     )
@@ -586,6 +666,10 @@ def _strict_diagonal_block_kernel(
     pair_partial,
     grad_u,
     grad_h,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     """Add the only coordinate-dependent part: strict 16x16 diagonals."""
 
@@ -595,34 +679,37 @@ def _strict_diagonal_block_kernel(
     source = source_vector[:, None]
     local = tl.arange(0, _DEVICE_BOUNDARY_TILE)[None, :]
     coordinate = coordinate_block * _DEVICE_BOUNDARY_TILE + local
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     valid_source_vector = source_vector < count
     valid_source = valid_source_vector[:, None]
+    vector_offsets = (
+        _raw_vector_offsets(
+            panel, source, coordinate, length, heads, chunks
+        )
+        if RAW_LAYOUT
+        else (panel * _DEVICE_CHUNK + source) * _DEVICE_RANK + coordinate
+    )
     source_u = tl.load(
-        u
-        + (panel * _DEVICE_CHUNK + source) * _DEVICE_RANK
-        + coordinate,
+        u + vector_offsets,
         mask=valid_source,
         other=0.0,
     ).to(tl.float32)
     source_h = tl.load(
-        h
-        + (panel * _DEVICE_CHUNK + source) * _DEVICE_RANK
-        + coordinate,
+        h + vector_offsets,
         mask=valid_source,
         other=0.0,
     ).to(tl.float32)
     output_u = tl.load(
-        grad_u
-        + (panel * _DEVICE_CHUNK + source) * _DEVICE_RANK
-        + coordinate,
+        grad_u + vector_offsets,
         mask=valid_source,
         other=0.0,
     ).to(tl.float32)
     output_h = tl.load(
-        grad_h
-        + (panel * _DEVICE_CHUNK + source) * _DEVICE_RANK
-        + coordinate,
+        grad_h + vector_offsets,
         mask=valid_source,
         other=0.0,
     ).to(tl.float32)
@@ -771,16 +858,12 @@ def _strict_diagonal_block_kernel(
             )
 
     tl.store(
-        grad_u
-        + (panel * _DEVICE_CHUNK + source) * _DEVICE_RANK
-        + coordinate,
+        grad_u + vector_offsets,
         output_u,
         mask=valid_source,
     )
     tl.store(
-        grad_h
-        + (panel * _DEVICE_CHUNK + source) * _DEVICE_RANK
-        + coordinate,
+        grad_h + vector_offsets,
         output_h,
         mask=valid_source,
     )
@@ -797,12 +880,20 @@ def _strict_block_scalar_reduce_kernel(
     grad_radial_scale,
     grad_theta,
     grad_weights,
+    length,
+    heads: tl.constexpr,
+    chunks: tl.constexpr,
+    RAW_LAYOUT: tl.constexpr,
 ):
     panel = tl.program_id(0)
     target = tl.arange(0, _DEVICE_CHUNK)
     source = tl.arange(0, _DEVICE_CHUNK)
     row_block = tl.arange(0, _DEVICE_ROW_BLOCKS)
-    count = tl.load(valid_count + panel)
+    count = (
+        _panel_count(panel, length, heads, chunks)
+        if RAW_LAYOUT
+        else tl.load(valid_count + panel)
+    )
     valid_target = target < count
     pair_mask = (
         valid_target[:, None]
@@ -987,11 +1078,20 @@ def _strict_chart_direct_transpose_trusted(
     theta: torch.Tensor,
     weights: torch.Tensor,
     radial_scale: torch.Tensor,
-    valid_count: torch.Tensor,
+    valid_count: torch.Tensor | None,
 ) -> StrictChartGradients:
     """Execute the transpose action for inputs owned by the native pipeline."""
 
-    panels = u.shape[0]
+    raw_layout = u.ndim == 4
+    if raw_layout:
+        batch, length, heads, _ = u.shape
+        chunks = triton.cdiv(length, _CHUNK)
+        panels = batch * heads * chunks
+        metadata = boundary_j
+    else:
+        panels = u.shape[0]
+        length, heads, chunks = _CHUNK, 1, 1
+        metadata = valid_count
     device = u.device
     projection_partial = torch.empty(
         panels,
@@ -1010,8 +1110,12 @@ def _strict_chart_direct_transpose_trusted(
             upper_right,
             boundary_j,
             boundary_d,
-            valid_count,
+            metadata,
             projection_partial,
+            length,
+            heads=heads,
+            chunks=chunks,
+            RAW_LAYOUT=raw_layout,
             UPPER=upper,
             num_warps=2,
             num_stages=3,
@@ -1026,9 +1130,7 @@ def _strict_chart_direct_transpose_trusted(
         device=device,
         dtype=torch.float32,
     )
-    grad_u = torch.zeros(
-        panels, _CHUNK, _RANK, device=device, dtype=torch.float32
-    )
+    grad_u = torch.zeros(u.shape, device=device, dtype=torch.float32)
     grad_h = torch.zeros_like(grad_u)
     correlation = torch.empty(
         panels,
@@ -1050,8 +1152,12 @@ def _strict_chart_direct_transpose_trusted(
             upper_right,
             u,
             h,
-            valid_count,
+            metadata,
             correlation,
+            length,
+            heads=heads,
+            chunks=chunks,
+            RAW_LAYOUT=raw_layout,
             UPPER=upper,
             num_warps=4,
             num_stages=3,
@@ -1065,11 +1171,15 @@ def _strict_chart_direct_transpose_trusted(
             h,
             weights,
             radial_scale,
-            valid_count,
+            metadata,
             correlation,
             pair_partial,
             grad_u,
             grad_h,
+            length,
+            heads=heads,
+            chunks=chunks,
+            RAW_LAYOUT=raw_layout,
             UPPER=upper,
             num_warps=4,
             num_stages=3,
@@ -1083,10 +1193,14 @@ def _strict_chart_direct_transpose_trusted(
         h,
         weights,
         radial_scale,
-        valid_count,
+        metadata,
         pair_partial,
         grad_u,
         grad_h,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=4,
     )
     grad_radial_scale = torch.empty(
@@ -1098,12 +1212,16 @@ def _strict_chart_direct_transpose_trusted(
         theta,
         weights,
         radial_scale,
-        valid_count,
+        metadata,
         projection_partial,
         pair_partial,
         grad_radial_scale,
         grad_theta,
         grad_weights,
+        length,
+        heads=heads,
+        chunks=chunks,
+        RAW_LAYOUT=raw_layout,
         num_warps=8,
     )
 
@@ -1118,9 +1236,13 @@ def _strict_chart_direct_transpose_trusted(
             upper_right,
             theta,
             radial_scale,
-            valid_count,
+            metadata,
             grad_boundary_j,
             grad_boundary_d,
+            length,
+            heads=heads,
+            chunks=chunks,
+            RAW_LAYOUT=raw_layout,
             UPPER=upper,
             num_warps=2,
             num_stages=3,

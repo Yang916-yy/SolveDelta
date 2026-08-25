@@ -337,8 +337,6 @@ def _chunk_summary_vector_vjp_kernel(
     grad_weight_partial,
     local_grad_u,
     local_grad_h,
-    panel_grad_u,
-    panel_grad_h,
     length: tl.constexpr,
     heads: tl.constexpr,
     rank: tl.constexpr,
@@ -358,7 +356,6 @@ def _chunk_summary_vector_vjp_kernel(
     u_is_fp16: tl.constexpr,
     h_is_fp16: tl.constexpr,
     add_local_partials: tl.constexpr,
-    add_panel_partials: tl.constexpr,
 ):
     row_block = tl.program_id(0)
     panel = tl.program_id(1)
@@ -519,21 +516,6 @@ def _chunk_summary_vector_vjp_kernel(
         result_h += tl.load(
             local_grad_h + output_h, mask=valid[None, :], other=0.0
         ).to(tl.float32)
-    if add_panel_partials:
-        panel_offset = (
-            (panel * chunk_size + local_t[None, :]) * rank
-            + rows[:, None]
-        )
-        result_u += tl.load(
-            panel_grad_u + panel_offset,
-            mask=valid[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        result_h += tl.load(
-            panel_grad_h + panel_offset,
-            mask=valid[None, :],
-            other=0.0,
-        ).to(tl.float32)
     tl.store(grad_u + output_u, result_u, mask=valid[None, :])
     tl.store(grad_h + output_h, result_h, mask=valid[None, :])
     grad_weight = tl.sum(
@@ -556,7 +538,6 @@ def _chunk_summary_scalar_vjp_kernel(
     grad_weight_partial,
     grad_log_decay,
     local_grad_log_decay,
-    panel_grad_log_decay,
     length: tl.constexpr,
     heads: tl.constexpr,
     chunks: tl.constexpr,
@@ -566,7 +547,6 @@ def _chunk_summary_scalar_vjp_kernel(
     stride_t: tl.constexpr,
     stride_h: tl.constexpr,
     add_local_partial: tl.constexpr,
-    add_panel_partial: tl.constexpr,
 ):
     panel = tl.program_id(0)
     chunk = panel % chunks
@@ -608,12 +588,6 @@ def _chunk_summary_scalar_vjp_kernel(
     if add_local_partial:
         result += tl.load(
             local_grad_log_decay + output, mask=valid, other=0.0
-        ).to(tl.float32)
-    if add_panel_partial:
-        result += tl.load(
-            panel_grad_log_decay + panel * chunk_size + local_t,
-            mask=valid,
-            other=0.0,
         ).to(tl.float32)
     tl.store(
         grad_log_decay + output,
@@ -688,7 +662,7 @@ def _triton_geometry_chunk_scan_forward(
     # incoming state, so no second pair of chunk matrices is required.
     boundary_J = torch.empty(batch, heads, chunks, rank, rank, device=u.device, dtype=torch.float32)
     boundary_D = torch.empty_like(boundary_J)
-    rank_blocks = triton.cdiv(rank, 32)
+    rank_blocks = triton.cdiv(rank, 64)
     _chunk_matrix_summary_kernel[(chunks, batch * heads, rank_blocks * rank_blocks)](
         u,
         h,
@@ -700,7 +674,7 @@ def _triton_geometry_chunk_scan_forward(
         rank=rank,
         chunks=chunks,
         chunk_size=chunk_size,
-        block_r=32,
+        block_r=64,
         input_precision=input_precision,
         stride_ub=u.stride(0),
         stride_ut=u.stride(1),
@@ -710,7 +684,7 @@ def _triton_geometry_chunk_scan_forward(
         stride_ht=h.stride(1),
         stride_hh=h.stride(2),
         stride_hr=h.stride(3),
-        num_warps=8,
+        num_warps=4,
     )
 
     state_dtype = torch.float32
@@ -759,7 +733,7 @@ def _triton_geometry_chunk_scan_forward(
         rank=rank,
         chunks=chunks,
         block=256,
-        num_warps=8,
+        num_warps=4,
     )
     empty_boundary_S = torch.empty(0, device=u.device, dtype=state_dtype)
     empty_final_S = torch.empty(0, device=u.device, dtype=state_dtype)
@@ -787,7 +761,6 @@ def _triton_geometry_chunk_scan_backward(
     local_grad_u: torch.Tensor | None = None,
     local_grad_h: torch.Tensor | None = None,
     local_grad_log_decay: torch.Tensor | None = None,
-    panel_gradients: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Return affine-scan partials for a surrounding composed backward.
 
@@ -805,9 +778,6 @@ def _triton_geometry_chunk_scan_backward(
         local_grad_log_decay,
     )
     add_local_partials = any(value is not None for value in local_partials)
-    add_panel_partials = panel_gradients is not None
-    if add_local_partials and add_panel_partials:
-        raise ValueError("token-major and panel-major local partials are exclusive")
     if add_local_partials:
         if not all(value is not None for value in local_partials):
             raise ValueError("all local geometry partials must be provided")
@@ -821,30 +791,6 @@ def _triton_geometry_chunk_scan_backward(
                 raise ValueError(f"{name} must be contiguous FP32 with shape {shape}")
             if value.device != u.device or not value.is_contiguous():
                 raise ValueError(f"{name} must be contiguous on the input device")
-    if add_panel_partials:
-        if len(panel_gradients) != 3:
-            raise ValueError("panel_gradients must contain u, h, and log-decay")
-        panel_shapes = (
-            (panels, chunk_size, rank),
-            (panels, chunk_size, rank),
-            (panels, chunk_size),
-        )
-        for name, value, shape in zip(
-            (
-                "panel_grad_u",
-                "panel_grad_h",
-                "panel_grad_log_decay",
-            ),
-            panel_gradients,
-            panel_shapes,
-        ):
-            if (
-                value.shape != shape
-                or value.dtype != torch.float32
-                or value.device != u.device
-                or not value.is_contiguous()
-            ):
-                raise ValueError(f"{name} must be contiguous FP32 with shape {shape}")
 
     weights = torch.empty(
         batch,
@@ -936,12 +882,7 @@ def _triton_geometry_chunk_scan_backward(
     grad_h = torch.empty(h.shape, device=h.device, dtype=activation_dtype)
     local_u_pointer = local_grad_u if add_local_partials else grad_u
     local_h_pointer = local_grad_h if add_local_partials else grad_h
-    panel_pointers = (
-        panel_gradients
-        if add_panel_partials
-        else (grad_u, grad_h, geometry_log_decay)
-    )
-    row_blocks = rank // 32
+    row_blocks = rank // 64
     grad_weight_partial = torch.empty(
         panels,
         row_blocks,
@@ -960,14 +901,12 @@ def _triton_geometry_chunk_scan_backward(
         grad_weight_partial,
         local_u_pointer,
         local_h_pointer,
-        panel_pointers[0],
-        panel_pointers[1],
         length=length,
         heads=heads,
         rank=rank,
         chunks=chunks,
         chunk_size=chunk_size,
-        block_r=32,
+        block_r=64,
         row_blocks=row_blocks,
         stride_ub=u.stride(0),
         stride_ut=u.stride(1),
@@ -981,8 +920,7 @@ def _triton_geometry_chunk_scan_backward(
         u_is_fp16=u.dtype == torch.float16,
         h_is_fp16=h.dtype == torch.float16,
         add_local_partials=add_local_partials,
-        add_panel_partials=add_panel_partials,
-        num_warps=8,
+        num_warps=4,
         num_stages=1,
     )
     grad_log_decay = torch.empty(
@@ -1001,7 +939,6 @@ def _triton_geometry_chunk_scan_backward(
         grad_weight_partial,
         grad_log_decay,
         local_decay_pointer,
-        panel_pointers[2],
         length=length,
         heads=heads,
         chunks=chunks,
@@ -1011,7 +948,6 @@ def _triton_geometry_chunk_scan_backward(
         stride_t=grad_log_decay.stride(1),
         stride_h=grad_log_decay.stride(2),
         add_local_partial=add_local_partials,
-        add_panel_partial=add_panel_partials,
         num_warps=1,
         num_stages=1,
     )
