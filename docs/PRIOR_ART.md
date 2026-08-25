@@ -112,6 +112,47 @@ FP32 atomic accumulation: a fused route/coordinate-block schedule remains
 eligible if it passes the fixed repeatability and oracle/VJP gates and wins the
 complete path.
 
+Decision update (2026-08-25): the strict-diagonal transpose now follows the
+masked block-product organization used by the audited KDA/GDN2 kernels. For
+each target and 16-coordinate tile it first sums the three route descriptors
+into the exact strict matrices
+`A_lower=sum_a tril(l_a r_a^T,-1)` and
+`A_upper=sum_a triu(l_a r_a^T,1)`, then applies `A`, `A^T`, and the companion
+`h` action with fixed twofold BF16 Tensor Core products and FP32 accumulation.
+This is algebraically identical to the removed coordinate-prefix reductions;
+it does not form a tokenwise `r x r` matrix. On the target profile the isolated
+transpose changed from about `1.865 ms` to `1.761 ms`. Alternating same-process
+complete-path A/Bs changed F+B medians from `5.936/5.962 ms` to
+`5.774/5.796 ms`. Splitting the 32 targets over four CTAs plus a deterministic
+FP32 workspace regressed the isolated path to about `2.127 ms` and was
+deleted. The retained owner is one CTA per panel/coordinate tile and remains
+bitwise repeatable.
+
+The same pass tested MESA/KDA's exact matrix-free off-diagonal action
+`((X B^T) odot Omega) A` in the resident frame owner while preserving the
+existing warp diagonal solve. The implementation used BF16 MMA with FP32
+accumulation, materialized no score tensor in HBM, and passed the composed
+forward, state, and VJP gates. It nevertheless required two resident `C x C`
+score staging rounds for one primal and two transpose-dual actions. The best
+version measured about `1.530/5.902 ms` forward/F+B versus roughly
+`1.48/5.78 ms` for the retained scalar resident action. The shared-memory
+packing and barriers cost more at `C=32` than the scalar work they removed, so
+the implementation was deleted.
+
+FLA's resident state/output reverse was then audited at the actual graph
+boundary. SolveDelta's existing `chunk_state_backward` already keeps only the
+FP32 `(r x d_v)` carry serial across chunks for each head/value tile; WY and
+frame transpose remain chunk-panel parallel. A prototype fused the separate
+WY pair reverse into the frame-transpose CTA and overwrote the dead
+`grad_D_tail/grad_E_gamma/grad_Q_gamma` buffers in place, eliminating about
+12 MiB of frame cotangent traffic without creating an all-chunk mega-kernel.
+After fixing the required pre-overwrite tail-cotangent barrier it passed all
+chunk-WY gates and compiled at 64 registers with no spills. Two 500-sample
+target-profile comparisons still put backward-alone at `4.233/4.372 ms`
+fused versus `4.125/4.195 ms` separated. Extending the high-shared-memory frame
+CTA with pair work outweighed the saved launch and traffic; the fused ABI was
+deleted and the mature separated panel-parallel reverse retained.
+
 Decision: the first adopted block is
 `causallsso/ops/paired_wy.py::_inverse_c32_blocks`, specialized from FLA
 `v0.5.2`'s `merge_16x16_to_32x32_inverse_kernel`, together with the wide-RHS

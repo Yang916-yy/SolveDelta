@@ -280,6 +280,28 @@ three schedules, not cross-route or coordinate-block FP32 atomics as a class.
 A later fused atomic schedule remains admissible under the fixed repeated-run
 precision and complete-path performance gates in `VALIDATION_PLAN.md`.
 
+The coordinate-diagonal remainder was subsequently specialized with the same
+masked dense-block idiom used by the audited KDA/GDN2 sources. It aggregates
+the three rank-one route descriptors into lower/upper strict `16 x 16` tiles
+and uses the existing fixed twofold BF16/FP32 `tl.dot` owner for primal,
+transpose, and companion actions. The previous six coordinate-prefix scans per
+route are gone. Target-profile standalone time changed from about `1.865 ms`
+to `1.761 ms`, while alternating complete F+B medians changed from
+`5.936/5.962 ms` to `5.774/5.796 ms`. A four-CTA target split plus deterministic
+FP32 reduction workspace measured about `2.127 ms` standalone and was deleted;
+the selected schedule keeps one CTA per panel/coordinate tile and no new HBM
+workspace.
+
+The next matched experiment moved the exact MESA/KDA matrix-free
+`((X B^T) odot Omega) A` schedule into the native frame off-diagonal owner and
+kept the warp diagonal solve unchanged. It passed the full forward/state/VJP
+suite and did not write a score intermediate to HBM. One primal plus two
+transpose-dual actions still require two resident `C x C` score staging rounds,
+however. The best schedule measured about `1.530/5.902 ms` forward/F+B against
+roughly `1.48/5.78 ms` for the existing scalar resident owner. Its packing and
+barriers are not amortized at `C=32`, so it was deleted. This result rejects
+that integration, not the algebraic two-dot form at larger chunk widths.
+
 ### J/D moment tile update
 
 Upstream:
@@ -398,6 +420,24 @@ Upstream:
   cotangents.
 - [x] Keep the current dedicated 128-rank `chunk_state.py` after the matched
   target-profile rejection above.
+
+The subsequent graph-level audit confirmed that this retained state reverse
+already has the intended FLA ownership: only the FP32 state carry is serial
+over chunks inside each head/value tile. Pair-WY and frame transpose are
+independent panel grids; concatenating all chunks into one resident kernel
+would reduce parallelism and is prohibited without a new complete-path win.
+
+A narrower fusion was implemented and rejected. WY pair reverse ran at the
+start of each frame-transpose CTA and reused the dead gauge cotangent buffers
+in place, avoiding about 12 MiB of `frame_primal/frame_dual` write-read traffic
+and one launch. The exact tail-decay contraction was staged before any in-place
+overwrite, after which all chunk-WY numerical and repeatability tests passed;
+the fused kernel used 64 registers and had no spills. Two 500-sample
+target-profile comparisons measured backward-alone at `4.233/4.372 ms` fused
+versus `4.125/4.195 ms` separated. The extra lifetime and synchronization in
+the 42.6 KiB frame CTA exceeded the traffic saving, so the fused kernel and ABI
+were deleted. Production retains separate panel-parallel pair and frame
+transposes plus the existing resident state carry.
 
 ### Output contraction and reverse
 

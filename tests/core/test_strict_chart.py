@@ -447,7 +447,9 @@ def test_strict_chart_is_bitwise_repeatable_and_standalone() -> None:
         / "strict_chart.py"
     ).read_text()
     assert "tl.dot" in source
-    assert "tl.cumsum" in source
+    assert "tl.cumsum" not in source
+    assert "diagonal_grad_u" not in source
+    assert "_strict_diagonal_reduce_kernel" not in source
     assert "torch.autograd" not in source
     assert "c32_frame_compact_pair" not in source
     assert "c32_frame_compact_coefficients" not in source

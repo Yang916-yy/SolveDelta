@@ -671,13 +671,14 @@ def _strict_diagonal_block_kernel(
     chunks: tl.constexpr,
     RAW_LAYOUT: tl.constexpr,
 ):
-    """Add the only coordinate-dependent part: strict 16x16 diagonals."""
+    """Apply diagonal strict tiles with paired block products."""
 
     panel = tl.program_id(0)
     coordinate_block = tl.program_id(1)
     source_vector = tl.arange(0, _DEVICE_CHUNK)
     source = source_vector[:, None]
-    local = tl.arange(0, _DEVICE_BOUNDARY_TILE)[None, :]
+    local_vector = tl.arange(0, _DEVICE_BOUNDARY_TILE)
+    local = local_vector[None, :]
     coordinate = coordinate_block * _DEVICE_BOUNDARY_TILE + local
     count = (
         _panel_count(panel, length, heads, chunks)
@@ -697,29 +698,38 @@ def _strict_diagonal_block_kernel(
         u + vector_offsets,
         mask=valid_source,
         other=0.0,
-    ).to(tl.float32)
+    ).to(tl.bfloat16)
     source_h = tl.load(
         h + vector_offsets,
         mask=valid_source,
         other=0.0,
-    ).to(tl.float32)
-    output_u = tl.load(
-        grad_u + vector_offsets,
-        mask=valid_source,
-        other=0.0,
-    ).to(tl.float32)
-    output_h = tl.load(
-        grad_h + vector_offsets,
-        mask=valid_source,
-        other=0.0,
-    ).to(tl.float32)
+    ).to(tl.bfloat16)
+    source_u_t = tl.trans(source_u)
+    source_h_t = tl.trans(source_h)
+    output_u = tl.trans(
+        tl.load(
+            grad_u + vector_offsets,
+            mask=valid_source,
+            other=0.0,
+        ).to(tl.float32)
+    )
+    output_h = tl.trans(
+        tl.load(
+            grad_h + vector_offsets,
+            mask=valid_source,
+            other=0.0,
+        ).to(tl.float32)
+    )
+    strict_lower = local_vector[:, None] > local_vector[None, :]
+    strict_upper = local_vector[:, None] < local_vector[None, :]
 
-    for target in tl.static_range(0, _DEVICE_CHUNK):
-        active_pair = valid_source & (source <= target) & (target < count)
+    for target in tl.range(0, _DEVICE_CHUNK):
+        active_source = valid_source_vector & (source_vector <= target)
+        active_pair = active_source & (target < count)
         temporal = tl.load(
             weights
             + (panel * _DEVICE_CHUNK + target) * _DEVICE_CHUNK
-            + source,
+            + source_vector,
             mask=active_pair,
             other=0.0,
         ).to(tl.float32)
@@ -743,81 +753,83 @@ def _strict_diagonal_block_kernel(
             mask=target < count,
             other=0.0,
         ).to(tl.float32)
-        lower_j = tl.zeros((_DEVICE_CHUNK,), tl.float32)
-        lower_d = tl.zeros((_DEVICE_CHUNK,), tl.float32)
-        upper_j = tl.zeros((_DEVICE_CHUNK,), tl.float32)
-        upper_d = tl.zeros((_DEVICE_CHUNK,), tl.float32)
+        lower_matrix = tl.zeros(
+            (_DEVICE_BOUNDARY_TILE, _DEVICE_BOUNDARY_TILE), tl.float32
+        )
+        upper_matrix = tl.zeros_like(lower_matrix)
         for route in tl.static_range(0, _DEVICE_ROUTES):
             descriptor_base = (
                 (panel * _DEVICE_CHUNK + target) * _DEVICE_ROUTES
                 + route
             ) * _DEVICE_RANK
             lower_l = tl.load(
-                lower_left + descriptor_base + coordinate,
-                mask=active_pair,
+                lower_left
+                + descriptor_base
+                + coordinate_block * _DEVICE_BOUNDARY_TILE
+                + local_vector,
+                mask=target < count,
                 other=0.0,
             ).to(tl.float32)
             lower_r = tl.load(
-                lower_right + descriptor_base + coordinate,
-                mask=active_pair,
+                lower_right
+                + descriptor_base
+                + coordinate_block * _DEVICE_BOUNDARY_TILE
+                + local_vector,
+                mask=target < count,
                 other=0.0,
             ).to(tl.float32)
             upper_l = tl.load(
-                upper_left + descriptor_base + coordinate,
-                mask=active_pair,
+                upper_left
+                + descriptor_base
+                + coordinate_block * _DEVICE_BOUNDARY_TILE
+                + local_vector,
+                mask=target < count,
                 other=0.0,
             ).to(tl.float32)
             upper_r = tl.load(
-                upper_right + descriptor_base + coordinate,
-                mask=active_pair,
+                upper_right
+                + descriptor_base
+                + coordinate_block * _DEVICE_BOUNDARY_TILE
+                + local_vector,
+                mask=target < count,
                 other=0.0,
             ).to(tl.float32)
+            lower_matrix += tl.where(
+                strict_lower,
+                lower_l[:, None] * lower_r[None, :],
+                0.0,
+            )
+            upper_matrix += tl.where(
+                strict_upper,
+                upper_l[:, None] * upper_r[None, :],
+                0.0,
+            )
 
-            lower_ru = lower_r * source_u
-            lower_rh = lower_r * source_h
-            lower_lu = lower_l * source_u
-            upper_ru = upper_r * source_u
-            upper_rh = upper_r * source_h
-            upper_lu = upper_l * source_u
-            lower_prefix_ru = tl.cumsum(lower_ru, axis=1) - lower_ru
-            lower_prefix_rh = tl.cumsum(lower_rh, axis=1) - lower_rh
-            lower_prefix_lu = tl.cumsum(lower_lu, axis=1) - lower_lu
-            upper_prefix_ru = tl.cumsum(upper_ru, axis=1) - upper_ru
-            upper_prefix_rh = tl.cumsum(upper_rh, axis=1) - upper_rh
-            upper_prefix_lu = tl.cumsum(upper_lu, axis=1) - upper_lu
-            lower_action_u = lower_l * lower_prefix_ru
-            lower_action_h = lower_l * lower_prefix_rh
-            lower_transpose_u = lower_r * (
-                tl.sum(lower_lu, axis=1)[:, None]
-                - lower_lu
-                - lower_prefix_lu
-            )
-            upper_action_u = upper_l * (
-                tl.sum(upper_ru, axis=1)[:, None]
-                - upper_ru
-                - upper_prefix_ru
-            )
-            upper_action_h = upper_l * (
-                tl.sum(upper_rh, axis=1)[:, None]
-                - upper_rh
-                - upper_prefix_rh
-            )
-            upper_transpose_u = upper_r * upper_prefix_lu
-
-            output_u += temporal * (
-                scale_lower_j * (lower_action_u + lower_transpose_u)
-                + scale_lower_d * lower_action_h
-                + scale_upper_j * (upper_action_u + upper_transpose_u)
-                + scale_upper_d * upper_action_h
-            )
-            output_h += temporal * (
-                scale_lower_d * lower_transpose_u
-                + scale_upper_d * upper_transpose_u
-            )
-            lower_j += tl.sum(source_u * lower_action_u, axis=1)
-            lower_d += tl.sum(source_u * lower_action_h, axis=1)
-            upper_j += tl.sum(source_u * upper_action_u, axis=1)
-            upper_d += tl.sum(source_u * upper_action_h, axis=1)
+        lower_u = _split_dot(lower_matrix, source_u_t)
+        lower_h = _split_dot(lower_matrix, source_h_t)
+        lower_transpose_u = _split_dot(
+            tl.trans(lower_matrix), source_u_t
+        )
+        upper_u = _split_dot(upper_matrix, source_u_t)
+        upper_h = _split_dot(upper_matrix, source_h_t)
+        upper_transpose_u = _split_dot(
+            tl.trans(upper_matrix), source_u_t
+        )
+        temporal = temporal[None, :]
+        output_u += temporal * (
+            scale_lower_j * (lower_u + lower_transpose_u)
+            + scale_lower_d * lower_h
+            + scale_upper_j * (upper_u + upper_transpose_u)
+            + scale_upper_d * upper_h
+        )
+        output_h += temporal * (
+            scale_lower_d * lower_transpose_u
+            + scale_upper_d * upper_transpose_u
+        )
+        lower_j = tl.sum(source_u_t * lower_u, axis=0)
+        lower_d = tl.sum(source_u_t * lower_h, axis=0)
+        upper_j = tl.sum(source_u_t * upper_u, axis=0)
+        upper_d = tl.sum(source_u_t * upper_h, axis=0)
 
         for component in tl.static_range(0, 4):
             diagonal_pair = (
@@ -844,27 +856,23 @@ def _strict_diagonal_block_kernel(
             )
             previous = tl.load(
                 pointer,
-                mask=valid_source_vector
-                & (source_vector <= target)
-                & (target < count),
+                mask=active_pair,
                 other=0.0,
             ).to(tl.float32)
             tl.store(
                 pointer,
                 previous + diagonal_pair,
-                mask=valid_source_vector
-                & (source_vector <= target)
-                & (target < count),
+                mask=active_pair,
             )
 
     tl.store(
         grad_u + vector_offsets,
-        output_u,
+        tl.trans(output_u),
         mask=valid_source,
     )
     tl.store(
         grad_h + vector_offsets,
-        output_h,
+        tl.trans(output_h),
         mask=valid_source,
     )
 
