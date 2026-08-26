@@ -22,9 +22,8 @@ def _normalize_frame_fwd_kernel(
     q,
     keys,
     erase_raw,
-    out_u_j,
-    out_u_d,
     out_u_panel,
+    out_u_d_panel,
     out_h_panel,
     out_key_panel,
     out_paired_dual,
@@ -120,16 +119,10 @@ def _normalize_frame_fwd_kernel(
     active = norm > EPSILON
     inverse = tl.where(active, 1.0 / norm, 1.0 / EPSILON)
     result = values * inverse
-    bth = (output_token * H + head) * R + coordinate
     tl.store(
-        out_u_j + bth,
+        out_u_d_panel + local * R + coordinate,
         result,
-        mask=(coordinate < R) & valid_token & u_route,
-    )
-    tl.store(
-        out_u_d + bth,
-        result,
-        mask=(coordinate < R) & valid_token & u_route,
+        mask=(coordinate < R) & u_route,
     )
     tl.store(
         out_u_panel + local * R + coordinate,
@@ -171,8 +164,6 @@ def _normalize_frame_bwd_kernel(
     keys,
     erase_raw,
     signed_inverse,
-    grad_u_j_bth,
-    grad_u_d_bth,
     grad_u_panel,
     grad_h_panel,
     grad_key_panel,
@@ -209,8 +200,6 @@ def _normalize_frame_bwd_kernel(
     N: tl.constexpr,
     R: tl.constexpr,
     BR: tl.constexpr,
-    HAS_GRAD_U_J: tl.constexpr,
-    HAS_GRAD_U_D: tl.constexpr,
     HAS_GRAD_U_PANEL: tl.constexpr,
     HAS_GRAD_H_PANEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -283,14 +272,6 @@ def _normalize_frame_bwd_kernel(
     erase_sigmoid = tl.sigmoid(erase_logit)
     erase_value = 2.0 * erase_sigmoid
     u_gradient = tl.zeros([BR], dtype=tl.float32)
-    if HAS_GRAD_U_J:
-        u_gradient += tl.load(
-            grad_u_j_bth + bth, mask=mask, other=0.0
-        ).to(tl.float32)
-    if HAS_GRAD_U_D:
-        u_gradient += tl.load(
-            grad_u_d_bth + bth, mask=mask, other=0.0
-        ).to(tl.float32)
     if HAS_GRAD_U_PANEL:
         u_gradient += tl.load(
             grad_u_panel + local * R + coordinate, mask=mask, other=0.0
@@ -354,8 +335,6 @@ class _NormalizeFrameInputs(torch.autograd.Function):
     ):
         batch, length, heads, width = u.shape
         edits = keys.shape[-2]
-        out_u_j = torch.empty(u.shape, dtype=torch.float16, device=u.device)
-        out_u_d = torch.empty(u.shape, dtype=torch.bfloat16, device=u.device)
         chunks = triton.cdiv(length, chunk_size)
         panels = (
             batch * heads * chunks
@@ -364,6 +343,9 @@ class _NormalizeFrameInputs(torch.autograd.Function):
         )
         out_u_panel = torch.empty(
             panels, chunk_size, width, dtype=torch.float16, device=u.device
+        )
+        out_u_d_panel = torch.empty(
+            panels, chunk_size, width, dtype=torch.bfloat16, device=u.device
         )
         out_h_panel = torch.empty(
             panels, chunk_size, width, dtype=torch.bfloat16, device=u.device
@@ -385,9 +367,8 @@ class _NormalizeFrameInputs(torch.autograd.Function):
             q,
             keys,
             erase_raw,
-            out_u_j,
-            out_u_d,
             out_u_panel,
+            out_u_d_panel,
             out_h_panel,
             out_key_panel,
             out_paired_dual,
@@ -417,9 +398,8 @@ class _NormalizeFrameInputs(torch.autograd.Function):
         )
         ctx.set_materialize_grads(False)
         return (
-            out_u_j,
-            out_u_d,
             out_u_panel,
+            out_u_d_panel,
             out_h_panel,
             out_key_panel,
             out_paired_dual,
@@ -429,9 +409,8 @@ class _NormalizeFrameInputs(torch.autograd.Function):
     @once_differentiable
     def backward(
         ctx,
-        grad_u_j_bth: torch.Tensor | None,
-        grad_u_d_bth: torch.Tensor | None,
         grad_u_panel: torch.Tensor | None,
+        grad_u_d_panel: torch.Tensor | None,
         grad_h_panel: torch.Tensor | None,
         grad_key_panel: torch.Tensor,
         grad_paired_dual: torch.Tensor,
@@ -456,8 +435,6 @@ class _NormalizeFrameInputs(torch.autograd.Function):
             keys,
             erase_raw,
             signed_inverse,
-            grad_u_j_bth if grad_u_j_bth is not None else u,
-            grad_u_d_bth if grad_u_d_bth is not None else u,
             grad_u_panel if grad_u_panel is not None else u,
             grad_h_panel if grad_h_panel is not None else u,
             grad_key_panel,
@@ -477,8 +454,6 @@ class _NormalizeFrameInputs(torch.autograd.Function):
             SE_E=erase_raw.stride(3), SE_R=erase_raw.stride(4),
             T=length, H=heads, E=edits, C=chunk_size, N=chunks,
             R=width, BR=block,
-            HAS_GRAD_U_J=grad_u_j_bth is not None,
-            HAS_GRAD_U_D=grad_u_d_bth is not None,
             HAS_GRAD_U_PANEL=grad_u_panel is not None,
             HAS_GRAD_H_PANEL=grad_h_panel is not None,
             IS_VARLEN=is_varlen,

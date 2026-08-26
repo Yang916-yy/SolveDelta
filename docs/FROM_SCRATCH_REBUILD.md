@@ -288,44 +288,75 @@ N_{i,pq}=b_i^H J_{0,pq}+b_i^R D_{0,pq}
 +\sum_s\omega^R_{is}u_{s,p}h_{s,q}.
 \]
 
-Introduce notation-only feature rows
+The two local terms share their left token panel. Let `U,H in R^{C x r}`
+contain `u_s,h_s` by row and define the dense boundary and one target-owned
+local generator
 
 \[
-\mathcal Q_{i,p}=\left[
-b_i^H J_{0,p,:}+b_i^R D_{0,p,:},\;
-\omega_i^H\odot u_{:,p},\;
-\omega_i^R\odot u_{:,p}
-\right],
+B_i=b_i^H J_0+b_i^R D_0,
 \]
 
 \[
-\mathcal K_q=\left[e_q,\;u_{:,q},\;h_{:,q}\right],
+\boxed{
+K_i=\operatorname{Diag}(\omega_i^H)U
+   +\operatorname{Diag}(\omega_i^R)H.}
 \]
 
-where `e_q` is the `q`th coordinate basis vector. Then, exactly,
+Then, exactly,
 
 \[
-\boxed{N_{i,pq}=\mathcal Q_{i,p}^T\mathcal K_q.}
+\boxed{N_i=B_i+U^TK_i,\qquad
+N_{i,pq}=B_{i,pq}+U_{:,p}^TK_{i,:,q}.}
 \]
 
-For a lower factor, `(I+N_i)y_i=b_i` is therefore
+Thus the local factor is one rank-at-most-`C` generalized-Delta generator,
+not separate H and R generators and not a notation-only `2C` feature. For a
+lower factor, `(I+N_i)y_i=b_i` is
 
 \[
-s_{i,p-1}=\sum_{q<p}\mathcal K_qy_{i,q},\qquad
-y_{i,p}=b_{i,p}-\mathcal Q_{i,p}^Ts_{i,p-1},
+s_{i,p-1}=\sum_{q<p}K_{i,:,q}y_{i,q},
 \]
 
 \[
-s_{i,p}=s_{i,p-1}+\mathcal K_py_{i,p}.
+y_{i,p}=b_{i,p}
+-\sum_{q<p}B_{i,pq}y_{i,q}
+-U_{:,p}^Ts_{i,p-1},
+\]
+
+\[
+s_{i,p}=s_{i,p-1}+K_{i,:,p}y_{i,p}.
 \]
 
 This is the generalized-Delta recurrence along the coordinate axis. An upper
 factor is the same recurrence in reversed coordinate order. Production ports
 FLA GDN2/DPLR's blocked substitution: 16-coordinate diagonal blocks use its
 exact ordered solve, while complete off-diagonal blocks use Tensor-Core pair
-dots. Boundary and the two local pair contributions are generated directly at
-the consuming block; the formal `r+2C` features, a dense factor, its inverse,
-and iterative panels never reach HBM.
+dots. Boundary tiles and `K_i` tiles are generated directly at the consuming
+block; neither the target-dependent generator, a dense factor, its inverse,
+nor iterative coordinate panels reach HBM. A direct action may write one FP32
+block-prefix tensor to preserve coordinate-block CTA parallelism. It must not
+write separate H and R prefixes.
+
+The transpose swaps the two local generator sides:
+
+\[
+\boxed{(N_i^{\mathrm{local}})^T=K_i^TU.}
+\]
+
+It therefore maintains one `U` prefix and evaluates the target-owned `K_i`
+query. The native exact solve retains a static mixed-precision decomposition
+of the same generator where required by the precision contract: the bounded
+H contraction uses FP16 operands while the unbounded driven-R contraction
+uses BF16 operands, both with FP32 accumulation. This physical contraction
+split is not a second mathematical generator or a route-level ABI.
+
+Production stores one FP32 causal decay table
+`Delta_ij=1[j<=i] exp(G_i-G_j)` and the three FP32 `kappa` row vectors.
+Each factor consumer forms `omega_i=kappa_i*Delta_i` once in registers. Three
+preformed route-specific `omega` tables are not a persistent ABI: the measured
+candidate slightly shortened the isolated local reverse but increased saved
+storage and did not produce a repeatable complete F+B win. This is a static
+schedule decision; `omega` remains the mathematical notation above.
 
 The reverse is the corresponding exact transpose recurrence. For
 `y=(I+N)^{-1}b`,
@@ -334,9 +365,50 @@ The reverse is the corresponding exact transpose recurrence. For
 z=(I+N)^{-T}\bar y,\qquad \bar b=z,\qquad \bar N=-zy^T.
 \]
 
+For a strict cotangent `G=bar N_i^{local}` and `N_i^{local}=U^TK_i`,
+
+\[
+\bar U_{\rm left}=K_iG^T,
+\qquad
+\bar K_i=UG,
+\]
+
+\[
+\boxed{
+\bar U=\bar U_{\rm left}
++\operatorname{Diag}(\omega_i^H)\bar K_i,
+\qquad
+\bar H=\operatorname{Diag}(\omega_i^R)\bar K_i,}
+\]
+
+\[
+\boxed{
+\bar\omega_{i,s}^H=\langle\bar K_{i,s,:},U_{s,:}\rangle,
+\qquad
+\bar\omega_{i,s}^R=\langle\bar K_{i,s,:},H_{s,:}\rangle.}
+\]
+
 FLA's pair-dot transpose schedule consumes each strict `bar N` block directly
-into boundary and local operands. It does not materialize `bar N` or replay a
-coordinate descriptor chain. MathDx remains an independent exact TRSM oracle.
+into the boundary owner and this single local generator transpose. It does not
+materialize `bar N`, `bar K`, or replay a coordinate descriptor chain. H/R
+radial cotangents separate only in the generator epilogue above. MathDx remains
+an independent exact TRSM oracle.
+
+The first C32/r128 specialization uses a 256-thread staged-output owner derived
+from FLA DPLR's low-register reverse schedule. Each of eight warps owns four
+target tokens and each lane owns one source channel. Prefix, suffix, and the
+two weight cotangents remain distributed by target/source. Sixteen coordinate
+outputs are accumulated before one shared staging phase; warp zero then owns
+the final FP32 `bar U/bar H` stores. After the last coordinate block, the same
+shared storage is reused for the row/column decay reduction. One- and two-RHS
+programs are static specializations. Neither the strict cotangent nor a
+source-partial tensor reaches HBM.
+
+On SM120 the selected owner uses 256 threads, 128 registers/thread, 50,176
+bytes shared memory, and zero local-memory allocation, permitting two CTAs per
+SM. The generic Triton recurrence remains the implementation for other legal
+`C/r/RHS` shapes; this is shape specialization, not a second operator or
+numerical contract.
 The only native error relative to the FP64 solve is the declared operand
 rounding and FP32 reduction order under the BF16-observable contract; there is
 no authorized solve approximation.
@@ -1254,6 +1326,7 @@ Audited sources:
 | diagonal chart | FLA tanh soft-cap primitive plus exp | `s*tanh(x/s)` forward/reverse | add H/R routes in the frame FP32 epilogue |
 | L/U direct action | MESA `chunk_update_once` two-dot | resident state plus local rank-k residual action | coordinate strict mask and route coefficients |
 | L/U inverse action | FLA GDN2/KDA blocked substitution plus MathDx TRSM oracle | exact ordered diagonal solve and off-diagonal pair-dot composition | specialize the strict H/R pair producer and its transpose |
+| L/U local transpose | FLA DPLR staged backward owner | 256-thread distributed fragments and phase-reused final-output staging | replace the temporal state loop with the exact coordinate recurrence and H/R generator epilogue |
 | W/A and chunk solve | FLA GDN2/KDA/DPLR | safe diagonal, gauged off-diagonal, candidate C16/C32/C64 solve blocks | independent e/chi row panels and d columns |
 | WY RHS | FLA GDN2 `wy_fast.py` | wide RHS schedule | direct E and Z operands |
 | S state/output | FLA common state and DPLR/GLA output | complete fwd/bwd programs | direct-e naming and FP32 continuation |
@@ -1269,6 +1342,7 @@ The exact source symbols audited for first adoption are:
 | diagonal soft-cap forward/reverse | FLA `ops.utils.op.tanh` and `cross_entropy_fwd_kernel` / `cross_entropy_bwd_kernel` soft-cap epilogues |
 | matrix-free residual state action | MESA `chunk_update_once` |
 | exact coordinate-axis inverse action | FLA GDN2/KDA fused inter-solve schedule and `solve_tril` ordered diagonal block |
+| staged local-generator transpose | FLA DPLR TileLang `chunk_stream_bwd.py` low-register schedule and `schedules.py` |
 | chunk unit-lower inverse candidates | FLA C16 solve, C32 `merge_16x16_to_32x32_inverse_kernel`, and a C64 upstream schedule to audit |
 | wide WY right-hand sides | FLA DPLR `wu_fwd_kernel` |
 | WY matrix reverse | FLA DPLR `prepare_wy_repr_bwd_kernel` |
@@ -1619,14 +1693,15 @@ panel counts, boundary histories, saved cache, and allocator peak.
 | one `[B,T,H,r]` FP16 panel | 2.00 MiB |
 | d/e/chi | 6.00 MiB |
 | sigma | 2.00 MiB |
-| three route G caches | 3.00 MiB |
+| three route Gram caches | 3.00 MiB |
+| one shared causal decay table | 1.00 MiB |
 | route c/n/coefficients | about 0.20 MiB |
 | packed inverse plus A at C32 | 1.00 MiB |
 | one FP32 J or D 33-boundary history | 16.50 MiB |
 | J+D histories | 33.00 MiB |
 | radial scalar cotangents | about 0.09 MiB |
 
-Core saved training cache is about 45 MiB/layer before ordinary projection
+Core saved training cache is about 46 MiB/layer before ordinary projection
 inputs. Dense canonical geometry boundaries dominate, not d/e/chi.
 
 FLA S boundaries are recomputed in B1/B2. Their temporary 16.5 MiB lifetime

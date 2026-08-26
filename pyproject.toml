@@ -20,6 +20,9 @@ test = ["pytest>=8"]
 [tool.setuptools.packages.find]
 include = ["causallsso*"]
 
+[tool.setuptools.package-data]
+"causallsso.ops" = ["csrc/*.cu"]
+
 [project.urls]
 Repository = "https://github.com/Yang916-yy/SolveDelta"
 

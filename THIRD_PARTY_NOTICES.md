@@ -19,6 +19,9 @@ Attention commit `bc3b101dcb713ddc5bd8924b66754eb68b5ccf89`:
 - `causallsso/ops/resident_frame.py`: FLA GDN2/KDA blocked substitution and
   ordered 16-coordinate diagonal pattern, combined with MESA's two-dot action
   identity and specialized to generated J/D/u/h pair tiles.
+- `causallsso/ops/csrc/local_transpose.cu`: FLA DPLR's 256-thread,
+  phase-staged output ownership specialized to the exact coordinate-axis
+  generalized-Delta transpose and its H/R generator epilogue.
 
 > MIT License
 >
@@ -38,6 +41,12 @@ The adapted portions are provided under the MIT License; see
 
 Upstream source:
 <https://github.com/fla-org/flash-linear-attention/tree/bc3b101dcb713ddc5bd8924b66754eb68b5ccf89>.
+
+The staged local-transpose schedule additionally follows
+`fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_stream_bwd.py`
+and `schedules.py` at commit
+`38a496e1ce58baaf1bc6613176eb2f433d0ddb90`:
+<https://github.com/fla-org/flash-linear-attention/tree/38a496e1ce58baaf1bc6613176eb2f433d0ddb90>.
 
 SolveDelta changes pointer layouts, operand dtypes, masks, route composition,
 and private interfaces. It does not import the upstream model ABI. This notice

@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .native_local import local_transpose
+
 
 @triton.jit
 def _exact_coordinate_solve_kernel(
@@ -20,8 +22,9 @@ def _exact_coordinate_solve_kernel(
     D,
     u,
     h,
-    omega_h,
-    omega_r,
+    decay,
+    kappa_h,
+    kappa_r,
     boundary_h,
     boundary_r,
     sigma,
@@ -72,16 +75,19 @@ def _exact_coordinate_solve_kernel(
     panel_vector = chunk * C * R
     panel_pair = chunk * C * C
     panel_matrix = chunk * R * R
-    weight_h = tl.load(
-        omega_h + panel_pair + token[:, None] * C + o_s[None, :],
+    pair_decay = tl.load(
+        decay + panel_pair + token[:, None] * C + o_s[None, :],
         mask=valid_row[:, None],
         other=0.0,
     ).to(tl.float32)
-    weight_r = tl.load(
-        omega_r + panel_pair + token[:, None] * C + o_s[None, :],
-        mask=valid_row[:, None],
-        other=0.0,
+    target_kappa_h = tl.load(
+        kappa_h + chunk * C + token, mask=valid_row, other=0.0
     ).to(tl.float32)
+    target_kappa_r = tl.load(
+        kappa_r + chunk * C + token, mask=valid_row, other=0.0
+    ).to(tl.float32)
+    weight_h = pair_decay * target_kappa_h[:, None]
+    weight_r = pair_decay * target_kappa_r[:, None]
     coeff_h = tl.load(
         boundary_h + chunk * C + token, mask=valid_row, other=0.0
     ).to(tl.float32)
@@ -229,8 +235,10 @@ def _direct_prefix_states_kernel(
     rhs,
     u,
     h,
-    prefix_h_out,
-    prefix_r_out,
+    decay,
+    kappa_h,
+    kappa_r,
+    prefix_out,
     sigma,
     stride_rhs_p: tl.constexpr,
     stride_rhs_n: tl.constexpr,
@@ -245,6 +253,7 @@ def _direct_prefix_states_kernel(
     LOWER: tl.constexpr,
     TRANSPOSE: tl.constexpr,
     MULTIPLY_SIGMA: tl.constexpr,
+    BOUNDED_RHS: tl.constexpr,
 ):
     panel = tl.program_id(0).to(tl.int64)
     rows = C * NRHS
@@ -255,15 +264,27 @@ def _direct_prefix_states_kernel(
     token = o_row % C
     rhs_index = o_row // C
     panel_local = panel * C * R
+    panel_pair = panel * C * C
     panel_state = panel * NB * rows * C
     reverse = LOWER == TRANSPOSE
-    prefix_h = tl.zeros([BM, C], dtype=tl.float32)
-    prefix_r = tl.zeros([BM, C], dtype=tl.float32)
+    pair_decay = tl.load(
+        decay + panel_pair + token[:, None] * C + o_s[None, :],
+        mask=valid_row[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    target_kappa_h = tl.load(
+        kappa_h + panel * C + token, mask=valid_row, other=0.0
+    ).to(tl.float32)
+    target_kappa_r = tl.load(
+        kappa_r + panel * C + token, mask=valid_row, other=0.0
+    ).to(tl.float32)
+    weight_h = pair_decay * target_kappa_h[:, None]
+    weight_r = pair_decay * target_kappa_r[:, None]
+    prefix = tl.zeros([BM, C], dtype=tl.float32)
     for tile in range(NB):
         state_offset = panel_state + tile * rows * C
         pointer = state_offset + o_row[:, None] * C + o_s[None, :]
-        tl.store(prefix_h_out + pointer, prefix_h, mask=valid_row[:, None])
-        tl.store(prefix_r_out + pointer, prefix_r, mask=valid_row[:, None])
+        tl.store(prefix_out + pointer, prefix, mask=valid_row[:, None])
         coord = tile * BC + o_b
         if reverse:
             coord = R - 1 - coord
@@ -287,9 +308,17 @@ def _direct_prefix_states_kernel(
         h_block = tl.load(
             h + panel_local + o_s[:, None] * R + coord[None, :]
         ).to(tl.bfloat16)
-        r_input = u_block.to(tl.bfloat16) if TRANSPOSE else h_block
-        prefix_h += tl.dot(bx.to(tl.float16), tl.trans(u_block))
-        prefix_r += tl.dot(bx.to(tl.bfloat16), tl.trans(r_input))
+        if TRANSPOSE:
+            if BOUNDED_RHS:
+                prefix += tl.dot(bx.to(tl.float16), tl.trans(u_block))
+            else:
+                prefix += tl.dot(
+                    bx.to(tl.bfloat16), tl.trans(u_block.to(tl.bfloat16))
+                )
+        else:
+            prefix_u = tl.dot(bx.to(tl.float16), tl.trans(u_block))
+            prefix_h = tl.dot(bx.to(tl.bfloat16), tl.trans(h_block))
+            prefix += weight_h * prefix_u + weight_r * prefix_h
 
 
 @triton.jit
@@ -300,12 +329,12 @@ def _direct_block_output_kernel(
     D,
     u,
     h,
-    omega_h,
-    omega_r,
+    decay,
+    kappa_h,
+    kappa_r,
     boundary_h,
     boundary_r,
-    prefix_h_in,
-    prefix_r_in,
+    prefix_in,
     sigma,
     stride_rhs_p: tl.constexpr,
     stride_rhs_n: tl.constexpr,
@@ -341,22 +370,22 @@ def _direct_block_output_kernel(
     panel_pair = panel * C * C
     panel_matrix = panel * R * R
     state_offset = (panel * NB + tile) * rows * C
-    prefix_h = tl.load(
-        prefix_h_in + state_offset + o_row[:, None] * C + o_s[None, :],
+    prefix = tl.load(
+        prefix_in + state_offset + o_row[:, None] * C + o_s[None, :],
         mask=valid_row[:, None], other=0.0,
     ).to(tl.float32)
-    prefix_r = tl.load(
-        prefix_r_in + state_offset + o_row[:, None] * C + o_s[None, :],
+    pair_decay = tl.load(
+        decay + panel_pair + token[:, None] * C + o_s[None, :],
         mask=valid_row[:, None], other=0.0,
     ).to(tl.float32)
-    wh = tl.load(
-        omega_h + panel_pair + token[:, None] * C + o_s[None, :],
-        mask=valid_row[:, None], other=0.0,
+    target_kappa_h = tl.load(
+        kappa_h + panel * C + token, mask=valid_row, other=0.0
     ).to(tl.float32)
-    wr = tl.load(
-        omega_r + panel_pair + token[:, None] * C + o_s[None, :],
-        mask=valid_row[:, None], other=0.0,
+    target_kappa_r = tl.load(
+        kappa_r + panel * C + token, mask=valid_row, other=0.0
     ).to(tl.float32)
+    wh = pair_decay * target_kappa_h[:, None]
+    wr = pair_decay * target_kappa_r[:, None]
     ch = tl.load(boundary_h + panel * C + token, mask=valid_row, other=0.0).to(tl.float32)
     cr = tl.load(boundary_r + panel * C + token, mask=valid_row, other=0.0).to(tl.float32)
     p_rhs_all = (
@@ -397,154 +426,278 @@ def _direct_block_output_kernel(
         x_block *= s_block
     u_block = tl.load(u + panel_local + o_s[:, None] * R + coord[None, :]).to(tl.float32)
     h_block = tl.load(h + panel_local + o_s[:, None] * R + coord[None, :]).to(tl.float32)
-    r_input = u_block if TRANSPOSE else h_block
-    r_output = h_block if TRANSPOSE else u_block
     result = tl.zeros([BM, BC], dtype=tl.float32)
     for step in range(BC):
         xv = tl.sum(tl.where(o_b[None, :] == step, x_block, 0.0), axis=1)
         uv = tl.sum(tl.where(o_b[None, :] == step, u_block, 0.0), axis=1)
-        riv = tl.sum(tl.where(o_b[None, :] == step, r_input, 0.0), axis=1)
-        rov = tl.sum(tl.where(o_b[None, :] == step, r_output, 0.0), axis=1)
-        local = tl.sum(wh * prefix_h * uv[None, :] + wr * prefix_r * rov[None, :], axis=1)
+        hv = tl.sum(tl.where(o_b[None, :] == step, h_block, 0.0), axis=1)
+        generator_value = wh * uv[None, :] + wr * hv[None, :]
+        if TRANSPOSE:
+            local = tl.sum(prefix * generator_value, axis=1)
+        else:
+            local = tl.sum(prefix * uv[None, :], axis=1)
         bv = tl.sum(tl.where(o_b[None, :] == step, boundary, 0.0), axis=1)
         result = tl.where(o_b[None, :] == step, (xv + bv + local)[:, None], result)
-        prefix_h += xv[:, None] * uv[None, :]
-        prefix_r += xv[:, None] * riv[None, :]
+        if TRANSPOSE:
+            prefix += xv[:, None] * uv[None, :]
+        else:
+            prefix += xv[:, None] * generator_value
     output_offset = panel * rows * R + o_row[:, None] * R + coord[None, :]
     tl.store(output + output_offset, result, mask=valid_row[:, None])
 
 
 @triton.jit
-def _local_vjp_resident_kernel(
-    x,
-    z,
-    a,
-    b,
-    omega,
-    cumulative,
+def _load_packed_route_value(
+    primal,
+    dual,
+    panel,
+    rhs_index,
+    token,
+    coordinate,
+    mask,
+    C: tl.constexpr,
+    R: tl.constexpr,
+    NPRIMAL: tl.constexpr,
+    NDUAL: tl.constexpr,
+    NEGATE_PRIMAL: tl.constexpr,
+):
+    """Load one logical [primal, dual...] row without an HBM concatenation."""
+    if NPRIMAL > 0:
+        is_primal = rhs_index < NPRIMAL
+        primal_index = tl.minimum(rhs_index, NPRIMAL - 1)
+        primal_pointer = (
+            (panel * NPRIMAL + primal_index) * C + token
+        ) * R + coordinate
+        primal_value = tl.load(
+            primal + primal_pointer, mask=mask & is_primal, other=0.0
+        ).to(tl.float32)
+    else:
+        is_primal = False
+        primal_value = tl.zeros(coordinate.shape, dtype=tl.float32)
+    if NDUAL > 0:
+        dual_index = tl.maximum(rhs_index - NPRIMAL, 0)
+        dual_pointer = (
+            (panel * NDUAL + dual_index) * C + token
+        ) * R + coordinate
+        dual_value = tl.load(
+            dual + dual_pointer, mask=mask & ~is_primal, other=0.0
+        ).to(tl.float32)
+    else:
+        dual_value = tl.zeros(coordinate.shape, dtype=tl.float32)
+    if NEGATE_PRIMAL:
+        primal_value = -primal_value
+    return primal_value + dual_value
+
+
+@triton.jit
+def _local_generator_vjp_kernel(
+    x_primal,
+    z_primal,
+    x_dual,
+    z_dual,
+    u,
+    h,
+    decay,
+    kappa_h,
+    kappa_r,
     mass,
-    grad_a,
-    grad_b,
-    grad_kappa,
+    grad_u,
+    grad_h,
+    grad_kappa_h,
+    grad_kappa_r,
     grad_cumulative,
     R: tl.constexpr,
     C: tl.constexpr,
-    NRHS: tl.constexpr,
+    NPRIMAL: tl.constexpr,
+    NDUAL: tl.constexpr,
     BM: tl.constexpr,
     BC: tl.constexpr,
     NB: tl.constexpr,
     LOWER: tl.constexpr,
-    SIGN: tl.constexpr,
-    SYMMETRIC: tl.constexpr,
-    ACCUMULATE_A: tl.constexpr,
-    ACCUMULATE_B: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
+    ACCUMULATE_SCALARS: tl.constexpr,
 ):
-    """Exact resident transpose of the coordinate generalized-Delta action."""
+    """Transpose N_local = U.T @ (diag(kappa * decay) [U,H])."""
     panel = tl.program_id(0).to(tl.int64)
-    rows = C * NRHS
+    rows = C * (NPRIMAL + NDUAL)
     o_row = tl.arange(0, BM)
     o_s = tl.arange(0, C)
     o_b = tl.arange(0, BC)
     valid_row = o_row < rows
     token = o_row % C
-    panel_rows = panel * rows * R
+    rhs_index = o_row // C
     panel_local = panel * C * R
     panel_pair = panel * C * C
-    bw = tl.load(
-        omega + panel_pair + token[:, None] * C + o_s[None, :],
+    pair_decay = tl.load(
+        decay + panel_pair + token[:, None] * C + o_s[None, :],
         mask=valid_row[:, None],
         other=0.0,
     ).to(tl.float32)
+    target_kappa_h = tl.load(
+        kappa_h + panel * C + token, mask=valid_row, other=0.0
+    ).to(tl.float32)
+    target_kappa_r = tl.load(
+        kappa_r + panel * C + token, mask=valid_row, other=0.0
+    ).to(tl.float32)
+    weight_h = pair_decay * target_kappa_h[:, None]
+    weight_r = pair_decay * target_kappa_r[:, None]
     prefix = tl.zeros([BM, C], dtype=tl.float32)
     for tile in range(NB):
         coord = tile * BC + o_b
-        bx = tl.load(
-            x + panel_rows + o_row[:, None] * R + coord[None, :],
-            mask=valid_row[:, None] & (coord[None, :] < R),
-            other=0.0,
+        route_mask = valid_row[:, None] & (coord[None, :] < R)
+        bx = _load_packed_route_value(
+            x_primal,
+            x_dual,
+            panel,
+            rhs_index[:, None],
+            token[:, None],
+            coord[None, :],
+            route_mask,
+            C=C,
+            R=R,
+            NPRIMAL=NPRIMAL,
+            NDUAL=NDUAL,
+            NEGATE_PRIMAL=False,
         ).to(tl.bfloat16)
-        bb = tl.load(
-            b + panel_local + o_s[:, None] * R + coord[None, :],
+        u_block = tl.load(
+            u + panel_local + o_s[:, None] * R + coord[None, :],
             mask=coord[None, :] < R,
             other=0.0,
         ).to(tl.bfloat16)
-        prefix += tl.dot(bx, tl.trans(bb))
+        h_block = tl.load(
+            h + panel_local + o_s[:, None] * R + coord[None, :],
+            mask=coord[None, :] < R,
+            other=0.0,
+        ).to(tl.bfloat16)
+        prefix_u = tl.dot(bx, tl.trans(u_block))
+        prefix_h = tl.dot(bx, tl.trans(h_block))
+        prefix += weight_h * prefix_u + weight_r * prefix_h
     suffix = tl.zeros([BM, C], dtype=tl.float32)
-    grad_w_rows = tl.zeros([BM, C], dtype=tl.float32)
+    grad_weight_h_rows = tl.zeros([BM, C], dtype=tl.float32)
+    grad_weight_r_rows = tl.zeros([BM, C], dtype=tl.float32)
     for reverse_coordinate in range(R):
         coordinate = R - 1 - reverse_coordinate if LOWER else reverse_coordinate
-        xc = tl.load(x + panel_rows + o_row * R + coordinate, mask=valid_row, other=0.0).to(tl.float32)
-        zc = tl.load(z + panel_rows + o_row * R + coordinate, mask=valid_row, other=0.0).to(tl.float32)
-        ac = tl.load(a + panel_local + o_s * R + coordinate).to(tl.float32)
-        bc = tl.load(b + panel_local + o_s * R + coordinate).to(tl.float32)
-        prefix -= xc[:, None] * bc[None, :]
-        ga = SIGN * tl.sum(zc[:, None] * bw * prefix, axis=0)
-        gb = SIGN * tl.sum(xc[:, None] * bw * suffix, axis=0)
+        xc = _load_packed_route_value(
+            x_primal,
+            x_dual,
+            panel,
+            rhs_index,
+            token,
+            coordinate,
+            valid_row,
+            C=C,
+            R=R,
+            NPRIMAL=NPRIMAL,
+            NDUAL=NDUAL,
+            NEGATE_PRIMAL=False,
+        )
+        zc = _load_packed_route_value(
+            z_primal,
+            z_dual,
+            panel,
+            rhs_index,
+            token,
+            coordinate,
+            valid_row,
+            C=C,
+            R=R,
+            NPRIMAL=NPRIMAL,
+            NDUAL=NDUAL,
+            NEGATE_PRIMAL=True,
+        )
+        uc = tl.load(u + panel_local + o_s * R + coordinate).to(tl.float32)
+        hc = tl.load(h + panel_local + o_s * R + coordinate).to(tl.float32)
+        generator = weight_h * uc[None, :] + weight_r * hc[None, :]
+        prefix -= xc[:, None] * generator
+        grad_left = tl.sum(zc[:, None] * prefix, axis=0)
+        grad_generator = xc[:, None] * suffix
+        grad_u_value = grad_left + tl.sum(grad_generator * weight_h, axis=0)
+        grad_h_value = tl.sum(grad_generator * weight_r, axis=0)
         output = panel_local + o_s * R + coordinate
-        if SYMMETRIC:
-            value = ga + gb
-            if ACCUMULATE_A:
-                value += tl.load(grad_a + output).to(tl.float32)
-            tl.store(grad_a + output, value)
-        else:
-            if ACCUMULATE_A:
-                ga += tl.load(grad_a + output).to(tl.float32)
-            if ACCUMULATE_B:
-                gb += tl.load(grad_b + output).to(tl.float32)
-            tl.store(grad_a + output, ga)
-            tl.store(grad_b + output, gb)
-        grad_w_rows += SIGN * zc[:, None] * ac[None, :] * prefix
-        suffix += zc[:, None] * ac[None, :]
-    g = tl.load(cumulative + panel * C + o_s, mask=o_s < C, other=0.0).to(tl.float32)
+        if ACCUMULATE:
+            grad_u_value += tl.load(grad_u + output).to(tl.float32)
+            grad_h_value += tl.load(grad_h + output).to(tl.float32)
+        tl.store(grad_u + output, grad_u_value)
+        tl.store(grad_h + output, grad_h_value)
+        grad_weight_h_rows += grad_generator * uc[None, :]
+        grad_weight_r_rows += grad_generator * hc[None, :]
+        suffix += zc[:, None] * uc[None, :]
     valid = tl.load(mass + panel * C + o_s, mask=o_s < C, other=0.0) > 0.0
     grad_g_rows = tl.zeros([C], dtype=tl.float32)
     grad_g_columns = tl.zeros([C], dtype=tl.float32)
     for target in range(C):
-        value = tl.sum(
-            tl.where((token[:, None] == target) & valid_row[:, None], grad_w_rows, 0.0),
+        value_h = tl.sum(
+            tl.where(
+                (token[:, None] == target) & valid_row[:, None],
+                grad_weight_h_rows,
+                0.0,
+            ),
+            axis=0,
+        )
+        value_r = tl.sum(
+            tl.where(
+                (token[:, None] == target) & valid_row[:, None],
+                grad_weight_r_rows,
+                0.0,
+            ),
             axis=0,
         )
         target_valid = tl.sum(tl.where(o_s == target, valid, 0), axis=0) > 0
-        target_g = tl.sum(tl.where(o_s == target, g, 0.0), axis=0)
-        weight = tl.where(target_valid & valid & (o_s <= target), tl.exp(target_g - g), 0.0)
-        omega_row = tl.load(
-            omega + panel_pair + target * C + o_s, mask=o_s < C, other=0.0
+        decay_row = tl.load(
+            decay + panel_pair + target * C + o_s,
+            mask=o_s < C,
+            other=0.0,
         ).to(tl.float32)
-        scaled = value * omega_row
+        kh = tl.load(kappa_h + panel * C + target).to(tl.float32)
+        kr = tl.load(kappa_r + panel * C + target).to(tl.float32)
+        scaled_h = value_h * decay_row * kh
+        scaled_r = value_r * decay_row * kr
+        scaled = scaled_h + scaled_r
         grad_g_rows += tl.where(o_s == target, tl.sum(scaled, axis=0), 0.0)
         grad_g_columns += scaled
-        tl.store(
-            grad_kappa + panel * C + target,
-            tl.where(target_valid, tl.sum(value * weight, axis=0), 0.0),
+        output_h = grad_kappa_h + panel * C + target
+        output_r = grad_kappa_r + panel * C + target
+        value_kappa_h = tl.where(
+            target_valid, tl.sum(value_h * decay_row, axis=0), 0.0
         )
-    tl.store(
-        grad_cumulative + panel * C + o_s,
-        tl.where(valid, grad_g_rows - grad_g_columns, 0.0),
-        mask=o_s < C,
-    )
+        value_kappa_r = tl.where(
+            target_valid, tl.sum(value_r * decay_row, axis=0), 0.0
+        )
+        if ACCUMULATE_SCALARS:
+            value_kappa_h += tl.load(output_h).to(tl.float32)
+            value_kappa_r += tl.load(output_r).to(tl.float32)
+        tl.store(output_h, value_kappa_h)
+        tl.store(output_r, value_kappa_r)
+    output_g = grad_cumulative + panel * C + o_s
+    value_g = tl.where(valid, grad_g_rows - grad_g_columns, 0.0)
+    if ACCUMULATE_SCALARS:
+        value_g += tl.load(output_g, mask=o_s < C, other=0.0).to(tl.float32)
+    tl.store(output_g, value_g, mask=o_s < C)
 
 
 @triton.jit
 def _boundary_matrix_vjp_kernel(
-    x,
-    z,
+    x_primal,
+    z_primal,
+    x_dual,
+    z_dual,
     boundary_h,
     boundary_r,
     grad_J,
     grad_D,
     R: tl.constexpr,
     C: tl.constexpr,
-    NRHS: tl.constexpr,
+    NPRIMAL: tl.constexpr,
+    NDUAL: tl.constexpr,
     BR: tl.constexpr,
     BK: tl.constexpr,
     LOWER: tl.constexpr,
-    SIGN: tl.constexpr,
     ACCUMULATE: tl.constexpr,
 ):
     tile_out = tl.program_id(0)
     tile_in = tl.program_id(1)
     panel = tl.program_id(2).to(tl.int64)
-    rows = C * NRHS
+    rows = C * (NPRIMAL + NDUAL)
     o_out = tile_out * BK + tl.arange(0, BK)
     o_in = tile_in * BK + tl.arange(0, BK)
     o_row = tl.arange(0, BR)
@@ -552,16 +705,34 @@ def _boundary_matrix_vjp_kernel(
     valid_in = o_in < R
     valid_row = o_row < rows
     token = o_row % C
-    panel_rows = panel * rows * R
-    bz = tl.load(
-        z + panel_rows + o_row[:, None] * R + o_out[None, :],
-        mask=valid_row[:, None] & valid_out[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    bx = tl.load(
-        x + panel_rows + o_row[:, None] * R + o_in[None, :],
-        mask=valid_row[:, None] & valid_in[None, :],
-        other=0.0,
+    rhs_index = o_row // C
+    bz = _load_packed_route_value(
+        z_primal,
+        z_dual,
+        panel,
+        rhs_index[:, None],
+        token[:, None],
+        o_out[None, :],
+        valid_row[:, None] & valid_out[None, :],
+        C=C,
+        R=R,
+        NPRIMAL=NPRIMAL,
+        NDUAL=NDUAL,
+        NEGATE_PRIMAL=True,
+    )
+    bx = _load_packed_route_value(
+        x_primal,
+        x_dual,
+        panel,
+        rhs_index[:, None],
+        token[:, None],
+        o_in[None, :],
+        valid_row[:, None] & valid_in[None, :],
+        C=C,
+        R=R,
+        NPRIMAL=NPRIMAL,
+        NDUAL=NDUAL,
+        NEGATE_PRIMAL=False,
     ).to(tl.bfloat16)
     coefficient_h = tl.load(
         boundary_h + panel * C + token, mask=valid_row, other=0.0
@@ -571,8 +742,8 @@ def _boundary_matrix_vjp_kernel(
     ).to(tl.float32)
     weighted_h = (bz * coefficient_h[:, None]).to(tl.bfloat16)
     weighted_r = (bz * coefficient_r[:, None]).to(tl.bfloat16)
-    value_j = SIGN * tl.dot(tl.trans(weighted_h), bx)
-    value_d = SIGN * tl.dot(tl.trans(weighted_r), bx)
+    value_j = tl.dot(tl.trans(weighted_h), bx)
+    value_d = tl.dot(tl.trans(weighted_r), bx)
     valid_matrix = valid_out[:, None] & valid_in[None, :]
     output_mask = valid_matrix
     if LOWER:
@@ -591,8 +762,10 @@ def _boundary_matrix_vjp_kernel(
 
 @triton.jit
 def _boundary_coefficient_output_kernel(
-    x,
-    z,
+    x_primal,
+    z_primal,
+    x_dual,
+    z_dual,
     J,
     D,
     cumulative,
@@ -604,36 +777,56 @@ def _boundary_coefficient_output_kernel(
     grad_cumulative,
     R: tl.constexpr,
     C: tl.constexpr,
-    NRHS: tl.constexpr,
+    NPRIMAL: tl.constexpr,
+    NDUAL: tl.constexpr,
     BR: tl.constexpr,
     BK: tl.constexpr,
     NT: tl.constexpr,
     LOWER: tl.constexpr,
-    SIGN: tl.constexpr,
+    ACCUMULATE_SHARED: tl.constexpr,
 ):
     panel = tl.program_id(0).to(tl.int64)
     rows = tl.arange(0, BR)
-    valid_rows = rows < C * NRHS
+    valid_rows = rows < C * (NPRIMAL + NDUAL)
     coordinates = tl.arange(0, BK)
-    panel_rows = panel * C * NRHS * R
     panel_matrix = panel * R * R
+    token = rows % C
+    rhs_index = rows // C
     row_j = tl.zeros([BR], dtype=tl.float32)
     row_d = tl.zeros([BR], dtype=tl.float32)
     for tile_out in range(NT):
         out = tile_out * BK + coordinates
         valid_out = out < R
-        bz = tl.load(
-            z + panel_rows + rows[:, None] * R + out[None, :],
-            mask=valid_rows[:, None] & valid_out[None, :],
-            other=0.0,
-        ).to(tl.float32)
+        bz = _load_packed_route_value(
+            z_primal,
+            z_dual,
+            panel,
+            rhs_index[:, None],
+            token[:, None],
+            out[None, :],
+            valid_rows[:, None] & valid_out[None, :],
+            C=C,
+            R=R,
+            NPRIMAL=NPRIMAL,
+            NDUAL=NDUAL,
+            NEGATE_PRIMAL=True,
+        )
         for tile_in in range(NT):
             incoming = tile_in * BK + coordinates
             valid_in = incoming < R
-            bx = tl.load(
-                x + panel_rows + rows[:, None] * R + incoming[None, :],
-                mask=valid_rows[:, None] & valid_in[None, :],
-                other=0.0,
+            bx = _load_packed_route_value(
+                x_primal,
+                x_dual,
+                panel,
+                rhs_index[:, None],
+                token[:, None],
+                incoming[None, :],
+                valid_rows[:, None] & valid_in[None, :],
+                C=C,
+                R=R,
+                NPRIMAL=NPRIMAL,
+                NDUAL=NDUAL,
+                NEGATE_PRIMAL=False,
             ).to(tl.bfloat16)
             factor_mask = valid_out[:, None] & valid_in[None, :]
             if LOWER:
@@ -651,9 +844,8 @@ def _boundary_coefficient_output_kernel(
             ).to(tl.bfloat16)
             action_j = tl.dot(bx, tl.trans(factor_j))
             action_d = tl.dot(bx, tl.trans(factor_d))
-            row_j += SIGN * tl.sum(bz * action_j, axis=1)
-            row_d += SIGN * tl.sum(bz * action_d, axis=1)
-    token = rows % C
+            row_j += tl.sum(bz * action_j, axis=1)
+            row_d += tl.sum(bz * action_d, axis=1)
     o_c = tl.arange(0, C)
     g = tl.load(cumulative + panel * C + o_c).to(tl.float32)
     valid = tl.load(mass + panel * C + o_c).to(tl.float32) > 0.0
@@ -666,18 +858,21 @@ def _boundary_coefficient_output_kernel(
         a = tl.exp(target_g)
         bh = tl.load(boundary_h + panel * C + target).to(tl.float32)
         br = tl.load(boundary_r + panel * C + target).to(tl.float32)
-        tl.store(
-            grad_kappa_h + panel * C + target,
-            tl.where(target_valid, value_j * a, 0.0),
+        output_h = grad_kappa_h + panel * C + target
+        output_g = grad_cumulative + panel * C + target
+        grad_h_value = tl.where(target_valid, value_j * a, 0.0)
+        grad_g_value = tl.where(
+            target_valid, value_j * bh + value_d * br, 0.0
         )
+        if ACCUMULATE_SHARED:
+            grad_h_value += tl.load(output_h).to(tl.float32)
+            grad_g_value += tl.load(output_g).to(tl.float32)
+        tl.store(output_h, grad_h_value)
         tl.store(
             grad_kappa_r + panel * C + target,
             tl.where(target_valid, value_d * a, 0.0),
         )
-        tl.store(
-            grad_cumulative + panel * C + target,
-            tl.where(target_valid, value_j * bh + value_d * br, 0.0),
-        )
+        tl.store(output_g, grad_g_value)
 
 
 @triton.jit
@@ -869,8 +1064,9 @@ def _exact_factor_solve(
     D: torch.Tensor,
     u: torch.Tensor,
     h: torch.Tensor,
-    omega_h: torch.Tensor,
-    omega_r: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r: torch.Tensor,
     boundary_h: torch.Tensor,
     boundary_r: torch.Tensor,
     *,
@@ -900,8 +1096,9 @@ def _exact_factor_solve(
         D,
         u,
         h,
-        omega_h,
-        omega_r,
+        decay,
+        kappa_h,
+        kappa_r,
         boundary_h,
         boundary_r,
         sigma_arg,
@@ -929,8 +1126,9 @@ def _chunked_factor_direct(
     D: torch.Tensor,
     u: torch.Tensor,
     h: torch.Tensor,
-    omega_h: torch.Tensor,
-    omega_r: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r: torch.Tensor,
     boundary_h: torch.Tensor,
     boundary_r: torch.Tensor,
     *,
@@ -938,6 +1136,7 @@ def _chunked_factor_direct(
     transpose: bool,
     sigma: torch.Tensor | None,
     output_dtype: torch.dtype,
+    bounded_rhs: bool,
     num_warps: int,
 ) -> torch.Tensor:
     if rhs.ndim == 3:
@@ -953,25 +1152,25 @@ def _chunked_factor_direct(
     bm, bk = _launch_shape(chunk_size, width, rhs_count)
     block = 32
     blocks = width // block
-    prefix_h = torch.empty(
+    prefix = torch.empty(
         chunks, blocks, chunk_size * rhs_count, chunk_size,
         dtype=torch.float32, device=rhs.device,
     )
-    prefix_r = torch.empty_like(prefix_h)
     sigma_arg = rhs if sigma is None else sigma
     _direct_prefix_states_kernel[(chunks,)](
-        rhs, u, h, prefix_h, prefix_r, sigma_arg,
+        rhs, u, h, decay, kappa_h, kappa_r, prefix, sigma_arg,
         stride_rhs_p=rhs.stride(0), stride_rhs_n=rhs.stride(1),
         stride_rhs_c=rhs.stride(2), stride_rhs_r=rhs.stride(3),
         R=width, C=chunk_size, NRHS=rhs_count, BM=bm,
         BC=block, NB=blocks, LOWER=lower, TRANSPOSE=transpose,
         MULTIPLY_SIGMA=sigma is not None,
+        BOUNDED_RHS=bounded_rhs,
         num_warps=num_warps, num_stages=2,
     )
     output = torch.empty(rhs.shape, dtype=output_dtype, device=rhs.device)
     _direct_block_output_kernel[(blocks, chunks)](
-        rhs, output, J, D, u, h, omega_h, omega_r,
-        boundary_h, boundary_r, prefix_h, prefix_r, sigma_arg,
+        rhs, output, J, D, u, h, decay, kappa_h, kappa_r,
+        boundary_h, boundary_r, prefix, sigma_arg,
         stride_rhs_p=rhs.stride(0), stride_rhs_n=rhs.stride(1),
         stride_rhs_c=rhs.stride(2), stride_rhs_r=rhs.stride(3),
         R=width, C=chunk_size, NRHS=rhs_count, BM=bm, BK=bk,
@@ -988,9 +1187,10 @@ def resident_primal(
     D: torch.Tensor,
     u: torch.Tensor,
     h: torch.Tensor,
-    omega_h: torch.Tensor,
-    omega_r_lower: torch.Tensor,
-    omega_r_upper: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r_lower: torch.Tensor,
+    kappa_r_upper: torch.Tensor,
     boundary_h: torch.Tensor,
     boundary_r_lower: torch.Tensor,
     boundary_r_upper: torch.Tensor,
@@ -1011,8 +1211,9 @@ def resident_primal(
         D,
         u,
         h,
-        omega_h,
-        omega_r_lower,
+        decay,
+        kappa_h,
+        kappa_r_lower,
         boundary_h,
         boundary_r_lower,
         lower=True,
@@ -1027,8 +1228,9 @@ def resident_primal(
         D,
         u,
         h,
-        omega_h,
-        omega_r_upper,
+        decay,
+        kappa_h,
+        kappa_r_upper,
         boundary_h,
         boundary_r_upper,
         lower=False,
@@ -1048,9 +1250,10 @@ def resident_dual(
     D: torch.Tensor,
     u: torch.Tensor,
     h: torch.Tensor,
-    omega_h: torch.Tensor,
-    omega_r_lower: torch.Tensor,
-    omega_r_upper: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r_lower: torch.Tensor,
+    kappa_r_upper: torch.Tensor,
     boundary_h: torch.Tensor,
     boundary_r_lower: torch.Tensor,
     boundary_r_upper: torch.Tensor,
@@ -1064,14 +1267,16 @@ def resident_dual(
         D,
         u,
         h,
-        omega_h,
-        omega_r_lower,
+        decay,
+        kappa_h,
+        kappa_r_lower,
         boundary_h,
         boundary_r_lower,
         lower=True,
         transpose=True,
         sigma=None,
         output_dtype=torch.float16,
+        bounded_rhs=True,
         num_warps=num_warps,
     )
     return _chunked_factor_direct(
@@ -1080,14 +1285,16 @@ def resident_dual(
         D,
         u,
         h,
-        omega_h,
-        omega_r_upper,
+        decay,
+        kappa_h,
+        kappa_r_upper,
         boundary_h,
         boundary_r_upper,
         lower=False,
         transpose=True,
         sigma=sigma,
         output_dtype=torch.bfloat16,
+        bounded_rhs=True,
         num_warps=num_warps,
     )
 
@@ -1098,8 +1305,9 @@ def resident_factor_transpose(
     D: torch.Tensor,
     u: torch.Tensor,
     h: torch.Tensor,
-    omega_h: torch.Tensor,
-    omega_r: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r: torch.Tensor,
     boundary_h: torch.Tensor,
     boundary_r: torch.Tensor,
     *,
@@ -1112,8 +1320,9 @@ def resident_factor_transpose(
         D,
         u,
         h,
-        omega_h,
-        omega_r,
+        decay,
+        kappa_h,
+        kappa_r,
         boundary_h,
         boundary_r,
         lower=lower,
@@ -1130,13 +1339,15 @@ def resident_factor_direct(
     D: torch.Tensor,
     u: torch.Tensor,
     h: torch.Tensor,
-    omega_h: torch.Tensor,
-    omega_r: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r: torch.Tensor,
     boundary_h: torch.Tensor,
     boundary_r: torch.Tensor,
     *,
     lower: bool,
     transpose: bool,
+    output_dtype: torch.dtype = torch.float32,
     num_warps: int,
 ) -> torch.Tensor:
     return _chunked_factor_direct(
@@ -1145,109 +1356,25 @@ def resident_factor_direct(
         D,
         u,
         h,
-        omega_h,
-        omega_r,
+        decay,
+        kappa_h,
+        kappa_r,
         boundary_h,
         boundary_r,
         lower=lower,
         transpose=transpose,
         sigma=None,
-        output_dtype=torch.float32,
+        output_dtype=output_dtype,
+        bounded_rhs=False,
         num_warps=num_warps,
     )
 
 
-def local_representation_vjp(
-    x: torch.Tensor,
-    cotangent: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    omega: torch.Tensor,
-    cumulative: torch.Tensor,
-    mass: torch.Tensor,
-    grad_a: torch.Tensor,
-    grad_b: torch.Tensor,
-    *,
-    lower: bool,
-    sign: int,
-    accumulate_a: bool,
-    accumulate_b: bool,
-    num_warps: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if x.ndim == 3:
-        x = x[:, None]
-        cotangent = cotangent[:, None]
-    chunks, rhs_count, chunk_size, width = x.shape
-    bm, bk = _launch_shape(chunk_size, width, rhs_count)
-    block = 32
-    grad_kappa = torch.empty_like(mass, dtype=torch.float32)
-    grad_cumulative = torch.empty_like(cumulative, dtype=torch.float32)
-    _local_vjp_resident_kernel[(chunks,)](
-        x, cotangent, a, b, omega, cumulative, mass,
-        grad_a, grad_b, grad_kappa, grad_cumulative,
-        R=width, C=chunk_size, NRHS=rhs_count, BM=bm,
-        BC=block, NB=triton.cdiv(width, block),
-        LOWER=lower, SIGN=sign, SYMMETRIC=False,
-        ACCUMULATE_A=accumulate_a, ACCUMULATE_B=accumulate_b,
-        num_warps=num_warps, num_stages=2,
-    )
-    return grad_kappa, grad_cumulative
-
-
-def local_symmetric_representation_vjp(
-    x: torch.Tensor,
-    cotangent: torch.Tensor,
-    a: torch.Tensor,
-    omega: torch.Tensor,
-    cumulative: torch.Tensor,
-    mass: torch.Tensor,
-    grad_a: torch.Tensor,
-    *,
-    lower: bool,
-    sign: int,
-    accumulate: bool,
-    num_warps: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if x.ndim == 3:
-        x = x[:, None]
-        cotangent = cotangent[:, None]
-    chunks, rhs_count, chunk_size, width = x.shape
-    bm, bk = _launch_shape(chunk_size, width, rhs_count)
-    block = 32
-    grad_kappa = torch.empty_like(mass, dtype=torch.float32)
-    grad_cumulative = torch.empty_like(cumulative, dtype=torch.float32)
-    _local_vjp_resident_kernel[(chunks,)](
-        x,
-        cotangent,
-        a,
-        a,
-        omega,
-        cumulative,
-        mass,
-        grad_a,
-        grad_a,
-        grad_kappa,
-        grad_cumulative,
-        R=width,
-        C=chunk_size,
-        NRHS=rhs_count,
-        BM=bm,
-        BC=block,
-        NB=triton.cdiv(width, block),
-        LOWER=lower,
-        SIGN=sign,
-        SYMMETRIC=True,
-        ACCUMULATE_A=accumulate,
-        ACCUMULATE_B=accumulate,
-        num_warps=num_warps,
-        num_stages=2,
-    )
-    return grad_kappa, grad_cumulative
-
-
-def boundary_representation_vjp(
-    x: torch.Tensor,
-    cotangent: torch.Tensor,
+def packed_factor_boundary_vjp(
+    primal_x: torch.Tensor,
+    primal_cotangent: torch.Tensor,
+    dual_x: torch.Tensor,
+    dual_cotangent: torch.Tensor,
     J: torch.Tensor,
     D: torch.Tensor,
     boundary_h: torch.Tensor,
@@ -1258,44 +1385,69 @@ def boundary_representation_vjp(
     grad_d: torch.Tensor,
     *,
     lower: bool,
-    sign: int,
     accumulate: bool,
+    shared_kappa_h: torch.Tensor | None = None,
+    shared_cumulative: torch.Tensor | None = None,
     num_warps: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if x.ndim == 3:
-        x = x[:, None]
-        cotangent = cotangent[:, None]
-    chunks, rhs_count, chunk_size, width = x.shape
-    rows = rhs_count * chunk_size
+    if primal_x.ndim == 3:
+        primal_x = primal_x[:, None]
+        primal_cotangent = primal_cotangent[:, None]
+    if dual_x.ndim == 3:
+        dual_x = dual_x[:, None]
+        dual_cotangent = dual_cotangent[:, None]
+    chunks, dual_count, chunk_size, width = dual_x.shape
+    primal_count = primal_x.shape[1]
+    if primal_x.shape != (chunks, primal_count, chunk_size, width):
+        raise ValueError("primal and dual packed routes must share [P,N,C,r]")
+    if primal_cotangent.shape != primal_x.shape or dual_cotangent.shape != dual_x.shape:
+        raise ValueError("packed route cotangents must match their action panels")
+    rows = chunk_size * (primal_count + dual_count)
     block_rows = triton.next_power_of_2(rows)
-    matrix_tile = 32
+    matrix_tile = 64 if width % 64 == 0 else 32
     matrix_tiles = triton.cdiv(width, matrix_tile)
-    grad_kappa_h = torch.empty_like(mass, dtype=torch.float32)
+    if (shared_kappa_h is None) != (shared_cumulative is None):
+        raise ValueError("shared scalar outputs must be provided together")
+    accumulate_shared = shared_kappa_h is not None
+    grad_kappa_h = (
+        torch.empty_like(mass, dtype=torch.float32)
+        if shared_kappa_h is None
+        else shared_kappa_h
+    )
     grad_kappa_r = torch.empty_like(mass, dtype=torch.float32)
-    grad_cumulative = torch.empty_like(cumulative, dtype=torch.float32)
+    grad_cumulative = (
+        torch.empty_like(cumulative, dtype=torch.float32)
+        if shared_cumulative is None
+        else shared_cumulative
+    )
+
     _boundary_matrix_vjp_kernel[
         (matrix_tiles, matrix_tiles, chunks)
     ](
-        x,
-        cotangent,
+        primal_x,
+        primal_cotangent,
+        dual_x,
+        dual_cotangent,
         boundary_h,
         boundary_r,
         grad_j,
         grad_d,
         R=width,
         C=chunk_size,
-        NRHS=rhs_count,
+        NPRIMAL=primal_count,
+        NDUAL=dual_count,
         BR=block_rows,
         BK=matrix_tile,
         LOWER=lower,
-        SIGN=sign,
         ACCUMULATE=accumulate,
         num_warps=4,
         num_stages=1,
     )
     _boundary_coefficient_output_kernel[(chunks,)](
-        x,
-        cotangent,
+        primal_x,
+        primal_cotangent,
+        dual_x,
+        dual_cotangent,
         J,
         D,
         cumulative,
@@ -1307,16 +1459,107 @@ def boundary_representation_vjp(
         grad_cumulative,
         R=width,
         C=chunk_size,
-        NRHS=rhs_count,
+        NPRIMAL=primal_count,
+        NDUAL=dual_count,
         BR=block_rows,
         BK=matrix_tile,
         NT=matrix_tiles,
         LOWER=lower,
-        SIGN=sign,
+        ACCUMULATE_SHARED=accumulate_shared,
         num_warps=num_warps,
         num_stages=1,
     )
+
     return grad_kappa_h, grad_kappa_r, grad_cumulative
+
+
+def factor_local_representation_vjp(
+    x: torch.Tensor,
+    cotangent: torch.Tensor,
+    u: torch.Tensor,
+    h: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r: torch.Tensor,
+    mass: torch.Tensor,
+    grad_u: torch.Tensor,
+    grad_h: torch.Tensor,
+    grad_kappa_h: torch.Tensor,
+    grad_kappa_r: torch.Tensor,
+    grad_cumulative: torch.Tensor,
+    *,
+    primal: bool,
+    lower: bool,
+    accumulate: bool,
+    num_warps: int,
+) -> None:
+    if x.ndim == 3:
+        x = x[:, None]
+        cotangent = cotangent[:, None]
+    if x.ndim != 4 or cotangent.shape != x.shape:
+        raise ValueError("local route and cotangent must share [P,N,C,r]")
+    chunks, rhs_count, chunk_size, width = x.shape
+    if (
+        rhs_count in (1, 2)
+        and chunk_size == 32
+        and width == 128
+        and x.is_contiguous()
+        and cotangent.is_contiguous()
+        and u.is_contiguous()
+        and h.is_contiguous()
+        and decay.is_contiguous()
+    ):
+        local_transpose(
+            x,
+            cotangent,
+            u,
+            h,
+            decay,
+            kappa_h,
+            kappa_r,
+            mass,
+            grad_u,
+            grad_h,
+            grad_kappa_h,
+            grad_kappa_r,
+            grad_cumulative,
+            primal=primal,
+            lower=lower,
+            accumulate=accumulate,
+        )
+        return
+    rows = chunk_size * rhs_count
+    block_rows = triton.next_power_of_2(rows)
+    block = 32
+    _local_generator_vjp_kernel[(chunks,)](
+        x if primal else u,
+        cotangent if primal else u,
+        u if primal else x,
+        u if primal else cotangent,
+        u,
+        h,
+        decay,
+        kappa_h,
+        kappa_r,
+        mass,
+        grad_u,
+        grad_h,
+        grad_kappa_h,
+        grad_kappa_r,
+        grad_cumulative,
+        R=width,
+        C=chunk_size,
+        NPRIMAL=rhs_count if primal else 0,
+        NDUAL=0 if primal else rhs_count,
+        BM=block_rows,
+        BC=block,
+        NB=triton.cdiv(width, block),
+        LOWER=lower,
+        ACCUMULATE=accumulate,
+        ACCUMULATE_SCALARS=True,
+        num_warps=num_warps,
+        num_stages=2,
+    )
 
 
 def boundary_route_forward(
@@ -1417,11 +1660,10 @@ def boundary_route_vjp(
 
 
 __all__ = [
-    "boundary_representation_vjp",
     "boundary_route_forward",
     "boundary_route_vjp",
-    "local_representation_vjp",
-    "local_symmetric_representation_vjp",
+    "factor_local_representation_vjp",
+    "packed_factor_boundary_vjp",
     "resident_dual",
     "resident_factor_direct",
     "resident_factor_transpose",

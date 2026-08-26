@@ -434,6 +434,35 @@ def test_r_strict_gram_block_prefix_matches_same_packed_vjp():
         assert relative < 5e-3
 
 
+def test_local_factor_is_one_generalized_delta_generator_with_exact_vjp():
+    torch.manual_seed(405)
+    chunk_size, width = 7, 11
+    u = torch.randn(chunk_size, width, device="cuda", dtype=torch.float64)
+    h = torch.randn_like(u)
+    omega_h = torch.randn(chunk_size, device="cuda", dtype=torch.float64)
+    omega_r = torch.randn_like(omega_h)
+    cotangent = torch.randn(width, width, device="cuda", dtype=torch.float64)
+
+    split_leaves = tuple(
+        value.detach().requires_grad_() for value in (u, h, omega_h, omega_r)
+    )
+    su, sh, swh, swr = split_leaves
+    split = su.T @ torch.diag(swh) @ su + su.T @ torch.diag(swr) @ sh
+    split_grads = torch.autograd.grad((split * cotangent).sum(), split_leaves)
+
+    fused_leaves = tuple(
+        value.detach().requires_grad_() for value in (u, h, omega_h, omega_r)
+    )
+    fu, fh, fwh, fwr = fused_leaves
+    generator = fwh[:, None] * fu + fwr[:, None] * fh
+    fused = fu.T @ generator
+    fused_grads = torch.autograd.grad((fused * cotangent).sum(), fused_leaves)
+
+    assert torch.allclose(fused, split, atol=1e-12, rtol=1e-12)
+    for got, expected in zip(fused_grads, split_grads):
+        assert torch.allclose(got, expected, atol=1e-11, rtol=1e-11)
+
+
 @pytest.mark.parametrize("width", [32, 128])
 def test_exact_coordinate_factor_actions_match_dense_triangular_reference(width):
     torch.manual_seed(407)
@@ -446,8 +475,14 @@ def test_exact_coordinate_factor_actions_match_dense_triangular_reference(width)
     j = 0.05 * torch.randn(panels, width, width, device="cuda")
     j = 0.5 * (j + j.transpose(-1, -2))
     d = 0.05 * torch.randn(panels, width, width, device="cuda")
-    omega_h = 0.01 * torch.randn(panels, chunk_size, chunk_size, device="cuda")
-    omega_r = 0.01 * torch.randn_like(omega_h)
+    cumulative = -0.01 * torch.rand(
+        panels, chunk_size, device="cuda"
+    ).cumsum(dim=-1)
+    indices = torch.arange(chunk_size, device="cuda")
+    decay = torch.exp(cumulative[:, :, None] - cumulative[:, None, :])
+    decay = torch.where(indices[:, None] >= indices[None, :], decay, 0.0)
+    kappa_h = 0.01 * torch.randn(panels, chunk_size, device="cuda")
+    kappa_r = 0.01 * torch.randn_like(kappa_h)
     boundary_h = 0.1 * torch.randn(panels, chunk_size, device="cuda")
     boundary_r = 0.1 * torch.randn_like(boundary_h)
     sigma = torch.exp(0.02 * torch.randn(panels, chunk_size, width, device="cuda")).half()
@@ -455,13 +490,15 @@ def test_exact_coordinate_factor_actions_match_dense_triangular_reference(width)
     def factor(panel, token, lower):
         matrix = boundary_h[panel, token] * j[panel]
         matrix = matrix + boundary_r[panel, token] * d[panel]
-        matrix = matrix + (u[panel].float().T * omega_h[panel, token]) @ u[panel].float()
-        matrix = matrix + (u[panel].float().T * omega_r[panel, token]) @ h[panel].float()
+        omega_h = kappa_h[panel, token] * decay[panel, token]
+        omega_r = kappa_r[panel, token] * decay[panel, token]
+        matrix = matrix + (u[panel].float().T * omega_h) @ u[panel].float()
+        matrix = matrix + (u[panel].float().T * omega_r) @ h[panel].float()
         strict = torch.tril(matrix, -1) if lower else torch.triu(matrix, 1)
         return torch.eye(width, device="cuda") + strict
 
     output, lower_output, _ = resident_primal(
-        rhs, j, d, u, h, omega_h, omega_r, omega_r,
+        rhs, j, d, u, h, decay, kappa_h, kappa_r, kappa_r,
         boundary_h, boundary_r, boundary_r, sigma,
         num_warps=4,
     )
@@ -486,11 +523,11 @@ def test_exact_coordinate_factor_actions_match_dense_triangular_reference(width)
     cotangent = torch.randn_like(output.float())
     for lower in (True, False):
         got = resident_factor_transpose(
-            cotangent, j, d, u, h, omega_h, omega_r,
+            cotangent, j, d, u, h, decay, kappa_h, kappa_r,
             boundary_h, boundary_r, lower=lower, num_warps=4,
         )
         direct = resident_factor_direct(
-            rhs.float(), j, d, u, h, omega_h, omega_r,
+            rhs.float(), j, d, u, h, decay, kappa_h, kappa_r,
             boundary_h, boundary_r,
             lower=lower, transpose=False, num_warps=4,
         )

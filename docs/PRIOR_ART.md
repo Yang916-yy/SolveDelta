@@ -1330,3 +1330,124 @@ transpose. The current operator-only target measured `1.537 ms` forward and
 `106.3/196.8 MiB` forward/F+B allocator peaks. These are adapted upstream
 schedules with SolveDelta strict masks and interfaces, not claims that the
 source is byte-identical to MESA.
+
+Decision update (2026-08-26): the H and R local factor terms were reduced to
+their minimal generalized-Delta generator before further schedule work. With
+token panels `U,H`, each target row is exactly
+
+`N_local = U.T @ K_i`, where
+`K_i = diag(omega_h_i) @ U + diag(omega_r_i) @ H`.
+
+This is an algebraic specialization of the same FLA/KDA blocked generator and
+transpose machinery already cited above; it introduces no new external code
+source. The direct action now applies the two route weights in its prefix
+producer and writes one FP32 block-prefix buffer instead of two. The strict
+reverse maintains one `K_i` prefix and one `U` suffix, then splits `bar_K_i`
+into final u/h and the two radial-weight cotangents in the owner epilogue. The
+former separate symmetric-H and R coordinate loops are deleted, reducing the
+four factor paths from eight local launches to four. Neither `K_i`, `bar_K_i`,
+nor a strict matrix reaches HBM.
+
+The real-valued generator fusion does not authorize one universal private
+operand dtype. A trial that also collapsed the exact solve's bounded-H FP16
+contraction and unbounded-R BF16 contraction into one BF16 dot passed factor
+action checks but raised the fixed composed `values`-gradient maximum from
+inside the `3e-2` gate to `3.1898e-2`. It was rejected. Production retains a
+static mixed-precision contraction decomposition of the same generator in the
+exact solve. Forward dual prefixes have an analytic normalization/factor bound
+and use FP16 operands; reverse direct-action prefixes consume unbounded
+cotangents and use BF16 operands. This choice is compile-time and has no
+runtime threshold or fallback.
+
+Three alternating warmed operator-only A/B rounds at
+`B1,T1024,H8,K1,r=d_v=128,C32` measured the `6ca37ff` baseline at
+`1.482--1.488 ms` forward and `7.092--7.113 ms` F+B. The single-generator path
+measured `1.441--1.461 ms` and `6.480--6.690 ms`. Profiler attribution changed
+local reverse from eight launches totaling `2.145--2.237 ms` to four totaling
+`1.687--1.757 ms`; direct prefix/output changed from approximately
+`0.064--0.067/0.772--0.800 ms` to `0.044--0.046/0.701--0.728 ms`. Exact solve
+remained approximately `1.01--1.05 ms`, as expected from retaining its mixed
+precision lowering. The operator F+B peak fell from `172.8` to `164.8 MiB`.
+
+Two complete-layer A/B rounds including projection, conv4, output projection,
+and all parameter gradients measured the baseline at `1.762--1.834 ms`
+forward and `8.071--8.073 ms` F+B, versus `1.735--1.743 ms` and
+`7.462--7.506 ms` for the selected path. F+B allocator peak fell from `196.8`
+to `188.8 MiB`. The rebuilt suite is 12/12, including an independent FP64
+single-generator forward/VJP identity test and the complete operator VJPs.
+
+Decision update (2026-08-26): two remaining ownership variants were tested
+after the single-generator path and rejected rather than retained as optional
+ABIs. First, chart forward materialized three FP32 route-specific
+`omega=kappa*Delta` tables while keeping the shared causal `Delta` table for
+the analytic chart reverse. Exact solve, direct action, and local transpose
+then consumed the preformed weights. The rebuilt 12-test suite passed, and the
+local transpose profile changed only from about `2.08 ms` to `2.00 ms`; the
+candidate added 3 MiB of saved route tables and its fresh complete-layer F+B
+runs were `8.74--9.01 ms`, versus the selected shared-decay path's established
+approximately `7.96 ms` run before the experiment. It did not establish a
+repeatable complete-path win and was deleted. Production retains one shared
+FP32 `Delta` table and forms each route weight once in the consuming CTA.
+
+Second, the combined local transpose was split into a KDA/GDN2-style final
+u/h output owner and an FLA-style scalar-weight owner. This removed the two
+weight-cotangent panels from the vector kernel's live set, but both owners had
+to replay the coordinate panels and suffix recurrence. The same semantic/VJP
+suite passed, while the eight resulting launches totaled `2.31 ms` versus
+`2.08 ms` for the four selected staged-owner launches. The split was deleted.
+This falsifies mechanical owner separation for this recurrence: its vector
+and scalar cotangents share enough exact prefix/suffix work that one staged
+owner is cheaper. No upstream kernel was found that owns SolveDelta's distinct
+per-token coordinate-triangular one-RHS solve; FLA's public triangular inverse
+programs amortize one token-triangular factor over many RHS and cannot replace
+this owner by an ABI rename.
+
+Decision update (2026-08-26): the remaining exact solve and local transpose
+were investigated against newer small-TRSM and staged-backward programs before
+another production change. Two isolated exact-solve CUDA prototypes were
+rejected. A one-CTA shared-resident owner reduced the Triton kernel's
+255-register live set to 92--122 registers with no local-memory spill, but
+measured `0.718--0.748 ms` per action versus `0.271--0.414 ms` for the selected
+Triton path. A MAGMA-style four-block recursive solve used 37--80 registers and
+seven launch waves, but measured `0.737--0.777 ms` and introduced about
+`3.2e-3` relative grouped-reduction drift. Both paid factor generation,
+staging, and synchronization costs that conventional TRSM avoids by assuming
+an already materialized factor. The prototypes were deleted; low register
+count alone is not an adoption result.
+
+The local transpose instead adopted the resource schedule in FLA DPLR
+TileLang commit `38a496e1ce58baaf1bc6613176eb2f433d0ddb90`, specifically its
+256-thread fragment distribution, phase-reused shared staging, and final
+output owner. SolveDelta's CUDA specialization assigns four target tokens to
+each of eight warps and one source channel to each lane. It keeps the exact
+coordinate prefix/suffix recurrence in registers, accumulates sixteen
+coordinate outputs per phase, and reuses the 32 KiB output staging buffer for
+the final row/column decay reduction. It does not copy DPLR's temporal-state
+mathematics or ABI.
+
+The C32/r128 one- and two-RHS kernels compile to 128 registers/thread, 50,176
+bytes shared memory, and `LOCAL=0`, allowing two CTAs/SM on the RTX 5070 Ti.
+Four real route specializations individually measured approximately
+`0.19--0.27 ms`; their profiler total was about `1.00 ms`, versus the former
+`1.69--2.08 ms`. The maximum same-input difference from the prior exact
+transpose owner was `1.9e-6` absolute and below `2.5e-7` relative across
+`bar U/bar H/bar kappa/bar G`.
+
+Seven alternating complete-operator A/B rounds at
+`B1,T1024,H8,K1,r=d_v=128,C32` measured the old Triton local owner at
+`7.653 ms` F+B median and the native owner at `6.611 ms`; the respective
+sample tails were `8.041/6.981 ms`. A complete layer including projections,
+conv4, final state, and all parameter gradients measured `8.597/7.544 ms` in
+five alternating rounds. The rebuilt suite remains 12/12.
+
+The same pass closed two adjacent epilogues without enlarging the frame
+kernel. Lower boundary coefficients now accumulate `bar kappa_H/bar G`
+directly into the upper-owned final buffers, deleting the route-scalar sum.
+Three small sigma owners write the lower cotangent, FP16 dual scale, FP32 dual
+cotangent, and final scale cotangent without materializing `diagonal`,
+`dual_sigma`, or a final two-input sum. The resulting complete operator
+measured `6.160 ms` F+B and `179.0 MiB` allocator peak in a separate seven-round
+run. Finally, boundary matrix/coefficient owners selected BK64/4-warps for
+widths divisible by 64: isolated time was `0.136 ms` versus `0.186 ms` for
+BK32, with at most `3.8e-6` reduction-order difference. BK16 and all 8-warp
+candidates were rejected.

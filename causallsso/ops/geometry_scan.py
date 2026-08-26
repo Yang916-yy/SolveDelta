@@ -14,7 +14,7 @@ import triton.language as tl
 
 @triton.jit
 def _paired_geometry_forward_kernel(
-    u_j,
+    u,
     u_d,
     h,
     cumulative,
@@ -34,10 +34,6 @@ def _paired_geometry_forward_kernel(
     lengths,
     cu_seqlens,
     chunk_offsets,
-    SH_B: tl.constexpr,
-    SH_T: tl.constexpr,
-    SH_H: tl.constexpr,
-    SH_R: tl.constexpr,
     T,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -153,17 +149,17 @@ def _paired_geometry_forward_kernel(
             )
             current_mass = tl.where(active_chunk, next_mass, current_mass)
 
-        row_base = ((bos + token[:, None]) * H + head) * R
+        row_base = panel * C * R + rows[:, None] * R
         u_j_i = tl.zeros([C, BR], dtype=tl.float16)
         u_j_j = tl.zeros([C, BR], dtype=tl.float16)
         if tile_i >= tile_j:
             u_j_i = tl.load(
-                u_j + row_base + oi[None, :],
+                u + row_base + oi[None, :],
                 mask=valid[:, None] & (oi[None, :] < R),
                 other=0.0,
             )
             u_j_j = tl.load(
-                u_j + row_base + oj[None, :],
+                u + row_base + oj[None, :],
                 mask=valid[:, None] & (oj[None, :] < R),
                 other=0.0,
             )
@@ -172,14 +168,8 @@ def _paired_geometry_forward_kernel(
             mask=valid[:, None] & (oi[None, :] < R),
             other=0.0,
         )
-        h_offset = (
-            (0 if IS_VARLEN else batch) * SH_B
-            + (bos + token[:, None] if IS_VARLEN else token[:, None]) * SH_T
-            + head * SH_H
-            + oj[None, :] * SH_R
-        )
         h_j = tl.load(
-            h + h_offset,
+            h + row_base + oj[None, :],
             mask=valid[:, None] & (oj[None, :] < R),
             other=0.0,
         )
@@ -677,10 +667,8 @@ class _GeometryScan(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        u_j: torch.Tensor,
-        u_d: torch.Tensor,
         u_panel: torch.Tensor,
-        h: torch.Tensor,
+        u_d_panel: torch.Tensor,
         h_panel: torch.Tensor,
         log_decay: torch.Tensor,
         initial_m: torch.Tensor,
@@ -694,7 +682,8 @@ class _GeometryScan(torch.autograd.Function):
     ):
         from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, prepare_chunk_offsets
 
-        batch, length, heads, width = u_j.shape
+        batch, length, heads = log_decay.shape
+        width = u_panel.shape[-1]
         is_varlen = cu_seqlens is not None
         if is_varlen:
             if batch != 1 or lengths is None:
@@ -729,17 +718,17 @@ class _GeometryScan(torch.autograd.Function):
         else:
             cumulative = chunk_local_cumsum(log_decay, chunk_size=chunk_size)
         j_boundary = torch.empty(
-            panels, width, width, dtype=torch.float32, device=u_j.device
+            panels, width, width, dtype=torch.float32, device=u_panel.device
         )
         d_boundary = torch.empty_like(j_boundary)
         m_boundary = torch.empty(
-            panels, dtype=torch.float32, device=u_j.device
+            panels, dtype=torch.float32, device=u_panel.device
         )
         mass = torch.empty(
             panels,
             chunk_size,
             dtype=torch.float32,
-            device=u_j.device,
+            device=u_panel.device,
         )
         cumulative_panel = torch.empty_like(mass)
         tail_weight = torch.empty_like(mass)
@@ -752,9 +741,9 @@ class _GeometryScan(torch.autograd.Function):
         _paired_geometry_forward_kernel[
             (triton.cdiv(width, block), triton.cdiv(width, block), state_batch * heads)
         ](
-            u_j,
-            u_d,
-            h,
+            u_panel,
+            u_d_panel,
+            h_panel,
             cumulative,
             initial_j,
             initial_d,
@@ -772,10 +761,6 @@ class _GeometryScan(torch.autograd.Function):
             lengths if lengths is not None else log_decay,
             cu_seqlens if cu_seqlens is not None else log_decay,
             chunk_offsets if chunk_offsets is not None else log_decay,
-            SH_B=h.stride(0),
-            SH_T=h.stride(1),
-            SH_H=h.stride(2),
-            SH_R=h.stride(3),
             T=length,
             H=heads,
             R=width,
@@ -1010,8 +995,6 @@ class _GeometryScan(torch.autograd.Function):
             num_warps=1,
         )
         return (
-            None,
-            None,
             grad_u_panel,
             None,
             grad_h_panel,
@@ -1028,10 +1011,8 @@ class _GeometryScan(torch.autograd.Function):
 
 
 def geometry_scan(
-    u_j: torch.Tensor,
-    u_d: torch.Tensor,
     u_panel: torch.Tensor,
-    h: torch.Tensor,
+    u_d_panel: torch.Tensor,
     h_panel: torch.Tensor,
     log_decay: torch.Tensor,
     initial_m: torch.Tensor,
@@ -1046,10 +1027,8 @@ def geometry_scan(
 ):
     """FLA/MESA affine geometry boundaries with a composed transpose."""
     return _GeometryScan.apply(
-        u_j,
-        u_d,
         u_panel,
-        h,
+        u_d_panel,
         h_panel,
         log_decay,
         initial_m,
