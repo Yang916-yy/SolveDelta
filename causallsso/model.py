@@ -7,126 +7,241 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import SolveDeltaConfig
-from .ops.chunk_wy import chunk_wy_solvedelta
+from .ops.operator import solvedelta_native
+from .ops.packing import (
+    PackedSegments,
+    build_packed_segments,
+    pack_tokens,
+    unpack_tokens,
+)
 from .reference import SolveDeltaState, solvedelta_reference
 
 
 class SolveDeltaLayerState(NamedTuple):
     operator: SolveDeltaState
-    conv_q: torch.Tensor | None
-    conv_k: torch.Tensor | None
-    conv_v: torch.Tensor | None
-
-
-class _CausalShortConvolution(nn.Conv1d):
-    """Fixed GDN2-style depthwise conv4 with shared reference/native weights."""
-
-    def __init__(self, width: int) -> None:
-        super().__init__(
-            in_channels=width,
-            out_channels=width,
-            kernel_size=4,
-            groups=width,
-            bias=False,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        cache: torch.Tensor | None = None,
-        output_final_state: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        state_width = self.kernel_size[0] - 1
-        expected_cache = (x.shape[0], x.shape[-1], state_width)
-        if cache is not None and cache.shape != expected_cache:
-            raise ValueError(
-                f"short-convolution cache must have shape {expected_cache}, "
-                f"got {tuple(cache.shape)}"
-            )
-        if x.device.type == "cuda":
-            try:
-                from causal_conv1d import causal_conv1d_fn
-            except ImportError as error:
-                raise RuntimeError(
-                    "CUDA short convolution requires causal-conv1d>=1.7.0"
-                ) from error
-            transposed = x.transpose(1, 2)
-            if transposed.stride(0) % 8 or transposed.stride(2) % 8:
-                transposed = x.contiguous().transpose(1, 2)
-            if cache is not None and cache.stride(1) != 1:
-                cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
-            result = causal_conv1d_fn(
-                x=transposed,
-                weight=self.weight[:, 0, :],
-                initial_states=cache,
-                return_final_states=output_final_state,
-                activation="silu",
-            )
-            if output_final_state:
-                output, final_state = result
-                return output.transpose(1, 2), final_state
-            return result.transpose(1, 2), None
-
-        batch, length, width = x.shape
-        state = (
-            x.new_zeros(batch, width, state_width) if cache is None else cache
-        )
-        outputs = []
-        for token in range(length):
-            window = torch.cat(
-                (state, x[:, token].unsqueeze(-1)), dim=-1
-            )
-            outputs.append(
-                F.silu(
-                    torch.einsum(
-                        "bdw,dw->bd", window, self.weight[:, 0, :]
-                    )
-                )
-            )
-            state = window[..., 1:]
-        return torch.stack(outputs, dim=1), state if output_final_state else None
+    conv: torch.Tensor | None
 
 
 class SolveDelta(nn.Module):
-    """Projection owner and dispatcher for the single SolveDelta contract."""
+    """Projection, packed conv4, operator, and output owner for SolveDelta."""
+
+    native_chunk_size = 32
 
     def __init__(self, config: SolveDeltaConfig) -> None:
         super().__init__()
         self.config = config
-        h = config.num_heads
-        r = config.resolved_head_k_dim
-        v = config.resolved_head_v_dim
-        k_edits = config.num_edits
+        heads = config.num_heads
+        width = config.resolved_head_k_dim
+        value_width = config.resolved_head_v_dim
+        edits = config.num_edits
 
         self.projection_sizes = (
-            h * r,                 # geometry feature
-            h * r,                 # geometry drive
-            h * r,                 # query
-            h * k_edits * r,       # edit keys
-            h * k_edits * v,       # edit values
-            h * k_edits * r,       # erase logits
-            h * k_edits * v,       # write logits
-            h,                     # geometry decay logits
-            h * r,                 # associative decay logits
+            heads * width,
+            heads * edits * width,
+            heads * edits * value_width,
+            heads * width,
+            heads * width,
+            heads * edits * width,
+            heads * edits * value_width,
+            heads,
+            heads * width,
+        )
+        self.projection_width = sum(self.projection_sizes)
+        # causal-conv1d's channel-last path requires the batch and token
+        # strides to be multiples of eight. Padding the packed projection row
+        # preserves a direct strided prefix view for conv4 and every consumer.
+        self.projection_padding = (
+            (-self.projection_width) % 8 if config.use_short_conv else 0
         )
         self.in_proj = nn.Linear(
             config.hidden_size,
-            sum(self.projection_sizes),
+            self.projection_width + self.projection_padding,
             bias=config.bias,
         )
-        self.output_proj = nn.Linear(h * v, config.hidden_size, bias=config.bias)
-
+        self.output_proj = nn.Linear(
+            heads * value_width, config.hidden_size, bias=config.bias
+        )
         if config.use_short_conv:
-            self.q_conv1d = _CausalShortConvolution(h * r)
-            self.k_conv1d = _CausalShortConvolution(h * k_edits * r)
-            self.v_conv1d = _CausalShortConvolution(h * k_edits * v)
+            conv_width = sum(self.projection_sizes[:3])
+            self.conv_weight = nn.Parameter(torch.empty(conv_width, 4))
+            nn.init.kaiming_uniform_(self.conv_weight, a=5**0.5)
 
-        self.geometry_log_rate = nn.Parameter(torch.zeros(h, dtype=torch.float32))
-        self.associative_log_rate = nn.Parameter(torch.zeros(h, r, dtype=torch.float32))
-        self.geometry_strength_logit = nn.Parameter(torch.full((h,), -2.0, dtype=torch.float32))
-        self.geometry_decay_bias = nn.Parameter(torch.zeros(h, dtype=torch.float32))
-        self.associative_decay_bias = nn.Parameter(torch.zeros(h, r, dtype=torch.float32))
+        self.geometry_log_rate = nn.Parameter(torch.zeros(heads, dtype=torch.float32))
+        self.associative_log_rate = nn.Parameter(
+            torch.zeros(heads, width, dtype=torch.float32)
+        )
+        self.geometry_strength_logit = nn.Parameter(
+            torch.full((heads,), -2.0, dtype=torch.float32)
+        )
+        self.geometry_decay_bias = nn.Parameter(torch.zeros(heads, dtype=torch.float32))
+        self.associative_decay_bias = nn.Parameter(
+            torch.zeros(heads, width, dtype=torch.float32)
+        )
+
+    def _packed_conv(
+        self,
+        x: torch.Tensor,
+        initial_state: torch.Tensor | None,
+        valid_mask: torch.Tensor | None,
+        reset_mask: torch.Tensor | None,
+        return_final_state: bool,
+        packed_segments: PackedSegments | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if packed_segments is None and x.device.type == "cuda":
+            try:
+                from causal_conv1d import causal_conv1d_fn
+            except ImportError as error:
+                raise RuntimeError(
+                    "SolveDelta conv4 requires causal-conv1d>=1.7.0"
+                ) from error
+            result = causal_conv1d_fn(
+                x=x.transpose(1, 2),
+                weight=self.conv_weight,
+                initial_states=initial_state,
+                return_final_states=return_final_state,
+                activation="silu",
+            )
+            if return_final_state:
+                output, final_state = result
+                return output.transpose(1, 2), final_state
+            return result.transpose(1, 2), None
+
+        if packed_segments is not None and x.device.type == "cuda":
+            return self._packed_varlen_conv(
+                x,
+                initial_state,
+                packed_segments,
+                return_final_state,
+            )
+
+        batch, length, channels = x.shape
+        if initial_state is None:
+            state = x.new_zeros(batch, channels, 3)
+        else:
+            state = initial_state
+        if valid_mask is None:
+            valid_mask = torch.ones(batch, length, dtype=torch.bool, device=x.device)
+        if reset_mask is None:
+            reset_mask = torch.zeros(batch, length, dtype=torch.bool, device=x.device)
+        outputs = []
+        for token in range(length):
+            valid = valid_mask[:, token]
+            reset = reset_mask[:, token] & valid
+            state = torch.where(reset[:, None, None], torch.zeros_like(state), state)
+            window = torch.cat((state, x[:, token, :, None]), dim=-1)
+            candidate = F.silu((window * self.conv_weight[None]).sum(dim=-1))
+            outputs.append(torch.where(valid[:, None], candidate, torch.zeros_like(candidate)))
+            state = torch.where(valid[:, None, None], window[..., 1:], state)
+        return torch.stack(outputs, dim=1), state if return_final_state else None
+
+    def _packed_varlen_conv(
+        self,
+        x: torch.Tensor,
+        initial_state: torch.Tensor | None,
+        plan: PackedSegments,
+        return_final_state: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        from causal_conv1d import causal_conv1d_fn
+        from fla.layers.utils import index_first_axis, index_put_first_axis
+        from fla.ops.utils import prepare_sequence_ids
+
+        batch, _, channels = x.shape
+        state_width = self.conv_weight.shape[-1] - 1
+        if state_width != 3:
+            raise RuntimeError("SolveDelta production convolution must be conv4")
+        if initial_state is None:
+            base_state = x.new_zeros(batch, channels, state_width)
+        else:
+            if initial_state.shape != (batch, channels, state_width):
+                raise ValueError("conv initial state must have shape [B,D,3]")
+            if initial_state.device != x.device or initial_state.dtype != x.dtype:
+                raise TypeError("conv initial state must match activation device and dtype")
+            base_state = initial_state
+        if plan.num_tokens == 0:
+            return torch.zeros_like(x), base_state if return_final_state else None
+
+        actual = pack_tokens(x, plan).squeeze(0)
+        segment_lengths_cpu = torch.diff(plan.cu_seqlens_cpu)
+        prefix_lengths_cpu = torch.zeros_like(segment_lengths_cpu)
+        if initial_state is not None:
+            prefix_lengths_cpu = plan.use_initial_cpu.long() * state_width
+        augmented_lengths_cpu = segment_lengths_cpu + prefix_lengths_cpu
+        augmented_cu_cpu = F.pad(
+            augmented_lengths_cpu.cumsum(0), (1, 0), value=0
+        )
+        augmented_cu = augmented_cu_cpu.to(x.device)
+        prefix_lengths = prefix_lengths_cpu.to(x.device)
+        packed_position = torch.arange(
+            plan.num_tokens, dtype=torch.long, device=x.device
+        ) - plan.cu_seqlens[plan.segment_ids]
+        actual_indices = (
+            augmented_cu[plan.segment_ids]
+            + prefix_lengths[plan.segment_ids]
+            + packed_position
+        )
+
+        values = [actual]
+        target_indices = [actual_indices]
+        if initial_state is not None:
+            initial_segments_cpu = torch.nonzero(
+                plan.use_initial_cpu, as_tuple=False
+            ).flatten()
+            if initial_segments_cpu.shape[0] != 0:
+                initial_segments = initial_segments_cpu.to(x.device)
+                initial_batches = plan.segment_batch_cpu[
+                    initial_segments_cpu
+                ].to(x.device)
+                initial_values = index_first_axis(
+                    initial_state, initial_batches
+                ).transpose(1, 2).reshape(-1, channels)
+                initial_indices = (
+                    augmented_cu[initial_segments, None]
+                    + torch.arange(state_width, device=x.device)[None, :]
+                ).reshape(-1)
+                values.append(initial_values)
+                target_indices.append(initial_indices)
+
+        total_augmented = int(augmented_cu_cpu[-1].item())
+        augmented = index_put_first_axis(
+            torch.cat(values, dim=0),
+            torch.cat(target_indices, dim=0),
+            total_augmented,
+        )
+        sequence_ids = prepare_sequence_ids(
+            augmented_cu,
+            cu_seqlens_cpu=augmented_cu_cpu,
+        ).to(torch.int32).unsqueeze(0)
+        convolved = causal_conv1d_fn(
+            x=augmented.transpose(0, 1).unsqueeze(0),
+            weight=self.conv_weight,
+            seq_idx=sequence_ids,
+            activation="silu",
+        ).transpose(1, 2)
+        output = unpack_tokens(
+            index_first_axis(convolved.squeeze(0), actual_indices).unsqueeze(0),
+            plan,
+        )
+        if not return_final_state:
+            return output, None
+
+        has_segment = plan.last_segment >= 0
+        selected_segment = plan.last_segment.clamp_min(0)
+        segment_start = augmented_cu[selected_segment]
+        segment_end = augmented_cu[selected_segment + 1]
+        state_indices = segment_end[:, None] + torch.arange(
+            -state_width, 0, dtype=torch.long, device=x.device
+        )[None, :]
+        state_valid = state_indices >= segment_start[:, None]
+        gathered = augmented.index_select(
+            0, state_indices.clamp(0, total_augmented - 1).reshape(-1)
+        ).view(batch, state_width, channels)
+        gathered = torch.where(
+            state_valid[:, :, None], gathered, torch.zeros_like(gathered)
+        ).transpose(1, 2)
+        final_state = torch.where(
+            has_segment[:, None, None], gathered, base_state
+        )
+        return output, final_state
 
     def forward(
         self,
@@ -140,214 +255,162 @@ class SolveDelta(nn.Module):
         return_final_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, SolveDeltaLayerState]:
         if hidden_states.ndim != 3:
-            raise ValueError("hidden_states must have shape [B, T, hidden_size]")
-        batch, length, width = hidden_states.shape
-        if width != self.config.hidden_size:
-            raise ValueError(
-                f"expected hidden_size={self.config.hidden_size}, got {width}"
-            )
-        h_count = self.config.num_heads
-        r = self.config.resolved_head_k_dim
-        v_dim = self.config.resolved_head_v_dim
+            raise ValueError("hidden_states must have shape [B,T,hidden_size]")
+        batch, length, hidden_width = hidden_states.shape
+        if hidden_width != self.config.hidden_size:
+            raise ValueError("hidden state width does not match the configuration")
+        heads = self.config.num_heads
+        width = self.config.resolved_head_k_dim
+        value_width = self.config.resolved_head_v_dim
         edits = self.config.num_edits
         use_native = (
             hidden_states.device.type == "cuda"
             and hidden_states.dtype == torch.bfloat16
         )
-        if use_native and (r != 128 or edits != 1):
-            raise NotImplementedError(
-                "the native BF16 SolveDelta path requires r=128 and K=1"
-            )
-        if (
-            use_native
-            and self.config.use_short_conv
-            and (h_count * v_dim) % 8
-        ):
-            raise NotImplementedError(
-                "the native CUDA conv4 path requires the projected value "
-                "width H*d_v to be divisible by 8"
-            )
+        packed_segments = None
         if use_native and (valid_mask is not None or reset_mask is not None):
-            raise NotImplementedError(
-                "the native BF16 SolveDelta path does not yet support "
-                "valid_mask or reset_mask"
-            )
-
-        def view_head(x: torch.Tensor, dim: int) -> torch.Tensor:
-            return x.view(batch, length, h_count, dim)
-
-        projected = self.in_proj(hidden_states).split(self.projection_sizes, dim=-1)
-        (
-            u_raw, h_raw, q_raw, key_raw, value_raw,
-            erase_raw, write_raw, geometry_raw, associative_raw,
-        ) = projected
-
-        operator_initial = initial_state.operator if initial_state is not None else None
-        conv_q = conv_k = conv_v = None
-        if self.config.use_short_conv:
-            initial_conv_q = initial_state.conv_q if initial_state is not None else None
-            initial_conv_k = initial_state.conv_k if initial_state is not None else None
-            initial_conv_v = initial_state.conv_v if initial_state is not None else None
-            q_raw, conv_q = self._apply_short_conv(
-                self.q_conv1d, q_raw, initial_conv_q,
-                valid_mask, reset_mask, return_final_state,
-            )
-            key_raw, conv_k = self._apply_short_conv(
-                self.k_conv1d, key_raw, initial_conv_k,
-                valid_mask, reset_mask, return_final_state,
-            )
-            value_raw, conv_v = self._apply_short_conv(
-                self.v_conv1d, value_raw, initial_conv_v,
-                valid_mask, reset_mask, return_final_state,
-            )
-        else:
-            q_raw = F.silu(q_raw)
-            key_raw = F.silu(key_raw)
-            value_raw = F.silu(value_raw)
-
-        u = view_head(u_raw, r)
-        h = view_head(h_raw, r)
-        q = view_head(q_raw, r)
-        keys = key_raw.view(batch, length, h_count, edits, r)
-        values = value_raw.view(batch, length, h_count, edits, v_dim)
-        if use_native:
-            from .ops.fused_gates import fused_native_solvedelta_gates
-
-            u = u.to(torch.bfloat16)
-            h = h.to(torch.bfloat16)
-            q = q.to(torch.bfloat16)
-            keys = keys.to(torch.bfloat16)
-            values = values.to(torch.bfloat16)
-            erase, write, geometry_log_decay, associative_log_decay = (
-                fused_native_solvedelta_gates(
-                    erase_raw.view(batch, length, h_count, edits, r),
-                    write_raw.view(
-                        batch, length, h_count, edits, v_dim
-                    ),
-                    geometry_raw,
-                    associative_raw.view(batch, length, h_count, r),
-                    self.geometry_log_rate,
-                    self.associative_log_rate,
-                    self.geometry_decay_bias,
-                    self.associative_decay_bias,
+            if valid_mask is None:
+                valid_mask = torch.ones(
+                    batch, length, dtype=torch.bool, device=hidden_states.device
                 )
+            if reset_mask is None:
+                reset_mask = torch.zeros(
+                    batch, length, dtype=torch.bool, device=hidden_states.device
+                )
+            if (
+                valid_mask.device != hidden_states.device
+                or reset_mask.device != hidden_states.device
+            ):
+                raise ValueError("masks must share the activation device")
+            packed_segments = build_packed_segments(valid_mask, reset_mask)
+
+        packed_projection = self.in_proj(hidden_states)
+        projected = packed_projection[..., : self.projection_width].split(
+            self.projection_sizes, dim=-1
+        )
+        (
+            q_raw,
+            key_raw,
+            value_raw,
+            u_raw,
+            h_raw,
+            erase_raw,
+            write_raw,
+            geometry_raw,
+            associative_raw,
+        ) = projected
+        conv_state = initial_state.conv if initial_state is not None else None
+        if self.config.use_short_conv:
+            qkv_width = sum(self.projection_sizes[:3])
+            qkv, final_conv = self._packed_conv(
+                packed_projection[..., :qkv_width],
+                conv_state,
+                valid_mask,
+                reset_mask,
+                return_final_state,
+                packed_segments,
             )
-            strength = torch.sigmoid(self.geometry_strength_logit.float())
+            q_raw, key_raw, value_raw = qkv.split(self.projection_sizes[:3], dim=-1)
         else:
-            erase = 2.0 * torch.sigmoid(
-                erase_raw.view(batch, length, h_count, edits, r)
+            q_raw, key_raw, value_raw = map(F.silu, (q_raw, key_raw, value_raw))
+            final_conv = None
+
+        def heads_view(x: torch.Tensor, size: int) -> torch.Tensor:
+            return x.view(batch, length, heads, size)
+
+        u = heads_view(u_raw, width)
+        h = heads_view(h_raw, width)
+        q = heads_view(q_raw, width)
+        keys = key_raw.view(batch, length, heads, edits, width)
+        values = value_raw.view(batch, length, heads, edits, value_width)
+        if use_native:
+            from .ops.gates import fused_decay_gate
+
+            geometry_log_decay = fused_decay_gate(
+                geometry_raw,
+                self.geometry_log_rate.float(),
+                self.geometry_decay_bias.float(),
             )
-            write = 2.0 * torch.sigmoid(
-                write_raw.view(batch, length, h_count, edits, v_dim)
-            )
-            geometry_log_decay = -torch.exp(self.geometry_log_rate).view(
-                1, 1, h_count
-            )
+            associative_log_decay = fused_decay_gate(
+                associative_raw,
+                self.associative_log_rate.float().flatten(),
+                self.associative_decay_bias.float().flatten(),
+            ).view(batch, length, heads, width)
+        else:
+            geometry_log_decay = -torch.exp(
+                self.geometry_log_rate.float()
+            ).view(1, 1, heads)
             geometry_log_decay = geometry_log_decay * F.softplus(
-                geometry_raw
-                + self.geometry_decay_bias.view(1, 1, h_count)
+                geometry_raw.float()
+                + self.geometry_decay_bias.float().view(1, 1, heads)
             )
-            associative_raw = view_head(associative_raw, r)
             associative_log_decay = -torch.exp(
-                self.associative_log_rate
-            ).view(1, 1, h_count, r)
+                self.associative_log_rate.float()
+            ).view(1, 1, heads, width)
             associative_log_decay = associative_log_decay * F.softplus(
-                associative_raw
-                + self.associative_decay_bias.view(1, 1, h_count, r)
+                associative_raw.float().view(batch, length, heads, width)
+                + self.associative_decay_bias.float().view(1, 1, heads, width)
             )
-            strength = torch.sigmoid(self.geometry_strength_logit)
-        if not associative_decay_enabled:
-            associative_log_decay = torch.zeros_like(associative_log_decay)
+        strength = torch.sigmoid(self.geometry_strength_logit)
         if not geometry_enabled:
             strength = torch.zeros_like(strength)
+        if not associative_decay_enabled:
+            associative_log_decay = torch.zeros_like(associative_log_decay)
 
+        operator_initial = initial_state.operator if initial_state is not None else None
         if use_native:
-            outputs, final_state = chunk_wy_solvedelta(
-                u,
-                h,
-                q,
-                keys,
-                values,
-                geometry_log_decay,
-                associative_log_decay,
-                erase,
-                write,
-                strength,
+            output, operator_state = solvedelta_native(
+                u.to(torch.bfloat16),
+                h.to(torch.bfloat16),
+                q.to(torch.bfloat16),
+                keys.to(torch.bfloat16),
+                values.to(torch.bfloat16),
+                geometry_log_decay.float(),
+                associative_log_decay.float(),
+                erase_raw.view(batch, length, heads, edits, width),
+                write_raw.view(batch, length, heads, edits, value_width),
+                strength.float(),
                 initial_state=operator_initial,
+                valid_mask=valid_mask,
+                reset_mask=reset_mask,
+                _packed_segments=packed_segments,
+                return_final_state=return_final_state,
+                chunk_size=self.native_chunk_size,
             )
         else:
-            reference_dtype = u.dtype
-            outputs, final_state = solvedelta_reference(
+            erase = 2.0 * torch.sigmoid(
+                erase_raw.float().view(batch, length, heads, edits, width)
+            )
+            write = 2.0 * torch.sigmoid(
+                write_raw.float().view(batch, length, heads, edits, value_width)
+            )
+            output, operator_state = solvedelta_reference(
                 u,
                 h,
                 q,
                 keys,
                 values,
-                geometry_log_decay.to(reference_dtype),
-                associative_log_decay.to(reference_dtype),
-                erase.to(reference_dtype),
-                write.to(reference_dtype),
-                strength.to(reference_dtype),
+                geometry_log_decay.to(u.dtype),
+                associative_log_decay.to(u.dtype),
+                erase.to(u.dtype),
+                write.to(u.dtype),
+                strength.to(u.dtype),
                 initial_state=operator_initial,
                 valid_mask=valid_mask,
                 reset_mask=reset_mask,
             )
-        outputs = outputs.reshape(batch, length, h_count * v_dim)
-        outputs = self.output_proj(outputs.to(hidden_states.dtype))
+            if not return_final_state:
+                operator_state = None
+        output = self.output_proj(
+            output.reshape(batch, length, heads * value_width).to(
+                hidden_states.dtype
+            )
+        )
         if not return_final_state:
-            return outputs
-        return outputs, SolveDeltaLayerState(final_state, conv_q, conv_k, conv_v)
+            return output
+        if operator_state is None:
+            raise RuntimeError("operator did not return the requested final state")
+        return output, SolveDeltaLayerState(operator_state, final_conv)
 
-    @staticmethod
-    def _apply_short_conv(
-        convolution: nn.Module,
-        x: torch.Tensor,
-        initial_cache: torch.Tensor | None,
-        valid_mask: torch.Tensor | None,
-        reset_mask: torch.Tensor | None,
-        output_final_state: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Apply GDN2-style depthwise causal convolution with exact state masks."""
-        if valid_mask is None and reset_mask is None:
-            return convolution(
-                x=x,
-                cache=initial_cache,
-                output_final_state=output_final_state,
-            )
 
-        batch, length, width = x.shape
-        kernel_size = convolution.kernel_size[0]
-        state_width = kernel_size - 1
-        if initial_cache is None:
-            cache = x.new_zeros(batch, width, state_width)
-        else:
-            expected = (batch, width, state_width)
-            if initial_cache.shape != expected:
-                raise ValueError(
-                    f"short-convolution cache must have shape {expected}, "
-                    f"got {tuple(initial_cache.shape)}"
-                )
-            cache = initial_cache
-        if valid_mask is None:
-            valid_mask = torch.ones(batch, length, dtype=torch.bool, device=x.device)
-        if reset_mask is None:
-            reset_mask = torch.zeros(batch, length, dtype=torch.bool, device=x.device)
-
-        weight = convolution.weight[:, 0, :]
-        bias = convolution.bias
-        outputs = []
-        for token in range(length):
-            valid = valid_mask[:, token]
-            reset = reset_mask[:, token] & valid
-            cache = torch.where(reset[:, None, None], torch.zeros_like(cache), cache)
-            window = torch.cat(
-                (cache, x[:, token].unsqueeze(-1)), dim=-1
-            )
-            preactivation = torch.einsum("bdw,dw->bd", window, weight)
-            if bias is not None:
-                preactivation = preactivation + bias
-            output = F.silu(preactivation)
-            outputs.append(torch.where(valid[:, None], output, torch.zeros_like(output)))
-            candidate = window[..., 1:]
-            cache = torch.where(valid[:, None, None], candidate, cache)
-        return torch.stack(outputs, dim=1), cache if output_final_state else None
+__all__ = ["SolveDelta", "SolveDeltaLayerState"]

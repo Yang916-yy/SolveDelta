@@ -32,6 +32,10 @@ the decision it informed.
   compression study, not part of the base model.
 - Prefer the simplest engineering form that is algebraically equivalent to the
   reference and measurably better for the intended workload.
+- `docs/FROM_SCRATCH_REBUILD.md` is the sole current native implementation
+  blueprint. The native bounded-LDU inverse is the exact coordinate-axis
+  generalized-Delta solve specified there. A fixed-degree Neumann or other
+  approximate frame action is not an authorized production implementation.
 - The first native training contract is BF16-observable with BF16 public and
   raw operands, analytically bounded private FP16 panels, and FP32
   accumulation. Geometry and associative continuation states, log-decay and
@@ -142,10 +146,13 @@ the decision it informed.
   token recurrence, causality and sequence semantics, FP32 continuation states,
   structural identities and reductions, and the chart's mathematical
   invariants. Production-observable gates cover BF16 outputs, every returned
-  or chunk-boundary state, and composed VJPs under the fixed ceilings in
-  `docs/VALIDATION_PLAN.md`. Private diagnostics cover intermediate reduction
-  order, packed-panel comparisons, strict-coordinate cotangents, repeatability,
-  and source-level implementation shape. A private diagnostic may localize a
+  or chunk-boundary state, and composed VJPs under ceilings regenerated from
+  the connected replacement path and frozen before native acceptance. The
+  pre-rebuild `docs/VALIDATION_PLAN.md` and its tests have no authority over the
+  replacement and may be deleted rather than repaired. Private diagnostics
+  cover intermediate reduction order, packed-panel comparisons,
+  strict-coordinate cotangents, repeatability, and source-level implementation
+  shape. A private diagnostic may localize a
   regression or impose a broad corruption guard, but it must not reject an
   implementation that passes the hard and production-observable gates merely
   because it uses a different arithmetic schedule.
@@ -170,11 +177,17 @@ the decision it informed.
 - Keep structural zero distinct from algebraic cancellation. Explicit identity
   geometry, zero strength, invalid padding, and disabled components must remain
   exact. A nonstructural zero produced by cancellation is accepted through the
-  fixed per-dtype `q2`, chart-action, and VJP gates in
-  `docs/VALIDATION_PLAN.md`; do not add a data-dependent threshold or fallback.
+  newly frozen chart-action and composed-VJP gates; private `q2` is only a
+  localization diagnostic. Do not add a data-dependent threshold or fallback.
 - An optimized solve must state its algebraic equivalence before adoption.
-  Approximate solves are experiments until forward, state, and gradient error
-  are bounded over the normal training envelope.
+  Production evaluates each unit-triangular factor as an exact coordinate-axis
+  generalized-Delta recurrence, using blocked forward substitution for the
+  primal and the corresponding blocked transpose substitution in reverse.
+  Pair tiles are generated from the structured boundary/local operands and
+  discarded at their consumer; a dense tokenwise factor or synthetic feature
+  panel is not a production ABI. Approximate solves remain experiments until
+  their forward, state, and gradient errors are bounded over the normal
+  training envelope and this contract is explicitly revised.
 - Benchmarks measure implementations; they never define model semantics.
 
 ## Investigation before invention
@@ -200,6 +213,13 @@ the decision it informed.
 
 ## Implementation order
 
+Obsolete native sources, Python glue, tests, validation documents, and private
+ABIs may be deleted before this work begins. Version-control recovery is
+sufficient; the old implementation need not remain buildable or coexist with
+the replacement for comparison. Deletion is not production acceptance: the
+new path may be declared current only after its relevant hard and regenerated
+production-observable gates pass.
+
 1. freeze the SolveDelta FP64 token recurrence in `causallsso/reference.py`;
 2. prove and test GDN2 and DeltaProduct-`K` reductions;
 3. establish Prefix-LSSO provenance diagnostics and independently test the
@@ -218,5 +238,6 @@ the decision it informed.
 Optimized candidates may be written and benchmarked while later envelope tests
 are still being added. They may replace the current path only after the hard
 semantic and production-observable gates relevant to their supported surface
-pass. Private diagnostics guide that iteration; they do not freeze an older
-kernel's arithmetic structure.
+pass. An archived revision may be benchmarked in a separate worktree when an
+old performance comparison is useful. Private diagnostics guide that
+iteration; they do not freeze an older kernel's arithmetic structure.

@@ -13,9 +13,11 @@ feeding an exact chunk-WY associative exterior. Section 4 proves that the WY
 part is exact. Every other implementation choice below must earn its place by
 an oracle check and an end-to-end benchmark.
 
-This is not a compatibility plan. Once the replacement passes the gates in
-Section 16, the old native path, Python glue, and obsolete execution documents
-are deleted. No legacy ABI, backend selector, or fallback survives.
+This is not a compatibility plan. The old native path, Python glue, tests, and
+obsolete execution documents may be deleted before construction begins;
+version control is their recovery mechanism. Section 16 governs when the new
+path may be accepted as production, not how long obsolete source must remain in
+the working tree. No legacy ABI, backend selector, or fallback survives.
 
 ## 1. Conclusions first
 
@@ -32,7 +34,9 @@ The production split is:
    chunk-width pair/WY exterior, the FP32 associative state scan, output
    composition, and their transpose kernels.
 4. A dtype-specialized MESA resident `Hkk/Hkv` program owns the paired FP32
-   `(J,D)` geometry boundary scan and its resident transpose.
+   `(m,J,D)` geometry boundary scan and its resident transpose. The scalar
+   mass route is owned by one matrix-tile CTA in that same resident program;
+   it is not a separate sequence scan.
 5. MESA's two-dot action and pair-reduction schedules, instantiated with CuTe
    warp-level atoms and CUB reductions, own the local structured work.
 6. One thin SolveDelta-specific orchestration owns the bounded-LDU composition:
@@ -273,46 +277,69 @@ or, algebraically because a strict triangular `N` is nilpotent,
 (I+N)^{-1}=\sum_{k=0}^{r-1}(-N)^k.
 \]
 
-The first native production specialization evaluates the fixed degree-six
-Neumann action
+The production inverse is an exact coordinate-axis generalized-Delta solve.
+For one chunk-frame row `i`, let `b_i^H,b_i^R` denote its boundary
+coefficients and `omega_i^H,omega_i^R in R^C` its local coefficients. Each
+strict-factor entry before masking is
 
 \[
-P_6(N)=\sum_{j=0}^{6}(-N)^j
+N_{i,pq}=b_i^H J_{0,pq}+b_i^R D_{0,pq}
++\sum_s\omega^H_{is}u_{s,p}u_{s,q}
++\sum_s\omega^R_{is}u_{s,p}h_{s,q}.
 \]
 
-by the resident Horner recurrence
+Introduce notation-only feature rows
 
 \[
-x^{(0)}=b,\qquad x^{(j+1)}=b-Nx^{(j)},\quad j=0,\ldots,5.
+\mathcal Q_{i,p}=\left[
+b_i^H J_{0,p,:}+b_i^R D_{0,p,:},\;
+\omega_i^H\odot u_{:,p},\;
+\omega_i^R\odot u_{:,p}
+\right],
 \]
-
-No power, dense factor, or per-iteration global panel is formed. The degree is
-compile-time fixed at `p=6`; there is no convergence test, early stop,
-precision fallback, or runtime degree selection. This is a bounded numerical
-implementation of the exact LDU operator, not a second mathematical model.
-For either strict factor, `||N||_2 <= ||N||_F < q=1/4`, so exact arithmetic
-gives
 
 \[
-\left\|(I+N)^{-1}-P_6(N)\right\|_2
-\le \delta_6=\frac{q^7}{1-q}
-=\frac1{12288}\simeq8.138\times10^{-5}.
+\mathcal K_q=\left[e_q,\;u_{:,q},\;h_{:,q}\right],
 \]
 
-For the complete primal LDU action this implies
+where `e_q` is the `q`th coordinate basis vector. Then, exactly,
 
 \[
-\left\|\widehat P_M-P_M\right\|_2
-\le 2e^{1/4}\frac43\delta_6
-\simeq2.79\times10^{-4}.
+\boxed{N_{i,pq}=\mathcal Q_{i,p}^T\mathcal K_q.}
 \]
 
-Low-precision packing and contraction error is separate and remains governed
-by the BF16-observable validation contract. MESA `chunk_update_once` owns the
-resident matrix-free action and loop skeleton; SolveDelta specializes its
-strict H/R coordinates and exact transpose. MathDx remains the exact TRSM
-oracle. FLA `solve_tril` is no longer the production frame-solve owner; its
-chunk-WY use is a separate token-axis operation.
+For a lower factor, `(I+N_i)y_i=b_i` is therefore
+
+\[
+s_{i,p-1}=\sum_{q<p}\mathcal K_qy_{i,q},\qquad
+y_{i,p}=b_{i,p}-\mathcal Q_{i,p}^Ts_{i,p-1},
+\]
+
+\[
+s_{i,p}=s_{i,p-1}+\mathcal K_py_{i,p}.
+\]
+
+This is the generalized-Delta recurrence along the coordinate axis. An upper
+factor is the same recurrence in reversed coordinate order. Production ports
+FLA GDN2/DPLR's blocked substitution: 16-coordinate diagonal blocks use its
+exact ordered solve, while complete off-diagonal blocks use Tensor-Core pair
+dots. Boundary and the two local pair contributions are generated directly at
+the consuming block; the formal `r+2C` features, a dense factor, its inverse,
+and iterative panels never reach HBM.
+
+The reverse is the corresponding exact transpose recurrence. For
+`y=(I+N)^{-1}b`,
+
+\[
+z=(I+N)^{-T}\bar y,\qquad \bar b=z,\qquad \bar N=-zy^T.
+\]
+
+FLA's pair-dot transpose schedule consumes each strict `bar N` block directly
+into boundary and local operands. It does not materialize `bar N` or replay a
+coordinate descriptor chain. MathDx remains an independent exact TRSM oracle.
+The only native error relative to the FP64 solve is the declared operand
+rounding and FP32 reduction order under the BF16-observable contract; there is
+no authorized solve approximation.
 
 With normalized key `k_t`, erase covector source
 `b_t=erase_t\odot k_t`, normalized query `q_t`, and write target
@@ -340,8 +367,8 @@ These equations, masks/resets, and returned states must remain exactly those
 of `reference.py`. An implementation layout is never allowed to redefine
 them.
 
-The operator receives already activated `erase/write` gates. The layer owner,
-not the chunk operator, computes
+The FP64 mathematical operator receives activated `erase/write` gates. The
+layer owns
 
 \[
 erase=2\sigma(erase_{raw}),\qquad
@@ -355,7 +382,14 @@ g=-\exp(\rho_s)\operatorname{softplus}(g_{raw}+b_s),
 \]
 
 and `gamma=sigmoid(gamma_raw)` in FP32. Their reverse uses the matching fused
-FLA gate schedule and reduces static parameter gradients in FP32. For
+FLA gate schedule and reduces static parameter gradients in FP32. In the
+native production graph, BF16 `erase_raw/write_raw` cross the model-to-kernel
+boundary and their activations are composed into their unique consumer
+epilogues: erase in the normalized dual-source store and write in the
+FLA-native `z=write*v` pack. No activated full-tensor gate is written to HBM.
+The same epilogues apply the sigmoid transpose from FP32 register values, so
+this changes only the private boundary and not the layer-owned expression or
+its composed VJP. For
 `y=x/max(||x||_2,epsilon)`, the normalization transpose is
 
 \[
@@ -821,9 +855,10 @@ same reference and packed operand bits.
 
 ## 7. Frame forward and transpose
 
-Do not differentiate a materialized M or unroll six polynomial VJP nodes.
-Reverse each solve through the implicit exact-solve formula, with its inverse
-and transpose inverse evaluated by the same fixed `P_6` schedule.
+Do not differentiate a materialized M or build a coordinatewise VJP chain.
+Forward and reverse use the paired exact blocked substitutions derived in
+Section 2. The same structured pair generator serves the primal solve, its
+transpose solve, the direct dual actions, and their pair-dot transposes.
 
 ### 7.1 Primal
 
@@ -832,10 +867,11 @@ y=L^{-1}k,\qquad v=\sigma^{-1}\odot y,
 \qquad d=U^{-1}v.
 \]
 
-For each lower or upper factor, production substitutes `P_6(N)` for the exact
-inverse and executes six complete matrix-free actions while the `C x r` base
-and iterate panels remain resident. Full boundary blocks are broad GEMMs.
-Local outer products use MESA's identity
+For each lower or upper factor, production executes the exact coordinate-axis
+generalized-Delta recurrence in 16-coordinate blocks. The diagonal block uses
+FLA's ordered unit-triangular solve. Complete off-diagonal blocks use broad
+Tensor-Core pair products. Full boundary blocks are direct J/D tiles; local
+outer products use MESA's identity
 
 \[
 \boxed{((XB^T)\odot\Omega)A.}
@@ -849,9 +885,10 @@ C_H=Xu^T,\qquad C_R=Xh^T,
 \]
 
 then applies the strict mask and route coefficients before the second dot. The
-lower action uses `kappa_R^-`; the upper action uses `kappa_R^+`. Coordinate
-tiles inside one `Nx` action are ordinary masked matrix actions, not sequential
-triangular substitutions. No full L/U/H/R tensor exists.
+lower action uses `kappa_R^-`; the upper action uses `kappa_R^+` and reverses
+the coordinate order. Each diagonal tile preserves the required ordered
+dependency; all earlier complete tiles are consumed by block products. No full
+L/U/H/R tensor or formal generalized-Delta feature panel exists.
 
 ### 7.2 Paired dual
 
@@ -876,22 +913,13 @@ z=(I+N)^{-T}\bar y,\qquad
 \bar b=z,\qquad \bar N=-zy^T.
 \]
 
-Production evaluates `z` with `P_6(N)^T` and streams `-zy^T` directly into the
-strict chart transpose. It deliberately does not differentiate through the six
-Horner updates. Thus it approximates the VJP of the exact LDU operator rather
-than defining the exact derivative of a truncated-polynomial model. For one
-factor, excluding operand rounding,
+Production evaluates `z` with the reversed blocked substitution and streams
+the strict blocks of `-zy^T` through FLA's pair-dot transpose schedule. Applied
+to the staged primal action, this gives exactly, up to declared operand
+rounding and FP32 reduction order,
 
 \[
-\left\|\widehat{\bar N}-\bar N\right\|_F
-\le \frac{2q^7}{(1-q)^2}\|\bar y\|_2\|b\|_2
-\simeq2.17\times10^{-4}\|\bar y\|_2\|b\|_2.
-\]
-
-Applied to the staged primal action, this gives
-
-\[
-\bar v\mathrel{\approx}P_6(N_U)^T\bar d,
+\bar v=U^{-T}\bar d,
 \qquad \bar U\mathrel{+}=-\bar v d^T,
 \]
 
@@ -901,15 +929,14 @@ Applied to the staged primal action, this gives
 \]
 
 \[
-\bar k\mathrel{\approx}P_6(N_L)^T\bar y,
+\bar k=L^{-T}\bar y,
 \qquad \bar L\mathrel{+}=-\bar k y^T.
 \]
 
 The forward `y` panel used by the rank-one cotangent is a declared private
-training cache or is recomputed by the same fixed `P_6(N_L)k` recurrence. It is
-never reconstructed by asserting `Ud=v`, because that equality is only exact
-for an exact solve. Cache versus recompute is a static complete-path A/B choice;
-neither choice creates per-iteration HBM traffic.
+training cache or is recomputed by the same exact blocked recurrence. Cache
+versus recompute is a static complete-path A/B choice; neither choice creates
+per-coordinate HBM traffic.
 
 Each rank-one factor cotangent is generated in registers and consumed by the
 chart transpose before its coordinate tile is released.
@@ -1226,7 +1253,7 @@ Audited sources:
 | radial norm/VJP | FLA `modules/l2norm.py` plus MESA Gram/Hadamard | scaled epsilon-L2Norm and matrix-free norm statistics | set `eps=c^2`, retain masks/routes, never materialize x |
 | diagonal chart | FLA tanh soft-cap primitive plus exp | `s*tanh(x/s)` forward/reverse | add H/R routes in the frame FP32 epilogue |
 | L/U direct action | MESA `chunk_update_once` two-dot | resident state plus local rank-k residual action | coordinate strict mask and route coefficients |
-| L/U inverse action | MESA `chunk_update_once` resident loop plus MathDx TRSM oracle | fixed matrix-free action recurrence | specialize strict H/R action and transpose at compile-time `p=6` |
+| L/U inverse action | FLA GDN2/KDA blocked substitution plus MathDx TRSM oracle | exact ordered diagonal solve and off-diagonal pair-dot composition | specialize the strict H/R pair producer and its transpose |
 | W/A and chunk solve | FLA GDN2/KDA/DPLR | safe diagonal, gauged off-diagonal, candidate C16/C32/C64 solve blocks | independent e/chi row panels and d columns |
 | WY RHS | FLA GDN2 `wy_fast.py` | wide RHS schedule | direct E and Z operands |
 | S state/output | FLA common state and DPLR/GLA output | complete fwd/bwd programs | direct-e naming and FP32 continuation |
@@ -1241,7 +1268,7 @@ The exact source symbols audited for first adoption are:
 | radial scalar forward/reverse | FLA `l2norm_fwd_kernel` / `l2norm_bwd_kernel` |
 | diagonal soft-cap forward/reverse | FLA `ops.utils.op.tanh` and `cross_entropy_fwd_kernel` / `cross_entropy_bwd_kernel` soft-cap epilogues |
 | matrix-free residual state action | MESA `chunk_update_once` |
-| resident fixed-order inverse action | MESA `chunk_update_once` inside `chunk_fwd_mesa_cg_dim64_kernel` |
+| exact coordinate-axis inverse action | FLA GDN2/KDA fused inter-solve schedule and `solve_tril` ordered diagonal block |
 | chunk unit-lower inverse candidates | FLA C16 solve, C32 `merge_16x16_to_32x32_inverse_kernel`, and a C64 upstream schedule to audit |
 | wide WY right-hand sides | FLA DPLR `wu_fwd_kernel` |
 | WY matrix reverse | FLA DPLR `prepare_wy_repr_bwd_kernel` |
@@ -1274,19 +1301,18 @@ restores the glue this rebuild removes.
 |---|---|---:|---|
 | F0 | cuBLASLt/PyTorch | library | packed projection |
 | F1 | causal-conv1d | `(B,ceil(T/128),channels)` | packed q/k/v and optional cache |
-| F2 | FLA-derived preprocess | token rows | FP16 u/q/k/b, BF16 z, FP32 logs |
+| F2 | FLA-derived preprocess | token rows | FP16 u/q/k/b, BF16 z, FP32 logs; raw sigmoid is consumer-owned |
 | F3 | FLA cumsum | chunk/head/channel tiles | geometry and associative cumulative logs |
-| F4 | MESA resident J/D specialization | `(B*H,ceil(r/32),ceil(r/32))` | FP32 J/D boundary history |
-| F5 | scalar resident scan | `B*H` | FP32 m boundary history |
-| F6 | radial specializations | `(3,B*H*Nchunk)` | FP32 G/c/n and coefficients |
-| F7 | chart diagonal | `(B*H*Nchunk,ceil(r/128))` | FP16 sigma |
-| F8 | bounded-LDU primal | `B*H*Nchunk` | FP16 d |
-| F9 | bounded-LDU dual2 | `B*H*Nchunk` | FP16 e/chi |
-| F10 | FLA pair/inverse at selected C | diagonal and off-diagonal grids | packed chunk inverse and A |
-| F11 | FLA wide RHS | `B*H*Nchunk` | U/Y |
-| F12 | FLA state forward | state tiles | FP32 final S |
-| F13 | FLA output | panel/value tiles | BF16 output |
-| F14 | cuBLASLt/PyTorch | library | model-width output |
+| F4 | MESA resident m/J/D specialization | `(B*H,ceil(r/32),ceil(r/32))` | FP32 m/J/D boundary history |
+| F5 | radial specializations | `(3,B*H*Nchunk)` | FP32 G/c/n and coefficients |
+| F6 | chart diagonal | `(B*H*Nchunk,ceil(r/128))` | FP16 sigma |
+| F7 | bounded-LDU primal | `B*H*Nchunk` | FP16 d |
+| F8 | bounded-LDU dual2 | `B*H*Nchunk` | FP16 e/chi |
+| F9 | FLA pair/inverse at selected C | diagonal and off-diagonal grids | packed chunk inverse and A |
+| F10 | FLA wide RHS | `B*H*Nchunk` | U/Y |
+| F11 | FLA state forward | state tiles | FP32 final S |
+| F12 | FLA output | panel/value tiles | BF16 output |
+| F13 | cuBLASLt/PyTorch | library | model-width output |
 
 F0 places q/k/v contiguously. F1 consumes the strided channel-last slice as
 Mamba does; there is no `cat/permute/contiguous`. Conv weights are one packed
@@ -1344,9 +1370,9 @@ The initial schedule search includes four- and eight-warp programs for each
 `C in {16,32,64}`. Tile width, stages, shared allocation, register lifetime,
 spill traffic, and achieved CTAs/SM follow the complete mature schedule being
 adapted; none is a semantic constant or an isolated pass/fail threshold. The
-forward program keeps the base and current Neumann iterate resident for all six
-actions; the reverse uses FP32 resident iterates because cotangent magnitude is
-not statically bounded.
+forward program keeps the source, solved blocks, and generalized-Delta prefix
+state resident across coordinate blocks. Reverse uses the matching suffix
+state and FP32 cotangents because their magnitude is not statically bounded.
 
 The following is the C32/four-warp resource estimate used to seed one candidate,
 not a contract for the winner:
@@ -1354,8 +1380,8 @@ not a contract for the winner:
 | Shared buffer | Type/shape | Bytes |
 |---|---|---:|
 | double-buffered u/h tiles | `2 x 2 x [C,16] x 2` | 4,096 |
-| Neumann base and current iterate | `2 x [C,r] FP16` | 16,384 |
-| H/R pair scores | `2 x [C,C] FP16` | 4,096 |
+| source and solved panel | `2 x [C,r] FP16` | 16,384 |
+| H/R prefix state or pair scores | `2 x [C,C] FP16` | 4,096 |
 | double-buffered J/D tile | `2 x 2 x [16,16] BF16` | 2,048 |
 | coefficient/RHS scratch | fixed ceiling | 8,192 |
 | alignment/CuTe reserve | fixed ceiling | 6,144 |
@@ -1367,10 +1393,10 @@ is no high/low expansion or data-dependent precision branch.
 
 A `32x16x16` product is exactly four `m16n8k16` MMA instructions: two token
 halves by two coordinate halves. A `32x32x16` score update is eight MMA
-instructions. Each Neumann step invokes the same inline action schedule over
-all coordinate tiles, accumulates `next=base-action` in distributed FP32
-fragments, and overwrites the current-iterate panel only after every source
-tile has been consumed. There is no coordinate-serial diagonal solve.
+instructions. Each off-diagonal coordinate block uses these pair products;
+each 16-coordinate diagonal block uses the ordered FLA solve because that is
+where the true dependency lives. Solved blocks update the resident prefix once
+and are never replayed as polynomial iterates.
 
 The only project-owned arithmetic is the strict H/R specialization and its
 transpose around MESA's resident two-dot action. MathDx exact TRSM remains an
@@ -1397,18 +1423,16 @@ sequence:
 
 1. Stage `u/h`, FP32 boundary `J/D`, validity predicates, radial statistics,
    and the source panel once; invalid rows are zero-filled.
-2. Generate the bounded lower-action coefficients and directly pack the
-   analytically bounded factor operands to FP16. Set both resident panels to
-   the source `base`.
-3. Repeat exactly six times: traverse the eight coordinate tiles with MESA's
-   inline two-dot action; combine boundary and local contributions in FP32;
-   compute `next=base-action` in distributed FP32 fragments; after the complete
-   action has consumed the old iterate, round `next` directly over that
-   resident FP16 panel.
-4. Apply `exp(-ell)` in FP32 to the degree-six lower result and directly pack
-   the upper-solve base.
-5. Repeat the identical six-step program with the upper strict mask and
-   `kappa_R^+`, then emit the primal result at the selected private
+2. Generate the bounded lower coefficients and initialize the resident
+   generalized-Delta prefix state.
+3. Traverse 16-coordinate blocks in increasing order. Generate each diagonal
+   pair tile, run the exact FLA ordered solve, update the resident prefix, and
+   apply the solved block to later complete blocks with the upstream pair-dot
+   schedule. Generate-use-discard every pair tile.
+4. Apply `exp(-ell)` in FP32 to the exact lower result and directly pack the
+   upper-solve source.
+5. Traverse the same program in decreasing coordinate order with
+   `kappa_R^+`, then emit the exact primal result at the selected private
    frame-to-pair boundary.
 
 The paired dual CTA loads `b` and `q` together, applies exact direct actions
@@ -1417,11 +1441,11 @@ row panels at that same private boundary. It performs no inverse iteration and
 does not require a synthetic `3C` tile; such packing is a downstream schedule
 choice rather than an operator property.
 
-Forward iterates satisfy `||x^(j)|| <= 4/3 ||base||` for either factor, and the
-complete primal panel is bounded by `e^(1/4)(4/3)^2 < 2.284` times its normalized
-source, so the declared direct FP16 panels are analytically safe. FP32 produces
-every recurrence update before that direct store. Casting an already rounded
-BF16 result to FP16 is not permitted.
+The exact factor bounds give `||L^-1||,||U^-1|| <= 4/3`, so the complete primal
+panel is bounded by `e^(1/4)(4/3)^2 < 2.284` times its normalized source and the
+declared direct FP16 panels are analytically safe. FP32 produces each ordered
+update before its direct store. Casting an already rounded BF16 result to FP16
+is not permitted.
 
 Every CTA barrier in this list protects an actual shared producer/consumer.
 Adding a barrier, a global score store, or a second shared-memory owner is a
@@ -1429,14 +1453,13 @@ design change that must win a complete-path A/B.
 
 ### 12.3 Frame reverse microprogram
 
-The primal transpose CTA applies six resident `N_U^T` actions to evaluate
-`P_6(N_U)^T bar_d`, produces `-bar_v d^T` as FP32 fragments, and immediately
-feeds those fragments to the upper H/R strict transpose. It then forms
-`bar_y/bar_ell`, applies six resident `N_L^T` actions, and consumes
-`-bar_k y^T` in the lower strict transpose. It never constructs the six-node
-autograd graph. Forward `y` is consumed from the declared cache or recomputed
-with `P_6(N_L)k`, according to one compile-time benchmarked schedule; no
-per-iteration panel is written to HBM.
+The primal transpose CTA runs the exact reversed block substitution for
+`U^-T bar_d`, produces `-bar_v d^T` as FP32 fragments, and immediately feeds
+those fragments to the upper H/R pair transpose. It then forms
+`bar_y/bar_ell`, runs the exact reversed block substitution for `L^-T bar_y`,
+and consumes `-bar_k y^T` in the lower pair transpose. Forward `y` is consumed
+from the declared cache or recomputed with the same exact recurrence; no
+coordinate descriptor or iterative panel is written to HBM.
 
 Reverse iterates and base additions remain FP32 because upstream cotangents
 have no static FP16 magnitude bound. Their Tensor Core action operands use one
@@ -1454,6 +1477,14 @@ chart contributions are consumed before register reuse. Only three FP32
 `bar_n` scalar panels leave these CTAs. The later MESA Gram/Hadamard transpose
 owns the norm-dependent global reduction and writes final FP32 geometry
 partials directly.
+
+The four factor contributions use output-owned accumulation. A boundary or
+vector tile has one CTA owner; the primal-upper, primal-lower, dual-upper, and
+dual-lower launches update the same FP32 `bar J/bar D/bar u/bar h` tile in
+stream order and no additional combined matrix panel is written. This is
+cross-kernel accumulation with disjoint tile ownership, not an atomic
+reduction or a cross-chunk mega-kernel. Only the small route-scalar and sigma
+cotangents retain separate reduction buffers.
 
 Thus forward and reverse have paired ownership: solve versus transpose solve,
 action versus transpose action, and Gram reduction versus Gram transpose. No
@@ -1617,8 +1648,9 @@ projections, output projection, dtype, gradients, and state policy.
    complete-path cost loses to another passing schedule.
 4. Frame backward consists of transpose block actions plus radial scalar/pair
    reverse, never descriptor replay.
-5. Complete F+B must improve the current `6.539 ms` median by at least 25
-   percent before the old path is deleted.
+5. Complete F+B must improve the archived `6.539 ms` median by at least 25
+   percent before the replacement is accepted. The archived implementation may
+   be reproduced in a separate worktree; it need not coexist with the rebuild.
 6. First acceptance is at most `1.5x` matched complete GDN2 F+B; research
    target is `1.25x` or better.
 7. Report saved cache and allocator peak with latency.
@@ -1629,17 +1661,19 @@ even when an isolated kernel wins.
 
 ## 17. Replacement order
 
-1. Add standalone FP64 chunk identities for Sections 3-9.
-2. Build direct-e FLA exterior without chart code.
-3. Specialize MESA/FLA FP32 J/D resident forward/reverse without changing its
+1. Delete obsolete native sources, Python glue, tests, validation documents,
+   execution documents, and private ABIs. Retain `causallsso/reference.py`, this
+   blueprint, the current model-visible contract, and provenance records.
+2. Add standalone FP64 chunk identities for Sections 3-9.
+3. Build direct-e FLA exterior without chart code.
+4. Specialize MESA/FLA FP32 J/D resident forward/reverse without changing its
    low-level schedule.
-4. Build radial statistics and diagonal producers.
-5. Build primal forward and strict transpose together.
-6. Build paired dual forward and strict transpose together.
-7. Compose the full operator and freeze same-packed numerical gates.
-8. Profile/tune only after the entire forward/backward closes.
-9. Delete old native sources, Python glue, tests, and execution documents in
-   one reviewable change.
+5. Build radial statistics and diagonal producers.
+6. Build primal forward and strict transpose together.
+7. Build paired dual forward and strict transpose together.
+8. Compose the full operator and rebuild/freeze the minimal semantic,
+   production-observable, and same-packed diagnostic gates from the oracle.
+9. Profile/tune only after the entire forward/backward closes.
 10. Update notices and publish measured artifacts.
 
 Old native behavior is never a compatibility requirement. Only the FP64

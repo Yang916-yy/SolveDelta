@@ -568,25 +568,22 @@ backend convenience alter the model mathematics. The earlier standalone
 polynomial path materialized its own panels and defined a competing solve
 surface; deleting it was correct.
 
-Decision revision (2026-08-25): select a different, resident fixed-order
-Neumann lowering for the first native training path. It keeps the exact
-bounded-LDU recurrence as the mathematical operator, reuses the matrix-free
-strict action already needed by direct primal/dual work, and holds `base` and
-all iterates inside one program. With `||N||_2 < q=1/4`, degree `p=6` has the
-static single-factor truncation bound
+Rejected decision (2026-08-25): a resident fixed-order Neumann lowering was
+briefly selected for the first native training path. With `||N||_2 < q=1/4`,
+degree `p=6` had the static single-factor truncation bound
 
 \[
 \delta_6=\frac{q^7}{1-q}=\frac1{12288}\simeq8.138\times10^{-5}.
 \]
 
-The reverse uses the implicit solve VJP
-`z=(I+N)^(-T) bar_y`, `bar_N=-z y^T`, with `z` evaluated by the same resident
-degree-six transpose recurrence. It does not retain a six-node polynomial VJP
-chain. This route is therefore not the deleted HBM polynomial backend and does
-not change the LDU factor family. MESA's inline `chunk_update_once` and its
-resident CG-loop schedule informed the execution decision; the CG reductions,
-adaptive iteration count, denominator perturbation, ridge system, and `q_star`
-ABI are not adopted. MathDx continues to own exact factor-action validation.
+The approximation was subsequently rejected as production semantics. The
+current implementation uses exact blocked coordinate-axis generalized-Delta
+substitution and its exact transpose: complete coordinate blocks use pair-dot
+products and each diagonal block retains ordered substitution. MESA's inline
+`chunk_update_once` and resident CG loop still inform the action schedule, but
+its CG recurrence, adaptive iteration count, denominator perturbation, ridge
+system, and `q_star` ABI are not adopted. MathDx continues to own independent
+exact factor-action validation.
 
 An isolated SM120 chart VJP prototype matched FP64 closely but materialized
 full factor cotangents and increased end-to-end time and workspace. It was
@@ -1012,3 +1009,324 @@ they solve a token-tile triangular factor, whereas SolveDelta has one
 coordinate-triangular factor per token with nonlinear H/R route coefficients.
 The reusable unit is therefore the mature action/substitution program, not the
 MESA CG wrapper or the complete GDN ABI.
+
+Decision update (2026-08-25): the paired geometry state specialization is now
+connected at its natural memory boundary. It copies MESA's resident
+`chunk_mesa_net_fwd_kernel_h` loop, removes only the model-specific beta/CG
+interface, separates the direct FP16 J and BF16 D operand pointers, and writes
+the frame consumer's `[B,H,N,r,r]` order directly. The mass owner writes the
+matching cumulative and tail panels in the same order. Reverse loads the
+symmetric J representative directly, retains the resident affine state loop,
+uses MESA's Hkk/Hkv tiled transpose-dot pattern for `bar u/bar h`, and uses
+FLA's `tl.cumsum(..., reverse=True)` schedule for the scalar affine transpose.
+Two broad FP32 products remain separate because log-decay inner products are
+sensitive scalars under the precision contract. At
+`B=1,T=1024,H=8,r=d_v=128,K=1,C=32`, this interface specialization changed
+the current complete operator from about `4.86/19.73 ms` forward/F+B to about
+`4.67/18.01 ms`; it also removed the geometry permute/contiguous boundary ABI.
+The same connection audit found that passing PyTorch `diagonal()` and
+zero-stride `expand()` views into a contiguous-only Triton ABI made chart
+values depend on storage offset. The adopted interface passes the source
+strides explicitly and keeps the resident J diagonal tile in its stored
+symmetric representative after every chunk. No diagonal or strength panel is
+materialized merely to repair pointer arithmetic. A K=2 whole/recurrent-split
+check is consequently bitwise equal for output and all continuation states.
+
+Decision correction (2026-08-25): a same-device source and latency audit
+distinguished literal upstream schedules from implementations that only reuse
+an algebraic identity. The direct-e pair producer retains FLA's sub-intra
+schedule and measured about `0.065 ms` for its two physical interaction
+matrices, versus `0.108 ms` for the generic upstream four-matrix producer.
+The fused normalization fan-out measured about `0.086/0.438 ms` forward/F+B,
+versus `0.117/0.684 ms` for three independent upstream L2Norm calls. The paired
+geometry resident loop appeared to measure about `0.066 ms`, versus `0.080 ms`
+for the upstream MESA C32 FP32-state configuration, in that single profiling
+pass. The later seven-round audit below supersedes the geometry latency claim:
+it measured the state kernels themselves at `55.2/45.4 us`, current/upstream.
+Direct-`e` and normalization remain genuine mature specializations; geometry
+retains the upstream loop shape but has not retained its full efficiency.
+
+The bounded frame is not. At
+`B=1,T=1024,H=8,K=1,r=d_v=128,C=32`, a warmed profiler attributed about
+`3.492 ms` forward and `9.673 ms` backward to `resident_frame.py`. Its eight
+local representation transpose launches alone used about `5.351 ms`. The
+complete upstream MESA 30-step F+B measured `1.524 ms` on the same device and
+shape. This comparison does not assert algebraic equivalence between MESA CG
+and bounded LDU; it established that SolveDelta's former six-step code did not
+retain
+MESA's resident efficiency. The cause is visible in source: the local strict
+action and its VJP scan all `r` coordinates with scalar select/reduction state,
+whereas upstream `chunk_update_once` expresses each action as two Tensor-Core
+dots inside one resident loop. The R-route Gram transpose and composed sigma
+reverse are likewise SolveDelta schedules built from MESA/FLA formulas, not
+copied upstream programs.
+
+Accordingly, provenance uses precise terms. MESA owns the adopted geometry
+state loop and supplies the two-dot action primitive; FLA generalized-Delta
+owns the blocked pair-dot/ordered-diagonal substitution pattern. SolveDelta
+specializes the structured J/D and local u/h pair generator without adopting
+either upstream ABI wholesale.
+
+Decision revision (2026-08-26): fixed-degree Neumann is no longer authorized.
+Each unit-triangular factor is evaluated by an exact coordinate-axis
+generalized-Delta recurrence. The connected kernel ports FLA GDN2/KDA's
+blocked-substitution split: complete coordinate blocks use pair dots while the
+diagonal block preserves ordered substitution. It generates the J/D boundary
+and u/h local pair tiles at their consumer, so neither a tokenwise dense factor
+nor the notation-only generalized-Delta feature panel reaches HBM. Reverse
+uses the corresponding exact transpose substitution and the implicit identity
+`bar_N=-z y^T`.
+
+The upstream `solve_tril` ABI was deliberately not copied. It writes a complete
+strict factor and its inverse; at SolveDelta's one-factor-per-token shape that
+would dominate HBM. What is reused is its diagonal solve and block-composition
+schedule, with a reduced structured producer interface. Two attempts to reuse
+FLA's causal `dA x feature` backward schedule without its materialized `dA`
+layout were measured and deleted. A source-parallel variant regressed target
+F+B from about `9.64 ms` to `24.09 ms`; grouping eight sources per CTA regressed
+it to `34.82 ms`. Both repeated a causal-mask MMA per source and incurred too
+many atomics. The current fastest local transpose remains a resident
+prefix/suffix state pass plus ordered 32-coordinate diagonal reverse. Replacing
+it requires changing the upstream representation or joining it to chart
+reverse, not another local `tl.dot` rewrite.
+
+The exact path passes the rebuilt K1/K2 FP64 output/state/composed-VJP suite,
+mask/reset semantics, bitwise symmetric J, aligned recurrent splits, and exact
+GDN2/DeltaProduct-K identity-geometry reductions. At the target shape,
+C32/four-warps measures about `1.50/9.32 ms` forward/F+B in the direct variant
+A/B, while C16 is `1.87/17.96 ms`, C64/four-warps is `5.79/24.05 ms`, and
+C32/eight-warps is `1.96/12.94 ms`. The production specialization therefore
+keeps C32/four-warps; the other schedules are rejected measurements rather
+than runtime selectors.
+
+Decision update (2026-08-26): mask/reset execution now uses FLA's variable-
+length ownership across the complete frame and exterior. Valid tokens are
+gathered once into a flat batch, valid resets define `cu_seqlens`, and
+`prepare_chunk_indices` gives normalization, the MESA J/D scan, radial/chart,
+and frame actions one shared global chunk order. `prepare_chunk_offsets` maps
+those source-token frame panels into the independently chunked edit-expanded
+direct-e/WY schedule. The transpose consumes the same indices and offsets;
+there is no rectangular `[segment,max_length,...]` frame buffer or per-segment
+kernel loop. FLA pair/WY/state/output kernels remain separate from the frame,
+so this is metadata/layout fusion rather than a high-pressure CTA fusion.
+
+On a measured `B=4,T=512,H=8,r=d_v=128,K=1,C=32` workload with one empty
+batch and 12 unequal reset-free segments, rectangular frame scheduling needed
+864 head-panels while the packed schedule needed 360. Frame-only forward fell
+from `4.169` to `1.967 ms`, F+B from `26.632` to `11.892 ms`, forward allocator
+peak increment from `341.4` to `150.6 MiB`, and F+B peak increment from
+`1072.4` to `454.0 MiB`. The complete packed operator measured `3.936 ms`
+forward and `15.630 ms` F+B; removing explicit per-segment zero initial states
+reduced its forward peak increment from about `206` to `186 MiB`. The all-valid
+target specialization remained separate and measured `1.770/8.777 ms`
+forward/F+B in the same development pass.
+
+### Upstream-original latency audit
+
+A seven-round alternating A/B on the RTX 5070 Ti used
+`B=1,T=1024,H=8,K=1,r=d_v=128,C=32`, CUDA events, and warmed Triton caches.
+The direct-`e` exterior was compared with FLA DPLR under the exact variable
+mapping `q=chi`, `k=b=d`, `a=-e*exp(g)`, `v=write*values`, and `scale=1`.
+Its BF16 output/final-state differences from the generic arithmetic schedule
+were `7.81e-3/8.44e-3`; these are private schedule differences rather than a
+second operator contract.
+
+| Comparison | Current | Upstream original | Result |
+|---|---:|---:|---|
+| direct-`e` exterior forward vs preformed generic DPLR inputs | `0.220 ms` | `0.238 ms` | current is `7%` faster |
+| direct-`e` exterior F+B vs preformed generic DPLR inputs | `1.166 ms` | `1.198 ms` | current is `3%` faster |
+| direct-`e` exterior forward vs generic ABI including `a/z` formation | `0.218 ms` | `0.311 ms` | current is `30%` faster |
+| direct-`e` exterior F+B vs generic ABI including `a/z` formation | `1.105 ms` | `1.359 ms` | current is `19%` faster |
+| J/D FP32 boundaries plus scalar mass forward | `0.145 ms` | MESA two-state FP32 `0.108 ms` | current is `34%` slower including mass |
+| complete operator forward | `1.684 ms` | GDN2 C64 `0.350 ms` | current is `4.81x` slower |
+| complete operator F+B | `8.798 ms` | GDN2 C64 `1.321 ms` | current is `6.66x` slower |
+| complete operator allocator peak in F+B | `322.9 MiB` | GDN2 `74.1 MiB` | current is `4.36x` larger |
+
+The direct-`e` peak was `78.1 MiB`, versus `81.1 MiB` for preformed generic
+DPLR and `97.1 MiB` when the generic `a/z` ABI was composed. It is therefore a
+real upstream-quality specialization and is not the remaining performance
+problem.
+
+The MESA comparison used C32, `states_in_fp32=True`, two dense `128x128`
+states, and the same scalar decay. Current additionally computes and stores the
+effective mass. Kernel attribution separated about `55.2 us` for the current
+paired J/D state loop and `17.8 us` for mass, versus `45.4 us` for the original
+MESA pair and `0.9 us` for its cumsum. Thus mass explains part of the wall-time
+gap, but the copied state schedule itself remains about `21%` slower than the
+original and misses the blueprint's 15-percent target. Its absolute gap is
+small and is not the first optimization target.
+
+The complete comparison is intentionally workload-matched rather than
+algebraically equivalent: GDN2's upstream implementation fixes C64 and does
+not own SolveDelta geometry. Subtracting forward from F+B gives about
+`7.114 ms` backward for SolveDelta versus `0.970 ms` for GDN2. A three-step
+profile attributed `2.266 ms` per iteration to eight
+`_local_vjp_resident_kernel` launches, `1.148 ms` to four exact coordinate
+solves, `0.823 ms` to five direct block-output launches, and `0.771 ms` to the
+sigma reverse. The first hotspot alone is slower than the complete original
+GDN2 F+B.
+
+Source inspection narrows the meaning of "adapted". The direct coordinate
+action stores two FP32 block-prefix tensors between
+`_direct_prefix_states_kernel` and `_direct_block_output_kernel`. At the target
+shape its paired two-RHS call writes `2 x 8 MiB` before the block consumers
+reload it. The local transpose keeps no coordinate descriptor in HBM, but
+still performs a scalar 128-coordinate loop with select/reduction work in each
+iteration. The sigma reverse keeps several `32x128` values and a `32x32`
+weight in one CTA. These are project-owned lowerings built from upstream
+identities, not original MESA/GDN2 programs. Future performance claims must
+distinguish this source-level provenance from measured schedule equivalence.
+
+Decision update (2026-08-26): the first post-audit schedule replacements were
+accepted or rejected only on the complete path. Retiling sigma reverse so one
+panel CTA keeps the C-by-C temporal weight resident and streams 32-coordinate
+tiles reduced `_sigma_backward_tiled_kernel` from roughly `0.77-0.91 ms` to
+`0.050-0.052 ms`. The rebuilt composed-VJP suite remained 8/8. The geometry
+resident loop now lets its `(tile_i=0,tile_j=0)` owner produce the scalar mass
+boundaries, token masses, tail weights, and chunk decay from the cumulative
+values already loaded by the J/D program. It also omits J loads and products
+in upper-coordinate CTAs, where only unconstrained D exists. This deleted the
+separate approximately `17.8 us` mass launch while changing the combined
+geometry kernel from about `64.8 us` to `66.5 us` in the same profiler class.
+
+Three direct-action no-prefix-HBM schedules were measured and deleted: a
+single-CTA resident action (`11.72 ms` complete F+B), a coordinate-block
+consumer that recomputed prefixes (`10.61 ms`), and a per-RHS resident split
+(`14.13 ms`), versus the approximately `9 ms` selected path. The communication
+choice is unavoidable in these Triton decompositions: coordinate CTAs must
+share a prefix, recompute it, or serialize the coordinate traversal. Lower HBM
+traffic did not compensate for lost CTA parallelism or longer live state.
+
+Likewise, a block-parallel strict transpose that reconstructed chart scale as
+`kappa_i*exp(G_i-G_j)` passed composed VJPs but regressed complete F+B to
+about `13.11 ms`. A resident block variant used about `3.121 ms` for local
+reverse versus `2.266 ms` for the scalar resident baseline because it extended
+the `omega/prefix/suffix` live set. Upstream inspection found no mature exact
+no-`dA` replacement to transplant: FLA generalized-Delta/WY reverse forms and
+consumes a materialized `dA`, while MESA Hkk/Hkv backward owns the radial
+Gram/Hadamard transpose rather than this coordinate-triangular factor
+cotangent. A future replacement must either port a complete CUDA resident
+program with its producer layout or batch multiple primal/dual cotangents in a
+multi-input resident transpose without first concatenating an HBM panel.
+
+Decision update (2026-08-26): five low-risk interface specializations were
+adopted after the larger scheduling audit. First, direct-`e` backward now
+replays only the pair/WY/state caches it consumes; it does not launch FLA's
+final output kernel or allocate the discarded output. The complete-layer A/B
+was `10.134 ms` for cache-only replay versus `10.187 ms` for the old replay.
+Second, the layer uses FLA's `fused_gdn_gate` for geometry and associative
+decays. Complete forward improved from about `1.976` to `1.876 ms`; complete
+F+B changed from `10.351` to `10.534 ms`. The forward winner is retained. Its
+transpose is mathematically connected and a formula/composed-VJP check covers
+raw input, log-rate, and bias gradients, but the upstream schedule is not a
+fully fused parameter transpose: it writes `[ceil(BT/32),H]` `dA` partials,
+reduces them with `sum(0)`, and separately rereads `dg` to reduce `dbias`.
+
+Passing the BF16 projection view directly to that upstream gate was tested and
+rejected for the present precision contract. Raw and log-rate gradients were
+unchanged or within `1.4e-7` relative error, but upstream forms `dbias` from
+the input-typed `dg`; BF16 rounding raised its relative error to `2.28e-3`.
+Production therefore keeps an explicit FP32 gate-input boundary until a
+specialized FLA backward computes both `dA` and `dbias` partials from the FP32
+register value in the same kernel. This is a static interface decision, not a
+runtime precision fallback.
+
+Third, the no-mask/no-reset branch now enters the rectangular fast path by
+Python argument identity and performs no CUDA `all/any` synchronization.
+Fourth, explicit mask/reset execution discovers one shared `PackedSegments`
+plan and uses causal-conv1d's `seq_idx` path. Initial cache entries are prefixed
+only to the first non-reset segment and final cache entries are gathered from
+the last segment, so their full state VJP remains connected. On the measured
+packed workload the native varlen conv path took `5.957 ms` for complete
+forward versus `47.059 ms` for the deleted Python token loop. Fifth, unique
+token gather/scatter uses FLA `index_first_axis`/`pad_input`, and one CPU
+`cu_seqlens` mirror is passed to every FLA metadata consumer. Repeated
+batch-to-segment state selection deliberately remains `index_select`: FLA's
+unique-index scatter transpose would overwrite rather than accumulate those
+cotangents.
+
+The rebuilt suite is now 10/10, including packed conv output/final-cache/input,
+initial-cache and weight VJPs plus the fused gate composed VJP. A final matched
+complete-layer run at `B=1,T=1024,H=8,r=d_v=128,K=1` measured SolveDelta at
+`1.865/10.033 ms` forward/F+B and GDN2 at `0.990/3.267 ms`; allocator peaks
+were `128.3/363.0 MiB` and `38.1/102.8 MiB`. These wrapper improvements do not
+change the conclusion that SolveDelta's frame transpose and gradient partial
+lifetimes, rather than the mature exterior, own the remaining gap.
+
+Decision update (2026-08-26): the mature-interface pass closed the avoidable
+gate and gradient-lifetime gaps. The FLA GDN gate program now reads strided
+BF16 projection views directly. Its transpose derives both log-rate and bias
+partials from the same FP32 register value and reduces them in one fixed tree;
+`dg` is stored only in the raw input dtype. This removes the explicit FP32 raw
+panel and the upstream second `dg` scan without reproducing the rejected
+BF16-rounded-bias error. Erase sigmoid is composed into normalization's
+dual-source epilogue, while write sigmoid is composed into direct-e's
+FLA-native `z` pack; their strict transposes remain in those same owners.
+
+The normalization producer now directly stores bounded `u/key/paired-dual`
+panels as FP16 and unbounded `h` as BF16. The chart producer writes bounded
+sigma directly as FP16. H Gram forward and reverse both consume the same FP16
+packed bits; the previous BF16 reverse replay was removed. FP32 state, radial,
+gate, sensitive decay-scalar, and backward accumulation rules are unchanged.
+
+Finally, the four factor reverses no longer return four complete sets of
+`grad_J/grad_D/grad_u/grad_h`. Their disjoint CTA tile owners accumulate the
+primal-upper, primal-lower, dual-upper, and dual-lower contributions directly
+into one final FP32 buffer. No atomics or cross-chunk mega-kernel were added.
+The rebuilt 10-test semantic/VJP suite passes. Three complete-layer runs at
+`B=1,T=1024,H=8,r=d_v=128,K=1,C=32` measured SolveDelta forward medians
+`1.776--1.808 ms` and F+B medians `9.392--9.544 ms`; allocator peaks were
+`106.3 MiB` forward and `211.4 MiB` F+B. Matched GDN2 was approximately
+`0.970--1.028/3.024--3.064 ms` with `38.1/102.8 MiB`. Relative to the prior
+`128.3/363.0 MiB` SolveDelta peaks, the eliminated action partial ABI accounts
+for the expected large backward-memory reduction and also improves complete
+F+B, so the schedule is retained.
+
+Decision update (2026-08-26): the next frame-reverse pass specialized four
+additional mature ownership patterns without merging unrelated live ranges.
+`BoundaryStats` now follows output-owned accumulation: one CTA owns each final
+u/h tile and consumes the H-left/H-right or ordered R streams before storing.
+Six vector partials, two D-matrix partials, and their combine kernel were
+deleted. This reduced the target F+B allocator peak from `211.4` to
+`196.8 MiB`; the measured complete F+B remained in the existing roughly
+`9.3--9.8 ms` range.
+
+The geometry decay scalar transpose now uses the same resident state-tile
+epilogue organization as MESA's Hkk/Hkv reverse. It contracts FP32 boundary
+state tiles directly into a compact approximately `132 KiB` partial and then
+uses one fixed reduction. The former `u_panel.float()/h_panel.float()` plus two
+full `torch.bmm` temporaries, about `16 MiB` at the target, are gone. The two
+new launches measured about `65.6 us` and `1.9 us`; complete latency was
+neutral, so the lower transient footprint is retained.
+
+Boundary factor reverse now separates output owners as FLA `chunk_o` and KDA
+`dAv` do. A matrix-tile CTA exclusively accumulates one final FP32 J/D tile;
+a panel CTA exclusively accumulates the H/R coefficient rows while streaming
+the same strict boundary tiles. An attempted fusion that made every matrix CTA
+write coefficient partials was rejected because it introduced a `2--4 MiB`
+workspace and a finalize launch. The selected split has no coefficient
+workspace; the target profiler measured the four coefficient owners at about
+`0.038--0.039 ms` each and matrix-owner launches at about `0.053--0.077 ms`.
+
+Finally, R strict Gram forward and transpose now use MESA's block-prefix
+schedule rather than a 128-step global-coordinate outer-product loop and an
+`NB^2` source-block replay. Each 16-coordinate block forms `Ku/Kh` with
+`tl.dot`; forward keeps the complete-block prefix resident and evaluates only
+the within-block strict epilogue. Reverse uses ordered prefix and suffix
+launches, loading each coordinate block once per direction and accumulating
+into the same output-owned tile without atomics or a partial workspace. It
+uses exactly one `Z+Z^T` in the broad Gram transpose; the former code
+symmetrized that cotangent twice. The port also keeps H's full-width reduction
+tile separate from R's 16-coordinate block. An intermediate implementation
+overwrote the saved H tile width with 16 and left coordinates 16:r
+uninitialized in H backward; the rebuilt composed VJP exposed and deleted
+that bug.
+
+A dedicated C16/r64 same-packed forward/VJP diagnostic is below `5e-3`
+relative error. At C32/r128 the R forward and two transpose launches measured
+`0.0688 ms` and `0.0540+0.0515 ms`, versus about `0.26 ms` for the former R
+transpose. The current operator-only target measured `1.537 ms` forward and
+`7.986 ms` F+B; the complete layer measured `1.719/9.305 ms` with
+`106.3/196.8 MiB` forward/F+B allocator peaks. These are adapted upstream
+schedules with SolveDelta strict masks and interfaces, not claims that the
+source is byte-identical to MESA.
