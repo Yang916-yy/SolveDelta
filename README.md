@@ -1,100 +1,80 @@
 # SolveDelta
 
-> **Status:** unfinished research repository. The FP64 operator is frozen; the
-> replacement BF16/FP16/FP32 production path is connected end to end and its
-> minimal semantic/composed-VJP acceptance suite is rebuilt. The final hardware
-> resource report and further backward optimization remain incomplete.
+SolveDelta is a causal sequence operator that uses a decayed RLS geometry state
+to transport a gated Delta memory before each edit. The current implementation
+selects a lower-expressivity moving-state formulation because it reaches usable
+training latency. The previous exact bounded-LDU implementation is retained in
+Git history at commit `2237875`, not as a runtime path.
 
-SolveDelta is one causal sequence operator. A decayed prefix constructs a
-bounded linear system; its primal action conditions ordered Delta writes and
-its transpose-dual action conditions erase and read covectors. DeltaNet,
-Gated DeltaNet, GDN2, KDA, and DeltaProduct are reductions or comparison
-baselines rather than maintained alternative architectures.
+## Recurrence
 
-## Contract
+For normalized geometry feature `u_t`:
 
-- `causallsso/reference.py` is the sole executable mathematical owner and FP64
-  oracle.
-- Geometry width is the resolved key-head width, `r = d_k`; `r=128` is the
-  first benchmark specialization, not a mathematical default.
-- `K` ordered edits share one token frame. `K=1` is the default.
-- The frontend applies independent depthwise causal conv4 plus SiLU to query,
-  packed edit keys, and packed edit values by default.
-- The symmetric occupancy state `J`, unconstrained driven state `D`, scalar
-  mass `m`, and associative memory `S` remain FP32 continuation states.
-- Public activations and outputs are BF16. Statically bounded private panels
-  may be produced directly as FP16. Tensor Core contractions and backward
-  partials accumulate in FP32.
+```text
+m_t = lambda_t m_{t-1} + 1
+J_t = lambda_t J_{t-1} + u_t u_t^T
+D_t = lambda_t D_{t-1} + u_t h_t^T
+```
 
-For normalized geometry feature `u_t`, the geometry recurrence is
+The fixed prior is `m_0=2`, `J_0=2I`, `D_0=0`. Define
 
-\[
-\begin{aligned}
-m_t &= \lambda_t m_{t-1}+1,\\
-J_t &= \lambda_t J_{t-1}+u_tu_t^T,\\
-D_t &= \lambda_t D_{t-1}+u_th_t^T.
-\end{aligned}
-\]
+```text
+g_t = J_t^-1 u_t
+p_t = J_{t-1}^-1 u_t
+C_{t-1} = J_{t-1}^-1 D_{t-1}
+r_t = h_t - C_{t-1}^T u_t
+rho_t = m_{t-1}/m_t
+```
 
-The separately bounded maps of `H_t=J_t/m_t` and `R_t=D_t/m_t` define
+and two rank-one geometry transports
 
-\[
-M_t=(I+N_t^-)\operatorname{diag}(\sigma_t)(I+N_t^+).
-\]
+```text
+F_H = rho_t (lambda_t I + u_t p_t^T)
+F_C = I + g_t r_t^T.
+```
 
-With normalized edit key `a`, erase source `b=erase\odot a`, query `q`, and
-write target `z=write\odot v`,
+Learned strength `gamma` interpolates each factor with identity. The memory is
+transported by `F_H`, channel-decayed, transported by `F_C`, updated by one
+ordinary gated Delta edit, and then read by the normalized query. At
+`gamma=0`, the memory path reduces exactly to GDN2 while geometry state still
+tracks the prefix.
 
-\[
-d=M^{-1}a,\qquad e=M^Tb,\qquad \chi=M^Tq.
-\]
+`causallsso/reference.py` is the sole FP64 mathematical oracle. The full
+formula, implementation mapping, transpose ownership, and precision map are in
+`docs/FROM_SCRATCH_REBUILD.md`.
 
-The fixed-basis associative state performs the ordered rank-one Delta edits and
-is read after edit `K`.
+## Production path
 
-## Production graph
+The dense CUDA path composes mature FLA/MESA primitives with a token-native
+block-E3 exterior:
 
-The current all-valid CUDA path is a selective composition:
+- MESA paired covariance/cross-moment state scans for FP32 `J/D`;
+- fixed five-step matrix-free CG gain and implicit transpose;
+- FP32 effective-mass affine scan;
+- BF16 Tensor Core C16 pair/WY/state/output owners with FP32 accumulation;
+- output-owned reverse and a fused source transpose.
 
-1. fused normalization writes each geometry/frame consumer layout directly
-   and consumes raw erase logits in its dual-source epilogue;
-2. a MESA-derived paired resident loop produces FP32 `J/D` boundaries while a
-   scalar affine owner produces `m`;
-3. MESA-style Gram/radial blocks and exact coordinate-axis generalized-Delta
-   solve/direct actions produce primal and paired-dual frame panels;
-4. a direct-`e` specialization activates raw write logits while packing `z`
-   and feeds FLA's mature pair/WY/state/output kernels;
-5. backward follows the corresponding transpose blocks and accumulates the
-   four factor routes into output-owned FP32 tiles, without descriptor bundles,
-   coordinate-entry VJP chains, or four-way full-matrix partials.
+The three internal slots are the two geometry transports plus one Delta edit.
+They remain a local slot axis and are not expanded into a public `3T` sequence.
+The production surface has `K=1`, BF16 public vectors/output, and FP32
+continuation states `(m,J,D,S)`.
 
-The frame-to-WY panel boundary is private and deliberately split: combining
-owners is allowed only when complete forward and F+B measurements beat the
-mature multi-kernel schedule. Masks and resets use one compact valid-token
-buffer plus FLA `cu_seqlens`, chunk indices, and chunk offsets across frame,
-pair/WY, state, output, and their transposes. No segment is padded to the
-longest segment; one gather and one scatter remain at the model boundary.
-
-On the local RTX 5070 Ti target at
-`B=1,T=1024,H=8,K=1,r=d_v=128,C=32`, the exact operator without returned states
-measures about `1.77 ms` forward and `8.78 ms` forward plus backward. The
-three latest matched complete BF16 layer runs, including conv4 and projections,
-measured about `1.78/9.39--9.54 ms` versus FLA GDN2's roughly
-`0.97--1.03/3.02--3.06 ms`; allocator peaks were `106/211 MiB` versus
-`38/103 MiB`. These are development measurements. The
-remaining dominant hotspot is the local strict transpose, and the formal
-register/shared/spill/occupancy report is still outstanding.
+The selected contiguous core at `B=1,T=1024,H=8,r=V=128` measured median/p95
+`0.371/0.402 ms` forward and `1.103/1.320 ms` F+B under CUDA Graph on the
+development RTX 5070 Ti, with `86.3 MiB` resident Graph allocation. The full
+projected layer including conv4, packed-view canonicalization, output
+projection, and all parameter gradients measured `0.649/0.854 ms` forward and
+`2.329/2.624 ms` F+B, with `152.0 MiB` Graph allocation. Matched GDN2 core was
+about `0.128/0.467 ms`; the remaining latency and memory gap is explicit.
 
 ## Install
 
-The FP64 reference requires PyTorch. The CUDA production path additionally
-uses Flash Linear Attention and causal-conv1d:
+The reference requires PyTorch. The native path additionally requires FLA,
+TileLang, and causal-conv1d:
 
 ```bash
 python -m pip install -e ".[native,test]"
 ```
-
-Reference example:
 
 ```python
 import torch
@@ -106,21 +86,22 @@ config = SolveDeltaConfig(
     num_heads=4,
     head_k_dim=64,
     head_v_dim=64,
-    use_short_conv=False,
 )
-layer = SolveDelta(config).double()
-hidden = torch.randn(2, 32, 256, dtype=torch.float64)
+layer = SolveDelta(config).cuda().to(torch.bfloat16)
+hidden = torch.randn(2, 128, 256, device="cuda", dtype=torch.bfloat16)
 output = layer(hidden)
 ```
 
-The native path is selected for CUDA BF16 inputs. It requires continuation
-states in FP32 and derives `r` from the configured key-head width.
+CUDA BF16 dense inputs select the optimized path. Masks/resets use the same RLS
+semantics through the model reference path. Non-CUDA and non-BF16 inputs use
+the PyTorch recurrence.
 
 ## Repository map
 
-- `AGENTS.md`: contribution, mathematical, precision, and acceptance contract;
+- `AGENTS.md`: current mathematical, precision, and acceptance contract;
 - `causallsso/reference.py`: FP64 token oracle;
+- `causallsso/ops/rls/`: selected native forward and transpose blocks;
 - `docs/FROM_SCRATCH_REBUILD.md`: sole native implementation blueprint;
-- `docs/INNOVATION_PROGRAM.md`: operator derivation and reductions;
-- `docs/PRIOR_ART.md`: source provenance and design decisions;
+- `docs/INNOVATION_PROGRAM.md`: derivation and model interpretation;
+- `docs/PRIOR_ART.md`: upstream provenance and measured design decisions;
 - `THIRD_PARTY_NOTICES.md`: adapted-source attribution.

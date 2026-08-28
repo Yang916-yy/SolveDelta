@@ -2,10 +2,8 @@ from .config import SolveDeltaConfig
 from .model import SolveDelta, SolveDeltaLayerState
 from .reference import (
     SolveDeltaState,
-    apply_dual_reference,
-    apply_primal_reference,
-    bounded_ldu_reference,
     solvedelta_reference,
+    solvedelta_zero_state,
 )
 
 __all__ = [
@@ -13,8 +11,6 @@ __all__ = [
     "SolveDeltaConfig",
     "SolveDeltaLayerState",
     "SolveDeltaState",
-    "apply_dual_reference",
-    "apply_primal_reference",
-    "bounded_ldu_reference",
     "solvedelta_reference",
+    "solvedelta_zero_state",
 ]

@@ -25,8 +25,6 @@ class SolveDeltaLayerState(NamedTuple):
 class SolveDelta(nn.Module):
     """Projection, packed conv4, operator, and output owner for SolveDelta."""
 
-    native_chunk_size = 32
-
     def __init__(self, config: SolveDeltaConfig) -> None:
         super().__init__()
         self.config = config
@@ -263,12 +261,13 @@ class SolveDelta(nn.Module):
         width = self.config.resolved_head_k_dim
         value_width = self.config.resolved_head_v_dim
         edits = self.config.num_edits
-        use_native = (
+        native_inputs = (
             hidden_states.device.type == "cuda"
             and hidden_states.dtype == torch.bfloat16
         )
+        use_native = native_inputs and valid_mask is None and reset_mask is None
         packed_segments = None
-        if use_native and (valid_mask is not None or reset_mask is not None):
+        if native_inputs and (valid_mask is not None or reset_mask is not None):
             if valid_mask is None:
                 valid_mask = torch.ones(
                     batch, length, dtype=torch.bool, device=hidden_states.device
@@ -323,7 +322,7 @@ class SolveDelta(nn.Module):
         q = heads_view(q_raw, width)
         keys = key_raw.view(batch, length, heads, edits, width)
         values = value_raw.view(batch, length, heads, edits, value_width)
-        if use_native:
+        if native_inputs:
             from .ops.gates import fused_decay_gate
 
             geometry_log_decay = fused_decay_gate(
@@ -371,31 +370,39 @@ class SolveDelta(nn.Module):
                 write_raw.view(batch, length, heads, edits, value_width),
                 strength.float(),
                 initial_state=operator_initial,
-                valid_mask=valid_mask,
-                reset_mask=reset_mask,
-                _packed_segments=packed_segments,
                 return_final_state=return_final_state,
-                chunk_size=self.native_chunk_size,
             )
         else:
+            reference_dtype = (
+                torch.float64
+                if hidden_states.dtype == torch.float64
+                else torch.float32
+            )
             erase = 2.0 * torch.sigmoid(
                 erase_raw.float().view(batch, length, heads, edits, width)
             )
             write = 2.0 * torch.sigmoid(
                 write_raw.float().view(batch, length, heads, edits, value_width)
             )
+            reference_initial = (
+                None
+                if operator_initial is None
+                else SolveDeltaState(
+                    *(state.to(reference_dtype) for state in operator_initial)
+                )
+            )
             output, operator_state = solvedelta_reference(
-                u,
-                h,
-                q,
-                keys,
-                values,
-                geometry_log_decay.to(u.dtype),
-                associative_log_decay.to(u.dtype),
-                erase.to(u.dtype),
-                write.to(u.dtype),
-                strength.to(u.dtype),
-                initial_state=operator_initial,
+                u.to(reference_dtype),
+                h.to(reference_dtype),
+                q.to(reference_dtype),
+                keys.to(reference_dtype),
+                values.to(reference_dtype),
+                geometry_log_decay.to(reference_dtype),
+                associative_log_decay.to(reference_dtype),
+                erase.to(reference_dtype),
+                write.to(reference_dtype),
+                strength.to(reference_dtype),
+                initial_state=reference_initial,
                 valid_mask=valid_mask,
                 reset_mask=reset_mask,
             )

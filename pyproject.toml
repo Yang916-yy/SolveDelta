@@ -13,15 +13,13 @@ dependencies = ["torch>=2.7"]
 [project.optional-dependencies]
 native = [
     "causal-conv1d>=1.7.0",
-    "flash-linear-attention>=0.5.2",
+    "flash-linear-attention>=0.6.0",
+    "tilelang>=0.1.13",
 ]
 test = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 include = ["causallsso*"]
-
-[tool.setuptools.package-data]
-"causallsso.ops" = ["csrc/*.cu"]
 
 [project.urls]
 Repository = "https://github.com/Yang916-yy/SolveDelta"

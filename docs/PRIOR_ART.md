@@ -2310,3 +2310,27 @@ not change the generated reduction/divide/exp path into Tensor Core work.
 Rounding CG `alpha/beta` to BF16 likewise slowed complete F+B by about
 `20--25 us`. These A/B results distinguish precision that protects the
 mathematics from FP32 storage or broadcasting that merely reflects a poor ABI.
+
+### RLS production promotion
+
+The MESA-CG5 plus token-native block-E3 route was promoted from an isolated
+study to the sole SolveDelta production operator on 2026-08-28. The exact
+bounded-LDU route remains recoverable at Git commit `2237875`; none of its
+private frame, chart, descriptor, or validation ABIs remain production
+dependencies.
+
+The selected configuration is fixed to prior mass 2, C32 paired MESA geometry,
+five CG iterations, and C16 exterior chunks. The choice accepts lower model
+expressivity than the archived full-rank bounded chart in exchange for a fresh
+contiguous-core CUDA Graph median/p95 of `0.371/0.402 ms` forward and
+`1.103/1.320 ms` F+B at `B1,T1024,H8,r=V=128`. Matched GDN2 was approximately
+`0.128/0.467 ms`. The full SolveDelta layer, including projections, conv4,
+packed canonicalization, output projection, and parameter gradients, measured
+`0.649/0.854 ms` forward and `2.329/2.624 ms` F+B.
+
+Promotion exposed that the experiment's contiguous input assumption was not a
+valid public ABI: TileLang reverse rejected the fused projection's row stride,
+and forward pointer arithmetic had the same packed assumption. Production now
+owns one explicit contiguous-vector boundary before MESA/E3. This is a
+correctness requirement, not a claimed final schedule. Removing it requires
+native stride-aware loads in every corresponding forward and transpose owner.

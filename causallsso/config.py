@@ -23,6 +23,10 @@ class SolveDeltaConfig:
                 raise TypeError(f"{name} must be an int, got {type(value).__name__}")
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if self.num_edits != 1:
+            raise ValueError(
+                "the current SolveDelta production contract requires num_edits=1"
+            )
         for name in ("head_k_dim", "head_v_dim"):
             value = getattr(self, name)
             if value is not None:
