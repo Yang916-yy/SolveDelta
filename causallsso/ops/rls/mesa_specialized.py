@@ -40,6 +40,10 @@ def _cg_fwd_kernel(
     local_decay,
     gain,
     prediction,
+    VALUE_STRIDE_B: tl.constexpr,
+    VALUE_STRIDE_T: tl.constexpr,
+    VALUE_STRIDE_H: tl.constexpr,
+    VALUE_STRIDE_D: tl.constexpr,
     T,
     STEPS: tl.constexpr,
     H: tl.constexpr,
@@ -96,7 +100,12 @@ def _cg_fwd_kernel(
     gain_ptr = gain + ((bos + token[:, None]) * H + head) * K + coord[None, :]
     tl.store(gain_ptr, x.to(gain_ptr.dtype.element_ty), mask=mtk)
 
-    v_ptr = value + ((bos + token[:, None]) * H + head) * K + coord[None, :]
+    v_ptr = value + (
+        batch * VALUE_STRIDE_B
+        + token[:, None] * VALUE_STRIDE_T
+        + head * VALUE_STRIDE_H
+        + coord[None, :] * VALUE_STRIDE_D
+    )
     v_tile = tl.load(v_ptr, mask=mtk, other=0.0)
     h_kv = tl.load(kv_ptr, mask=mkk, other=0.0)
     result = _matrix_action(x, k_tile, v_tile, causal, boundary_scale, h_kv)
@@ -117,6 +126,10 @@ def _cg_transpose_hkv_kernel(
     gain_cotangent,
     result,
     grad_decay,
+    VALUE_STRIDE_B: tl.constexpr,
+    VALUE_STRIDE_T: tl.constexpr,
+    VALUE_STRIDE_H: tl.constexpr,
+    VALUE_STRIDE_D: tl.constexpr,
     T,
     STEPS: tl.constexpr,
     H: tl.constexpr,
@@ -138,7 +151,12 @@ def _cg_transpose_hkv_kernel(
 
     q_ptr = gain + ((bos + token[:, None]) * H + head) * K + coord[None, :]
     key_ptr = key + ((bos + token[:, None]) * H + head) * K + coord[None, :]
-    value_ptr = value + ((bos + token[:, None]) * H + head) * K + coord[None, :]
+    value_ptr = value + (
+        batch * VALUE_STRIDE_B
+        + token[:, None] * VALUE_STRIDE_T
+        + head * VALUE_STRIDE_H
+        + coord[None, :] * VALUE_STRIDE_D
+    )
     do_ptr = output_cotangent + ((bos + token[:, None]) * H + head) * K + coord[None, :]
     hkv_ptr = boundary_kv + (chunk_global * H + head) * K * K
     hkv_ptr += coord[:, None] + coord[None, :] * K
@@ -205,6 +223,10 @@ def _paired_state_fwd_kernel(
     initial_kv,
     final,
     final_kv,
+    VALUE_STRIDE_B: tl.constexpr,
+    VALUE_STRIDE_T: tl.constexpr,
+    VALUE_STRIDE_H: tl.constexpr,
+    VALUE_STRIDE_D: tl.constexpr,
     T,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -242,7 +264,12 @@ def _paired_state_fwd_kernel(
 
         key_ptr = key + ((bos + token[:, None]) * H + head) * K + coord_k[None, :]
         key_v_ptr = key + ((bos + token[:, None]) * H + head) * K + coord_v[None, :]
-        value_ptr = value + ((bos + token[:, None]) * H + head) * K + coord_v[None, :]
+        value_ptr = value + (
+            batch * VALUE_STRIDE_B
+            + token[:, None] * VALUE_STRIDE_T
+            + head * VALUE_STRIDE_H
+            + coord_v[None, :] * VALUE_STRIDE_D
+        )
         k = tl.load(key_ptr, mask=mt[:, None] & (coord_k[None, :] < K), other=0.0)
         k_v = tl.load(key_v_ptr, mask=mt[:, None] & (coord_v[None, :] < K), other=0.0)
         v = tl.load(value_ptr, mask=mt[:, None] & (coord_v[None, :] < K), other=0.0)
@@ -284,6 +311,10 @@ def _hkv_reverse_dkv_kernel(
     grad_key,
     grad_decay,
     grad_value,
+    VALUE_STRIDE_B: tl.constexpr,
+    VALUE_STRIDE_T: tl.constexpr,
+    VALUE_STRIDE_H: tl.constexpr,
+    VALUE_STRIDE_D: tl.constexpr,
     T,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -305,7 +336,12 @@ def _hkv_reverse_dkv_kernel(
 
     gain_ptr = gain + ((bos + token[:, None]) * H + head) * K + ck[None, :]
     key_ptr = key + ((bos + token[:, None]) * H + head) * K + ck[None, :]
-    value_ptr = value + ((bos + token[:, None]) * H + head) * K + cv[None, :]
+    value_ptr = value + (
+        batch * VALUE_STRIDE_B
+        + token[:, None] * VALUE_STRIDE_T
+        + head * VALUE_STRIDE_H
+        + cv[None, :] * VALUE_STRIDE_D
+    )
     do_ptr = output_cotangent + ((bos + token[:, None]) * H + head) * K + cv[None, :]
     h_ptr = boundary_kv + (chunk_global * H + head) * K * K
     h_ptr += cv[:, None] + ck[None, :] * K
@@ -477,6 +513,10 @@ def paired_state_forward(key, value, local_decay, initial, initial_kv, *, chunk_
         initial_kv,
         final,
         final_kv,
+        VALUE_STRIDE_B=value.stride(0),
+        VALUE_STRIDE_T=value.stride(1),
+        VALUE_STRIDE_H=value.stride(2),
+        VALUE_STRIDE_D=value.stride(3),
         T=length,
         H=heads,
         K=rank,
@@ -490,7 +530,7 @@ def paired_state_forward(key, value, local_decay, initial, initial_kv, *, chunk_
 def cg_forward(q, key, value, boundary, boundary_kv, local_decay, *, chunk_size, steps):
     batch, length, heads, rank = q.shape
     gain = torch.empty_like(q)
-    prediction = torch.empty_like(value)
+    prediction = torch.empty(value.shape, dtype=value.dtype, device=value.device)
     _cg_fwd_kernel[(triton.cdiv(length, chunk_size), batch * heads)](
         q,
         key,
@@ -500,6 +540,10 @@ def cg_forward(q, key, value, boundary, boundary_kv, local_decay, *, chunk_size,
         local_decay,
         gain,
         prediction,
+        VALUE_STRIDE_B=value.stride(0),
+        VALUE_STRIDE_T=value.stride(1),
+        VALUE_STRIDE_H=value.stride(2),
+        VALUE_STRIDE_D=value.stride(3),
         T=length,
         STEPS=steps,
         H=heads,
@@ -541,6 +585,10 @@ def cg_transpose_hkv(
         gain_cotangent,
         result,
         grad_decay,
+        VALUE_STRIDE_B=value.stride(0),
+        VALUE_STRIDE_T=value.stride(1),
+        VALUE_STRIDE_H=value.stride(2),
+        VALUE_STRIDE_D=value.stride(3),
         T=length,
         STEPS=steps,
         H=heads,
@@ -558,7 +606,7 @@ def hkv_reverse_dkv(gain, key, value, boundary_kv, boundary_cotangent, local_dec
     block = max(16, triton.next_power_of_2(rank))
     grid = (triton.cdiv(length, chunk_size), batch * heads)
     grad_key = torch.empty_like(key)
-    grad_value = torch.empty_like(value)
+    grad_value = torch.empty(value.shape, dtype=value.dtype, device=value.device)
     grad_decay_first = torch.empty_like(local_decay)
     _hkv_reverse_dkv_kernel[grid](
         gain,
@@ -571,6 +619,10 @@ def hkv_reverse_dkv(gain, key, value, boundary_kv, boundary_cotangent, local_dec
         grad_key,
         grad_decay_first,
         grad_value,
+        VALUE_STRIDE_B=value.stride(0),
+        VALUE_STRIDE_T=value.stride(1),
+        VALUE_STRIDE_H=value.stride(2),
+        VALUE_STRIDE_D=value.stride(3),
         T=length,
         H=heads,
         K=rank,

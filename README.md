@@ -60,12 +60,13 @@ The production surface has `K=1`, BF16 public vectors/output, and FP32
 continuation states `(m,J,D,S)`.
 
 The selected contiguous core at `B=1,T=1024,H=8,r=V=128` measured median/p95
-`0.371/0.402 ms` forward and `1.103/1.320 ms` F+B under CUDA Graph on the
-development RTX 5070 Ti, with `86.3 MiB` resident Graph allocation. The full
-projected layer including conv4, packed-view canonicalization, output
-projection, and all parameter gradients measured `0.649/0.854 ms` forward and
-`2.329/2.624 ms` F+B, with `152.0 MiB` Graph allocation. Matched GDN2 core was
-about `0.128/0.467 ms`; the remaining latency and memory gap is explicit.
+about `0.348/0.364 ms` forward and `1.082/1.133 ms` F+B under CUDA Graph on the
+development RTX 5070 Ti; each value is the median of three 200-replay runs.
+The full projected layer, with native strided source loads and
+in-owner raw gate activation, measured about `0.550/0.573 ms` forward and
+`1.805/2.136 ms` F+B including conv4, output projection, and all parameter
+gradients. Matched GDN2 core was about `0.128/0.467 ms`; the remaining latency
+and memory gap is explicit.
 
 ## Install
 

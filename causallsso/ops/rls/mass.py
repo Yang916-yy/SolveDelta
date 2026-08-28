@@ -221,6 +221,7 @@ class _MassPrefix(torch.autograd.Function):
             num_stages=1,
         )
         ctx.chunk_size = chunk_size
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(log_decay, previous, chunk_scale)
         return previous, current, final
 

@@ -56,14 +56,11 @@ def _fused_pair_reverse_kernel(
         @T.prim_func
         def pair_reverse(
             u: T.Tensor((batch, length, heads, rank), in_dtype),
-            h: T.Tensor((batch, length, heads, rank), in_dtype),
             gain: T.Tensor((batch, length, heads, rank), in_dtype),
-            prediction: T.Tensor((batch, length, heads, rank), in_dtype),
             geometry_log_decay: T.Tensor((batch, length, heads), "float32"),
             associative_log_decay: T.Tensor(
                 (batch, length, heads, rank), "float32"
             ),
-            erase: T.Tensor((batch, length, heads, 1, rank), in_dtype),
             previous_mass: T.Tensor((batch, length, heads), "float32"),
             current_mass: T.Tensor((batch, length, heads), "float32"),
             strength: T.Tensor((heads,), "float32"),
@@ -110,9 +107,6 @@ def _fused_pair_reverse_kernel(
             grad_associative_log_decay: T.Tensor(
                 (batch, length, heads, rank), "float32"
             ),
-            grad_erase: T.Tensor(
-                (batch, length, heads, 1, rank), in_dtype
-            ),
             grad_previous_mass: T.Tensor(
                 (batch, length, heads), "float32"
             ),
@@ -152,7 +146,6 @@ def _fused_pair_reverse_kernel(
                     (logical_chunk, token_chunk), in_dtype
                 )
                 for logical, c in T.Parallel(logical_chunk, rank):
-                    token = logical // _E
                     valid = logical < valid_rows
                     by[logical, c] = T.if_then_else(
                         valid, grad_e[panel, logical, c], 0.0
@@ -405,15 +398,8 @@ def _fused_pair_reverse_kernel(
                             uv = T.Cast(
                                 "float32", u[i_b, token, i_h, c]
                             )
-                            hv = T.Cast(
-                                "float32", h[i_b, token, i_h, c]
-                            )
                             gv = T.Cast(
                                 "float32", gain[i_b, token, i_h, c]
-                            )
-                            pv = T.Cast(
-                                "float32",
-                                prediction[i_b, token, i_h, c],
                             )
                             assoc = T.exp(
                                 associative_log_decay[
@@ -426,7 +412,6 @@ def _fused_pair_reverse_kernel(
                             ge1 = grad_left[t * _E + 1, c]
                             gd2 = grad_right[t * _E + 2, c]
                             ge2 = grad_left[t * _E + 2, c]
-                            e1 = -(hv - pv) / denominator
                             grad_d0_scale = (
                                 grad_d0_scale + gd0 * assoc * uv
                             )
@@ -440,7 +425,6 @@ def _fused_pair_reverse_kernel(
                                 * geometry_decay
                                 * gv
                                 / (denominator * denominator * assoc)
-                                - ge1 * e1 / denominator
                             )
                             grad_gamma_direct = (
                                 grad_gamma_direct + gd1 * gv
@@ -497,9 +481,6 @@ def _fused_pair_reverse_kernel(
                         gv = T.Cast(
                             "float32", gain[i_b, token, i_h, c]
                         )
-                        erase_v = T.Cast(
-                            "float32", erase[i_b, token, i_h, 0, c]
-                        )
                         denom_vector = source_scalars[t, 1]
                         geometry_decay_vector = T.exp(
                             geometry_log_decay[i_b, token, i_h]
@@ -553,12 +534,12 @@ def _fused_pair_reverse_kernel(
                             - ge0 * e0_vector
                             + token_gate[t, c]
                         )
-                        key_grad_norm = gd2 + erase_v * ge2
-                        grad_d[panel, t * _E + (_E - 1), c] = key_grad_norm
-                        key_value = T.Cast(
-                            "float32", d[panel, t, _E - 1, c]
-                        )
-                        grad_erase[i_b, token, i_h, 0, c] = key_value * ge2
+                        # The strided source epilogue closes the raw gate and
+                        # key-normalization VJPs from these final source grads.
+                        # It also closes the e1 denominator term from raw h.
+                        grad_e[panel, t * _E + 1, c] = ge1
+                        grad_d[panel, t * _E + (_E - 1), c] = gd2
+                        grad_e[panel, t * _E + (_E - 1), c] = ge2
 
         return pair_reverse
 
@@ -569,12 +550,27 @@ def _fused_pair_reverse_kernel(
 def _paired_l2norm_bwd_kernel(
     paired,
     d,
+    u,
+    h,
+    gain,
+    prediction,
+    erase_raw,
     q_rstd,
     key_rstd,
     grad_q_normalized,
+    grad_e,
     grad_d,
     grad_q_raw,
     grad_keys,
+    grad_erase_raw,
+    grad_u,
+    grad_gain,
+    SH_B: tl.constexpr,
+    SH_T: tl.constexpr,
+    SH_H: tl.constexpr,
+    SE_B: tl.constexpr,
+    SE_T: tl.constexpr,
+    SE_H: tl.constexpr,
     TOTAL: tl.constexpr,
     LENGTH: tl.constexpr,
     H: tl.constexpr,
@@ -603,6 +599,10 @@ def _paired_l2norm_bwd_kernel(
         (panel[:, None] * C * 3 + panel_row[:, None] * 3 + 2) * R
         + coord[None, :]
     )
+    e1_dy_offset = (
+        (panel[:, None] * C * 3 + panel_row[:, None] * 3 + 1) * R
+        + coord[None, :]
+    )
 
     q_scale = tl.load(q_rstd + row, mask=row_mask, other=0.0).to(tl.float32)
     key_scale = tl.load(key_rstd + row, mask=row_mask, other=0.0).to(tl.float32)
@@ -616,6 +616,55 @@ def _paired_l2norm_bwd_kernel(
     key_dy = tl.load(grad_d + key_dy_offset, mask=mask, other=0.0).to(
         tl.float32
     )
+    erase_dy = tl.load(grad_e + key_dy_offset, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    e1_dy = tl.load(grad_e + e1_dy_offset, mask=mask, other=0.0).to(tl.float32)
+    erase_offset = (
+        batch[:, None] * SE_B
+        + token[:, None] * SE_T
+        + head[:, None] * SE_H
+        + coord[None, :]
+    )
+    erase_logits = tl.load(erase_raw + erase_offset, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    erase_sigmoid = tl.sigmoid(erase_logits)
+    erase_gate = (2.0 * erase_sigmoid).to(erase_raw.dtype.element_ty).to(
+        tl.float32
+    )
+    key_dy += erase_gate * erase_dy
+
+    packed_offset = raw_offset
+    b_u = tl.load(u + packed_offset, mask=mask, other=0.0).to(tl.float32)
+    b_gain = tl.load(gain + packed_offset, mask=mask, other=0.0).to(tl.float32)
+    h_offset = (
+        batch[:, None] * SH_B
+        + token[:, None] * SH_T
+        + head[:, None] * SH_H
+        + coord[None, :]
+    )
+    b_h = tl.load(h + h_offset, mask=mask, other=0.0).to(tl.float32)
+    b_prediction = tl.load(
+        prediction + packed_offset, mask=mask, other=0.0
+    ).to(tl.float32)
+    denominator = 1.0 - tl.sum(b_u * b_gain, axis=1)
+    denominator_bar = tl.sum(e1_dy * (b_h - b_prediction), axis=1)
+    denominator_bar /= denominator * denominator
+    b_grad_u = tl.load(grad_u + packed_offset, mask=mask, other=0.0).to(tl.float32)
+    b_grad_gain = tl.load(grad_gain + packed_offset, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    tl.store(
+        grad_u + packed_offset,
+        b_grad_u - denominator_bar[:, None] * b_gain,
+        mask=mask,
+    )
+    tl.store(
+        grad_gain + packed_offset,
+        b_grad_gain - denominator_bar[:, None] * b_u,
+        mask=mask,
+    )
 
     q_dx = (q_dy - tl.sum(q_dy * q_y, axis=1)[:, None] * q_y) * q_scale[:, None]
     key_dx = (
@@ -623,15 +672,28 @@ def _paired_l2norm_bwd_kernel(
     ) * key_scale[:, None]
     tl.store(grad_q_raw + raw_offset, q_dx, mask=mask)
     tl.store(grad_keys + raw_offset, key_dx, mask=mask)
+    # Match the deleted two-kernel path: source grad rounded to BF16 before
+    # applying the FP32 sigmoid derivative, then public grad rounded to BF16.
+    erase_gate_grad = (key_y * erase_dy).to(erase_raw.dtype.element_ty).to(
+        tl.float32
+    )
+    erase_raw_grad = erase_gate_grad * 2.0 * erase_sigmoid * (1.0 - erase_sigmoid)
+    tl.store(grad_erase_raw + raw_offset, erase_raw_grad, mask=mask)
 
 
 @triton.jit
 def _value_source_reverse_kernel(
     values,
-    write,
+    write_raw,
     grad_z,
     grad_values,
-    grad_write,
+    grad_write_raw,
+    SV_B: tl.constexpr,
+    SV_T: tl.constexpr,
+    SV_H: tl.constexpr,
+    SW_B: tl.constexpr,
+    SW_T: tl.constexpr,
+    SW_H: tl.constexpr,
     T: tl.constexpr,
     H: tl.constexpr,
     V: tl.constexpr,
@@ -648,12 +710,22 @@ def _value_source_reverse_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask = o_v < V
     raw_offset = (token_head * V) + o_v
+    value_offset = batch * SV_B + token * SV_T + head * SV_H + o_v
+    write_offset = batch * SW_B + token * SW_T + head * SW_H + o_v
     z_offset = ((panel * C + row) * V) + o_v
-    b_value = tl.load(values + raw_offset, mask=mask, other=0.0)
-    b_write = tl.load(write + raw_offset, mask=mask, other=0.0)
+    b_value = tl.load(values + value_offset, mask=mask, other=0.0).to(tl.float32)
+    b_write_logits = tl.load(write_raw + write_offset, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    b_write_sigmoid = tl.sigmoid(b_write_logits)
+    b_write = (2.0 * b_write_sigmoid).to(write_raw.dtype.element_ty).to(
+        tl.float32
+    )
     b_dz = tl.load(grad_z + z_offset, mask=mask, other=0.0).to(tl.float32)
     tl.store(grad_values + raw_offset, b_write * b_dz, mask=mask)
-    tl.store(grad_write + raw_offset, b_value * b_dz, mask=mask)
+    b_gate_grad = (b_value * b_dz).to(write_raw.dtype.element_ty).to(tl.float32)
+    b_raw_grad = b_gate_grad * 2.0 * b_write_sigmoid * (1.0 - b_write_sigmoid)
+    tl.store(grad_write_raw + raw_offset, b_raw_grad, mask=mask)
 
 
 def block_e3_fused_source_reverse(
@@ -666,8 +738,8 @@ def block_e3_fused_source_reverse(
     prediction: torch.Tensor,
     geometry_log_decay: torch.Tensor,
     associative_log_decay: torch.Tensor,
-    erase: torch.Tensor,
-    write: torch.Tensor,
+    erase_raw: torch.Tensor,
+    write_raw: torch.Tensor,
     previous_mass: torch.Tensor,
     current_mass: torch.Tensor,
     strength: torch.Tensor,
@@ -690,16 +762,20 @@ def block_e3_fused_source_reverse(
     batch, _, heads, rank = cumulative.shape
     length = cumulative.shape[1]
     grad_u = torch.empty_like(u)
-    grad_h = torch.empty_like(h)
-    grad_q_raw = torch.empty_like(q)
-    grad_keys = torch.empty_like(keys)
-    grad_values = torch.empty_like(values)
+    grad_h = torch.empty(h.shape, dtype=h.dtype, device=h.device)
+    grad_q_raw = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    grad_keys = torch.empty(keys.shape, dtype=keys.dtype, device=keys.device)
+    grad_values = torch.empty(values.shape, dtype=values.dtype, device=values.device)
     grad_gain = torch.empty_like(gain)
     grad_prediction = torch.empty_like(prediction)
     grad_geometry_log_decay = torch.empty_like(geometry_log_decay)
     grad_associative_log_decay = torch.empty_like(associative_log_decay)
-    grad_erase = torch.empty_like(erase)
-    grad_write = torch.empty_like(write)
+    grad_erase_raw = torch.empty(
+        erase_raw.shape, dtype=erase_raw.dtype, device=erase_raw.device
+    )
+    grad_write_raw = torch.empty(
+        write_raw.shape, dtype=write_raw.dtype, device=write_raw.device
+    )
     grad_previous_mass = torch.empty_like(previous_mass)
     grad_current_mass = torch.empty_like(current_mass)
     grad_strength_partial = torch.empty_like(geometry_log_decay)
@@ -713,12 +789,9 @@ def block_e3_fused_source_reverse(
     )
     kernel(
         u,
-        h,
         gain,
-        prediction,
         geometry_log_decay,
         associative_log_decay,
-        erase,
         previous_mass,
         current_mass,
         strength.reshape(-1),
@@ -738,7 +811,6 @@ def block_e3_fused_source_reverse(
         grad_prediction,
         grad_geometry_log_decay,
         grad_associative_log_decay,
-        grad_erase,
         grad_previous_mass,
         grad_current_mass,
         grad_strength_partial,
@@ -748,12 +820,27 @@ def block_e3_fused_source_reverse(
     _paired_l2norm_bwd_kernel[(triton.cdiv(total_rows, 16),)](
         paired,
         d,
+        u,
+        h,
+        gain,
+        prediction,
+        erase_raw,
         q_rstd,
         key_rstd,
         grad_q,
+        grad_e,
         grad_d,
         grad_q_raw,
         grad_keys,
+        grad_erase_raw,
+        grad_u,
+        grad_gain,
+        SH_B=h.stride(0),
+        SH_T=h.stride(1),
+        SH_H=h.stride(2),
+        SE_B=erase_raw.stride(0),
+        SE_T=erase_raw.stride(1),
+        SE_H=erase_raw.stride(2),
         TOTAL=total_rows,
         LENGTH=length,
         H=heads,
@@ -771,10 +858,16 @@ def block_e3_fused_source_reverse(
         (triton.cdiv(value_dim, 64), batch * length * heads)
     ](
         values,
-        write,
+        write_raw,
         grad_z,
         grad_values,
-        grad_write,
+        grad_write_raw,
+        SV_B=values.stride(0),
+        SV_T=values.stride(1),
+        SV_H=values.stride(2),
+        SW_B=write_raw.stride(0),
+        SW_T=write_raw.stride(1),
+        SW_H=write_raw.stride(2),
         T=length,
         H=heads,
         V=value_dim,
@@ -797,8 +890,8 @@ def block_e3_fused_source_reverse(
         grad_prediction,
         grad_geometry_log_decay,
         grad_associative_log_decay,
-        grad_erase,
-        grad_write,
+        grad_erase_raw,
+        grad_write_raw,
         grad_previous_mass,
         grad_current_mass,
         grad_strength,

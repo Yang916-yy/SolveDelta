@@ -284,25 +284,14 @@ class SolveDelta(nn.Module):
             packed_segments = build_packed_segments(valid_mask, reset_mask)
 
         packed_projection = self.in_proj(hidden_states)
-        projected = packed_projection[..., : self.projection_width].split(
-            self.projection_sizes, dim=-1
-        )
-        (
-            q_raw,
-            key_raw,
-            value_raw,
-            u_raw,
-            h_raw,
-            erase_raw,
-            write_raw,
-            geometry_raw,
-            associative_raw,
-        ) = projected
         conv_state = initial_state.conv if initial_state is not None else None
         if self.config.use_short_conv:
             qkv_width = sum(self.projection_sizes[:3])
+            qkv_projection, remaining_projection = packed_projection[
+                ..., : self.projection_width
+            ].split((qkv_width, self.projection_width - qkv_width), dim=-1)
             qkv, final_conv = self._packed_conv(
-                packed_projection[..., :qkv_width],
+                qkv_projection,
                 conv_state,
                 valid_mask,
                 reset_mask,
@@ -310,7 +299,28 @@ class SolveDelta(nn.Module):
                 packed_segments,
             )
             q_raw, key_raw, value_raw = qkv.split(self.projection_sizes[:3], dim=-1)
+            (
+                u_raw,
+                h_raw,
+                erase_raw,
+                write_raw,
+                geometry_raw,
+                associative_raw,
+            ) = remaining_projection.split(self.projection_sizes[3:], dim=-1)
         else:
+            (
+                q_raw,
+                key_raw,
+                value_raw,
+                u_raw,
+                h_raw,
+                erase_raw,
+                write_raw,
+                geometry_raw,
+                associative_raw,
+            ) = packed_projection[..., : self.projection_width].split(
+                self.projection_sizes, dim=-1
+            )
             q_raw, key_raw, value_raw = map(F.silu, (q_raw, key_raw, value_raw))
             final_conv = None
 

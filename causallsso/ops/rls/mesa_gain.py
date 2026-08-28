@@ -8,6 +8,8 @@ J/D/gain/prediction ABI consumed by SolveDelta.
 from __future__ import annotations
 
 import torch
+import triton
+import triton.language as tl
 
 from fla.ops.common.chunk_h import chunk_bwd_dh
 from fla.ops.utils import chunk_local_cumsum
@@ -21,8 +23,60 @@ from .mesa_specialized import (
     paired_state_forward,
 )
 
-def _symmetrize(x: torch.Tensor) -> torch.Tensor:
-    return 0.5 * (x + x.transpose(-1, -2))
+@triton.jit
+def _symmetrize_kernel(
+    x,
+    output,
+    R: tl.constexpr,
+    BLOCK: tl.constexpr,
+    SIGN: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    matrix = tl.program_id(1).to(tl.int64)
+    tiles = tl.cdiv(R, BLOCK)
+    tile_row, tile_column = tile // tiles, tile % tiles
+    row = tile_row * BLOCK + tl.arange(0, BLOCK)
+    column = tile_column * BLOCK + tl.arange(0, BLOCK)
+    mask = (row[:, None] < R) & (column[None, :] < R)
+    base = matrix * R * R
+    direct = tl.load(
+        x + base + row[:, None] * R + column[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    transpose = tl.load(
+        x + base + column[None, :] * R + row[:, None],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        output + base + row[:, None] * R + column[None, :],
+        (SIGN * direct + SIGN * transpose) * 0.5,
+        mask=mask,
+    )
+
+
+def _symmetrize(x: torch.Tensor, *, sign: int = 1) -> torch.Tensor:
+    if x.ndim < 2 or x.shape[-1] != x.shape[-2]:
+        raise ValueError("symmetric cotangent must end in a square matrix")
+    if sign not in (-1, 1):
+        raise ValueError("symmetric cotangent sign must be -1 or 1")
+    x = x.float().contiguous()
+    rank = x.shape[-1]
+    output = torch.empty_like(x)
+    block = 32
+    _symmetrize_kernel[
+        (triton.cdiv(rank, block) ** 2, x.numel() // (rank * rank))
+    ](
+        x,
+        output,
+        R=rank,
+        BLOCK=block,
+        SIGN=sign,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output
 
 
 class _MesaRLSGeometry(torch.autograd.Function):
@@ -65,6 +119,7 @@ class _MesaRLSGeometry(torch.autograd.Function):
         )
         ctx.chunk_size = chunk_size
         ctx.cg_iterations = cg_iterations
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(
             u,
             h,
@@ -99,7 +154,7 @@ class _MesaRLSGeometry(torch.autograd.Function):
             if grad_prediction is None
             else grad_prediction.to(prediction.dtype).contiguous()
         )
-        grad_final_j = None if grad_final_j is None else _symmetrize(grad_final_j.float()).contiguous()
+        grad_final_j = None if grad_final_j is None else _symmetrize(grad_final_j)
         grad_final_d = None if grad_final_d is None else grad_final_d.float().contiguous()
 
         # Recompute only the two compact chunk-boundary states, matching MESA's
@@ -180,7 +235,7 @@ class _MesaRLSGeometry(torch.autograd.Function):
             reverse=True,
         ).float()
         grad_u = grad_rhs.to(u.dtype) + grad_u_kk.to(u.dtype)
-        grad_initial_j = None if grad_initial_j is None else _symmetrize(-grad_initial_j.float())
+        grad_initial_j = None if grad_initial_j is None else _symmetrize(grad_initial_j, sign=-1)
         grad_initial_d = None if grad_initial_d is None else grad_initial_d.float()
         return grad_u, grad_h, grad_geometry_decay, grad_initial_j, grad_initial_d, None, None
 

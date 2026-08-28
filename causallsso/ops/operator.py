@@ -6,7 +6,6 @@ import torch
 
 from ..reference import SolveDeltaState
 from .rls import solvedelta_rls_native
-from .rls.gate import activated_gate
 
 
 def solvedelta_native(
@@ -24,7 +23,7 @@ def solvedelta_native(
     initial_state: SolveDeltaState | None = None,
     return_final_state: bool = False,
 ) -> tuple[torch.Tensor, SolveDeltaState | None]:
-    """Execute dense K=1 SolveDelta with activated FLA gate primitives."""
+    """Execute dense K=1 SolveDelta from raw fused-projection views."""
     if u.device.type != "cuda" or u.dtype != torch.bfloat16:
         raise TypeError("solvedelta_native requires BF16 CUDA activations")
     if keys.ndim != 5 or keys.shape[-2] != 1:
@@ -33,17 +32,12 @@ def solvedelta_native(
         raise ValueError("erase_raw must be BF16 with the same shape as keys")
     if write_raw.shape != values.shape or write_raw.dtype != torch.bfloat16:
         raise ValueError("write_raw must be BF16 with the same shape as values")
+    if any(
+        operand.stride(-1) != 1
+        for operand in (u, h, q, keys, values, erase_raw, write_raw)
+    ):
+        raise ValueError("native vector operands require unit innermost stride")
 
-    # The MESA and block-E3 owners use packed tensor ABIs. Projection slices
-    # retain the wider fused-projection row stride, so canonicalize the five
-    # public vector panels once at this boundary.
-    u = u.contiguous()
-    h = h.contiguous()
-    q = q.contiguous()
-    keys = keys.contiguous()
-    values = values.contiguous()
-    erase = activated_gate(erase_raw, scale=2.0)
-    write = activated_gate(write_raw, scale=2.0)
     output, final_state = solvedelta_rls_native(
         u,
         h,
@@ -52,12 +46,13 @@ def solvedelta_native(
         values,
         geometry_log_decay,
         associative_log_decay,
-        erase,
-        write,
+        erase_raw,
+        write_raw,
         geometry_strength,
         initial_state=initial_state,
+        return_final_state=return_final_state,
     )
-    return output, final_state if return_final_state else None
+    return output, final_state
 
 
 __all__ = ["solvedelta_native"]

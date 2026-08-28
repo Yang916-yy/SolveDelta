@@ -13,9 +13,51 @@ from functools import lru_cache
 import tilelang
 import tilelang.language as T
 import torch
+import triton
+import triton.language as tl
 
 
 _E = 3
+_TRITON_E = tl.constexpr(3)
+
+
+@triton.jit
+def _query_gauge_recompute_kernel(
+    paired,
+    cumulative,
+    q_global,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    R: tl.constexpr,
+    C: tl.constexpr,
+    NT: tl.constexpr,
+    BR: tl.constexpr,
+):
+    panel = tl.program_id(0).to(tl.int64)
+    i_bh, chunk = panel // NT, panel % NT
+    i_b, i_h = i_bh // H, i_bh % H
+    token_bos = chunk * C
+    valid = tl.minimum(C, T - token_bos)
+    coord = tl.arange(0, BR)
+    coord_mask = coord < R
+    for token in range(C):
+        token_mask = (token < valid) & coord_mask
+        gate = tl.load(
+            cumulative + ((i_b * T + token_bos + token) * H + i_h) * R + coord,
+            mask=token_mask,
+            other=0.0,
+        ).to(tl.float32)
+        query_offset = (
+            ((panel * C + token) * (_TRITON_E + 1) + _TRITON_E) * R + coord
+        )
+        query = tl.load(
+            paired + query_offset, mask=token_mask, other=0.0
+        ).to(tl.float32)
+        tl.store(
+            q_global + (panel * C + token) * R + coord,
+            query * tl.exp2(gate),
+            mask=token_mask,
+        )
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -247,5 +289,38 @@ def block_e3_pair_forward(
     return W, A, e_global, d_tail, q_global
 
 
+def block_e3_recompute_query_gauge(
+    paired: torch.Tensor,
+    cumulative: torch.Tensor,
+    *,
+    token_chunk_size: int,
+) -> torch.Tensor:
+    """Rebuild the short-lived query gauge for the state transpose."""
+    panels, _, _, rank = paired.shape
+    batch, length, heads, _ = cumulative.shape
+    chunks = (length + token_chunk_size - 1) // token_chunk_size
+    q_global = torch.empty(
+        panels,
+        token_chunk_size,
+        rank,
+        dtype=paired.dtype,
+        device=paired.device,
+    )
+    _query_gauge_recompute_kernel[(panels,)](
+        paired,
+        cumulative,
+        q_global,
+        T=length,
+        H=heads,
+        R=rank,
+        C=token_chunk_size,
+        NT=chunks,
+        BR=max(16, triton.next_power_of_2(rank)),
+        num_warps=4,
+        num_stages=1,
+    )
+    return q_global
 
-__all__ = ["block_e3_pair_forward"]
+
+
+__all__ = ["block_e3_pair_forward", "block_e3_recompute_query_gauge"]

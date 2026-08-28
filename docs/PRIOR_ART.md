@@ -2334,3 +2334,166 @@ and forward pointer arithmetic had the same packed assumption. Production now
 owns one explicit contiguous-vector boundary before MESA/E3. This is a
 correctness requirement, not a claimed final schedule. Removing it requires
 native stride-aware loads in every corresponding forward and transpose owner.
+
+### Strided source ownership and frontend parameterization audit
+
+The explicit boundary above was subsequently deleted. The implementation
+follows the source-stride pattern used by [Mamba's single packed `in_proj` and
+fused split-convolution/scan path](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba2.py):
+public projection slices keep their physical row stride, while the first
+mathematical producer writes the packed panel its matrix consumer needs. FLA's
+L2Norm forward/backward supplied the normalization arithmetic and transpose
+schedule; the local specialization adds explicit batch/token/head source
+strides. MESA's paired state, CG prediction, implicit transpose, and Hkv
+reverse retain their upstream tile ownership and add only strided loads for
+the cross-moment value source.
+
+FLA common's beta-sigmoid and the Gated Delta/KDA in-kernel beta option supplied
+the gate precedent. Erase/write logits are now loaded by the E3 source owner,
+evaluated in FP32, explicitly rounded to the former BF16 gate boundary in
+registers, and immediately multiplied by normalized key/value. Reverse closes
+the sigmoid derivative in the existing key/value source epilogues, including
+the former BF16 source-cotangent rounding. No activated erase/write tensor is
+written or saved. A packed-versus-wide-stride end-to-end test gives bitwise
+identical BF16 output, FP32 continuation states, and every public VJP.
+
+At `B1,T1024,H8,r=V=128`, a same-script 50-warmup/200-replay CUDA Graph A/B
+against `dbac580` measured contiguous core medians from `0.370` to
+`0.364--0.366 ms` forward and from `1.111` to `1.094--1.098 ms` F+B. The
+complete projected layer moved from `0.629` to `0.602--0.612 ms` forward and
+from `2.318` to `1.986--2.008 ms` F+B. The latest single-process p95 was
+`0.597/1.328 ms` for core and `0.905/2.522 ms` for the complete layer; p95
+varied materially with local clock/background state, so the median range is
+the stronger A/B signal. Capture-incremental training allocation was
+effectively unchanged (`120.0` versus `120.3 MiB`); inference capture fell by
+about `14 MiB`, matching the removed five vector copies and two activated gate
+panels.
+
+The accompanying parameterization audit found no exact parameter-count
+reduction for the current frontend. With total key/value width equal to model
+width `D`, its single input projection is an arbitrary dense map from `D` to
+approximately `8D`; arbitrary dense maps have `8D^2` independent degrees of
+freedom. Splitting, grouping, transposing, or factorizing that matrix is exact
+only when the factors retain at least the same effective rank/parameter count.
+Mamba's single `in_proj`, CUTLASS collective/epilogue composition, and fused
+projection slicing can improve execution or layout, but do not reduce this
+mathematical count; the production layer already uses the single-GEMM form and
+now removes its downstream layout copies.
+
+FLA provides mature but non-equivalent capacity choices. Its
+[Gated DeltaNet](https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/gated_deltanet.py)
+and [MESA](https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/mesa_net.py)
+layers use per-head scalar write/decay gates where SolveDelta currently uses
+channelwise erase/write and associative gates. FLA
+[LightNet](https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/lightnet.py),
+[Rodimus](https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/rodimus.py),
+and RWKV use low-rank two-linear gate parameterizations.
+[LoRA](https://arxiv.org/abs/2106.09685),
+[Monarch matrices](https://arxiv.org/abs/2204.00595),
+[butterfly products](https://arxiv.org/abs/1903.05895), and
+[tensor-train linear layers](https://arxiv.org/abs/1509.06569) likewise restrict
+or change the dense map unless run at full rank. They are therefore training
+ablations, not lossless frontend replacements. The least disruptive future
+candidate is a per-head scalar base plus a low-rank channel residual for
+erase/write logits; it preserves a mature scalar-gate path and channel
+selectivity, but still needs matched pretraining/utilization evidence before
+the operator contract changes.
+
+For the target `D=1024,H=8`, the current input projection has `8,396,800`
+weights and the whole layer has `9,459,736` parameters. Erase/write alone own
+`2,097,152` dense weights. Two independent rank-128 residual gates plus
+per-head scalar bases would use `540,672` weights and reduce the layer to about
+`7.90M`; a shared down-projection would use `409,600` and reduce it to about
+`7.77M`. Neither count includes an accuracy claim. A trained checkpoint should
+first be fitted with the best scalar-base plus truncated-SVD residual and its
+activation-weighted error measured; a from-scratch candidate then needs a
+matched training/utilization run because the extra bottleneck/up-projection
+GEMM can lose latency despite reducing FLOPs.
+
+### KDA output ownership, direct block solve, and mass-owner A/B
+
+FLA main was refreshed to commit `bccaf2d3`. The relevant MIT-licensed donor
+is `fla/ops/kda/backends/tilelang/chunk_bwd_dqkg.py`: one chunk/head CTA loops
+the value and key tiles, keeps the interaction cotangent private, and stores
+each final source gradient once. The selected SolveDelta reverse already has
+this ownership at its native axes: one `(chunk,batch,head)` CTA loops the
+`3 x 3` rank-two-geometry plus rank-one-edit interaction tiles and closes the
+source cotangents. A fresh eager profile measured this owner at `173.7 us`,
+down from the older `235 us` attribution.
+
+An A/B that moved the nine `bar W` tiles to independent TileLang CTAs was
+rejected. Although it shortened the following source owner, it introduced a
+2.25 MiB FP32 `bar W` write/read boundary and another launch. Complete CUDA
+Graph F+B measured `1.104 ms` versus `1.098 ms` for the retained resident
+owner. This distinguishes the useful KDA ownership pattern from copying one
+of its internal phase boundaries into an operator with different native axes.
+
+The C48 inverse cache was also challenged independently. A token-aligned
+analytic `3 x 3` precondition followed by four-token direct block TRSM used
+three Tensor-Core cross updates and never wrote an intermediate inverse. On
+the target panels it matched the selected inverse path to about `5.98e-4`
+relative error for `Y` and `5.65e-5` for the injection response, but measured
+`0.0401 ms` versus `0.0274 ms` for inverse construction plus application.
+Transpose work was therefore not added and the inverse cache remains selected;
+deleting it would have combined an algebraic, tiling, and lifetime change
+after the direct solve had already lost.
+
+Finally, the FP32 effective-mass recurrence was placed in the designated
+`(key_block=0,value_block=0)` MESA state tile for a complete forward/backward
+A/B. The implementation preserved the existing three-kernel affine transpose
+and changed only forward ownership plus the autograd seam. The 32 serial
+`exp/update/store` steps extended the matrix-state CTA critical path: core
+Graph forward/F+B regressed from `0.367/1.104 ms` to `0.509/1.251 ms`.
+The candidate was removed. Mass remains a separate low-resource affine scan,
+and the rejected eight-CTA sequence/head streaming schedule remains forbidden.
+
+### Final epilogue, saved-tensor, and numerical-primitive pass
+
+PyTorch's documented CUDA [`bmm`](https://docs.pytorch.org/docs/stable/generated/torch.bmm.html)
+and [`baddbmm`](https://docs.pytorch.org/docs/stable/generated/torch.baddbmm.html)
+paths support BF16 Tensor-Core operands with FP32 accumulation. The block-E3
+action-statistics owner previously requested FP32 HBM outputs for all three
+products and then launched separate BF16 cast/add kernels. The selected path
+now lets the mature GEMM epilogues write the private BF16 `Q*`, `Bz`, and `Kz`
+panels directly; `Q*=Q_global-A@Y` uses `baddbmm`. Five random target-shaped
+comparisons were bitwise identical to the former FP32-temporary-then-BF16
+schedule. Three target CUDA Graph runs moved core median forward/F+B from
+about `0.366/1.105 ms` to `0.348--0.349/1.081--1.085 ms` after all retained
+changes; the complete projected layer moved from about `0.570/1.853 ms` to
+`0.545--0.551/1.805 ms`.
+
+PyTorch's
+[`FunctionCtx.set_materialize_grads`](https://docs.pytorch.org/docs/stable/generated/torch.autograd.function.FunctionCtx.set_materialize_grads.html)
+was applied to the MESA, mass, and E3 autograd owners. Unrequested final
+`J/D/S` outputs no longer create full zero cotangents. The state reverse uses a
+static `HAS_FINAL_STATE` branch and begins from FP32 register zero when the
+cotangent is absent. A single Triton tile epilogue replaces the former
+`neg -> transpose-add -> scale` chain for symmetric `J` cotangents; isolated
+random checks at ranks 16, 32, and 128 were bitwise identical to the original
+FP32 expression. Skipping the public `J` symmetrization when final state is not
+requested reduces the inference graph by another 0.5 MiB without changing the
+returned-state path.
+
+The query-gauge save/recompute A/B retained a narrow memory trade. Rebuilding
+the BF16 panel from the already-saved paired query and FP32 cumulative gate
+costs about `9--11 us` but removes 2 MiB of long-lived storage per layer;
+unique core saved storage is now `75.47 MiB`. Reconstructing `d_tail` as well
+raised state reverse from about `161` to `272 us`, while a separate 8 MiB
+scratch owner still lost complete F+B, so all larger recompute candidates were
+rejected.
+
+The final numerical audit compared FLA's `tl.sigmoid` gate primitive with an
+FP32 PyTorch sigmoid over ten million BF16 samples. After the declared BF16
+forward rounding, `2*sigmoid` was bitwise identical. About 0.04 percent of
+BF16 raw-gate gradients differed by one ULP, with maximum absolute difference
+`2.44e-4`; replacing the source-owner primitive with libdevice therefore did
+not justify extra transcendental latency. The decay-gate softplus retains its
+already-selected libdevice implementation because that path improved FP32
+parameter-gradient accuracy at only about `0.2--0.5 us` isolated cost.
+
+A symmetric-J producer experiment was rejected despite its appealing algebra.
+Lower/diagonal MESA tiles wrote mirrored representative bits and upper tiles
+skipped the duplicate covariance product, yielding bitwise-symmetric `J` and
+passing all nine production tests. Nonuniform CTA control and mirrored scatter
+stores nevertheless regressed core forward/F+B to `0.417/1.230 ms`; the mature
+uniform paired J/D owner plus narrow cotangent epilogue remains selected.

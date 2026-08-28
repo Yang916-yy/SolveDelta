@@ -219,25 +219,51 @@ def _native_state(*, rank: int = 16, value_dim: int = 16):
 
 
 @CUDA_ONLY
-def test_raw_gate_matches_bf16_formula_and_vjp():
-    from causallsso.ops.rls.gate import activated_gate
+def test_native_strided_sources_and_fused_raw_gates_match_packed_path():
+    packed = tuple(value.detach().clone().requires_grad_() for value in _native_inputs())
+    vector_indices = {0, 1, 2, 3, 4, 7, 8}
+    strided = []
+    for index, value in enumerate(packed):
+        if index not in vector_indices:
+            strided.append(value.detach().clone().requires_grad_())
+            continue
+        storage = torch.empty(
+            *value.shape[:-1], value.shape[-1] + 7,
+            dtype=value.dtype,
+            device=value.device,
+        )
+        view = storage[..., : value.shape[-1]]
+        view.copy_(value.detach())
+        strided.append(view.detach().requires_grad_())
+        assert not strided[-1].is_contiguous()
+    strided = tuple(strided)
+
+    packed_output, packed_state = solvedelta_native(
+        *packed, return_final_state=True
+    )
+    strided_output, strided_state = solvedelta_native(
+        *strided, return_final_state=True
+    )
+    assert torch.equal(strided_output, packed_output)
+    for actual, expected in zip(strided_state, packed_state):
+        assert torch.equal(actual, expected)
 
     torch.manual_seed(17)
-    storage = torch.randn(2, 17, 111, device="cuda", dtype=torch.bfloat16)
-    raw = storage[..., 7:103].detach().requires_grad_()
-    output = activated_gate(raw, scale=2.0)
-    expected = (2.0 * torch.sigmoid(raw.float())).to(torch.bfloat16)
-    assert torch.equal(output, expected)
-    cotangent = torch.randn_like(output)
-    gradient = torch.autograd.grad((output * cotangent).sum(), raw)[0]
-    reference_raw = raw.detach().float().requires_grad_()
-    reference = 2.0 * torch.sigmoid(reference_raw)
-    reference_gradient = torch.autograd.grad(
-        (reference * cotangent.float()).sum(), reference_raw
-    )[0]
-    relative = (gradient.float() - reference_gradient).norm()
-    relative = relative / reference_gradient.norm().clamp_min(1e-8)
-    assert relative < 3e-3
+    output_cotangent = torch.randn_like(packed_output)
+    state_cotangents = [torch.randn_like(value) for value in packed_state]
+
+    def loss(output, state):
+        return (output * output_cotangent).sum() + sum(
+            (value * cotangent).sum()
+            for value, cotangent in zip(state, state_cotangents)
+        )
+
+    packed_gradients = torch.autograd.grad(loss(packed_output, packed_state), packed)
+    strided_gradients = torch.autograd.grad(
+        loss(strided_output, strided_state), strided
+    )
+    for actual, expected in zip(strided_gradients, packed_gradients):
+        assert torch.equal(actual, expected)
 
 
 @CUDA_ONLY

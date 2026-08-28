@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import torch
 
-from .block_e3_pair import block_e3_pair_forward
+from .block_e3_pair import block_e3_pair_forward, block_e3_recompute_query_gauge
 from .block_e3_pair_reverse import block_e3_fused_source_reverse
 from .block_e3_reverse import block_e3_mature_reverse
 from .block_e3_sources import block_e3_gate_cumsum, block_e3_sources_forward
@@ -59,7 +59,6 @@ def _forward_blocks(
         Y,
         response,
         inverse,
-        q_global,
         state_cache,
     )
 
@@ -77,8 +76,8 @@ class _BlockE3DirectE(torch.autograd.Function):
         prediction,
         geometry_log_decay,
         associative_log_decay,
-        erase,
-        write,
+        erase_raw,
+        write_raw,
         previous_mass,
         current_mass,
         strength,
@@ -95,8 +94,8 @@ class _BlockE3DirectE(torch.autograd.Function):
             prediction,
             geometry_log_decay,
             associative_log_decay,
-            erase,
-            write,
+            erase_raw,
+            write_raw,
             previous_mass,
             current_mass,
             strength,
@@ -113,6 +112,7 @@ class _BlockE3DirectE(torch.autograd.Function):
         )
         ctx.token_chunk_size = token_chunk_size
         ctx.strength_shape = strength.shape
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(
             u,
             h,
@@ -123,8 +123,8 @@ class _BlockE3DirectE(torch.autograd.Function):
             prediction,
             geometry_log_decay,
             associative_log_decay,
-            erase,
-            write,
+            erase_raw,
+            write_raw,
             previous_mass,
             current_mass,
             strength,
@@ -150,8 +150,8 @@ class _BlockE3DirectE(torch.autograd.Function):
             prediction,
             geometry_log_decay,
             associative_log_decay,
-            erase,
-            write,
+            erase_raw,
+            write_raw,
             previous_mass,
             current_mass,
             strength,
@@ -167,10 +167,24 @@ class _BlockE3DirectE(torch.autograd.Function):
             Y,
             response,
             inverse,
-            q_global,
             state_cache,
         ) = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
+        if grad_output is None:
+            grad_output = torch.zeros(
+                q.shape[0],
+                q.shape[1],
+                q.shape[2],
+                values.shape[-1],
+                dtype=values.dtype,
+                device=values.device,
+            )
+        else:
+            grad_output = grad_output.contiguous()
+        q_global = block_e3_recompute_query_gauge(
+            paired,
+            cumulative,
+            token_chunk_size=ctx.token_chunk_size,
+        )
         (
             grad_e,
             grad_injection,
@@ -206,8 +220,8 @@ class _BlockE3DirectE(torch.autograd.Function):
             prediction,
             geometry_log_decay,
             associative_log_decay,
-            erase,
-            write,
+            erase_raw,
+            write_raw,
             previous_mass,
             current_mass,
             strength,
@@ -239,8 +253,8 @@ def block_e3_direct_e_delta_rule(
     prediction,
     geometry_log_decay,
     associative_log_decay,
-    erase,
-    write,
+    erase_raw,
+    write_raw,
     previous_mass,
     current_mass,
     strength,
@@ -258,8 +272,8 @@ def block_e3_direct_e_delta_rule(
         prediction,
         geometry_log_decay,
         associative_log_decay,
-        erase,
-        write,
+        erase_raw,
+        write_raw,
         previous_mass,
         current_mass,
         strength,

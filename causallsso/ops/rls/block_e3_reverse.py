@@ -45,6 +45,7 @@ def _state_reverse_owner(
     BN: tl.constexpr,
     BR: tl.constexpr,
     BV: tl.constexpr,
+    HAS_FINAL_STATE: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_bh = tl.program_id(1).to(tl.int64)
@@ -58,9 +59,12 @@ def _state_reverse_owner(
     m_rv = m_r[:, None] & m_v[None, :]
 
     state_offset = i_bh * R * V + o_r[:, None] * V + o_v[None, :]
-    dstate = tl.load(
-        grad_final_state + state_offset, mask=m_rv, other=0.0
-    ).to(tl.float32)
+    if HAS_FINAL_STATE:
+        dstate = tl.load(
+            grad_final_state + state_offset, mask=m_rv, other=0.0
+        ).to(tl.float32)
+    else:
+        dstate = tl.zeros((BR, BV), dtype=tl.float32)
 
     for reverse_chunk in range(0, NT):
         chunk = NT - 1 - reverse_chunk
@@ -388,9 +392,8 @@ def block_e3_mature_reverse(
     logical_chunk = _E * token_chunk_size
     if token_chunk_size != 16:
         raise ValueError("the mature block-E3 reverse is specialized for C16")
-    if grad_final_state is None:
-        grad_final_state = torch.zeros_like(initial_state, dtype=torch.float32)
-    else:
+    has_final_state = grad_final_state is not None
+    if grad_final_state is not None:
         grad_final_state = grad_final_state.float().contiguous()
 
     grad_state = torch.empty_like(state_cache)
@@ -421,7 +424,7 @@ def block_e3_mature_reverse(
         cumulative,
         state_cache,
         grad_output,
-        grad_final_state,
+        grad_final_state if grad_final_state is not None else initial_state,
         grad_state,
         grad_residual,
         residual,
@@ -437,6 +440,7 @@ def block_e3_mature_reverse(
         BN=64,
         BR=block_rank,
         BV=16,
+        HAS_FINAL_STATE=has_final_state,
         num_warps=4,
         num_stages=2,
     )
@@ -446,7 +450,13 @@ def block_e3_mature_reverse(
     grad_e = torch.empty_like(Y, dtype=torch.float32)
     grad_injection = torch.empty_like(response, dtype=torch.float32)
     grad_d = torch.empty_like(Y, dtype=torch.float32)
-    grad_q = torch.empty_like(q_global, dtype=torch.float32)
+    grad_q = torch.empty(
+        panels,
+        token_chunk_size,
+        rank,
+        dtype=torch.float32,
+        device=Y.device,
+    )
     grad_tail_seed = torch.empty(
         panels, rank, dtype=torch.float32, device=Y.device
     )

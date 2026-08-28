@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from fla.modules.l2norm import l2norm
-
 from ...reference import SolveDeltaState, solvedelta_zero_state
 from .block_e3_exterior import block_e3_direct_e_delta_rule
 from .mass import mass_prefix
 from .mesa_gain import mesa_rls_geometry
+from .strided_l2norm import strided_l2norm
 
 
 PRIOR_MASS = 2.0
@@ -19,8 +18,8 @@ TOKEN_CHUNK_SIZE = 16
 
 
 def _normalize(x: torch.Tensor) -> torch.Tensor:
-    # Match FLA GDN2/MESA's FP32 norm reduction and public-dtype rounding.
-    return l2norm(x, eps=1.0e-24)
+    # FLA L2Norm arithmetic with explicit fused-projection source strides.
+    return strided_l2norm(x)
 
 
 def solvedelta_rls_native(
@@ -31,17 +30,14 @@ def solvedelta_rls_native(
     values: torch.Tensor,
     geometry_log_decay: torch.Tensor,
     associative_log_decay: torch.Tensor,
-    erase: torch.Tensor,
-    write: torch.Tensor,
+    erase_raw: torch.Tensor,
+    write_raw: torch.Tensor,
     geometry_strength: torch.Tensor,
     *,
     initial_state: SolveDeltaState | None = None,
-) -> tuple[torch.Tensor, SolveDeltaState]:
-    """Execute the selected dense BF16 RLS path.
-
-    ``erase`` and ``write`` are activated gates in ``[0, 2]``. Raw-logit
-    activation is owned by the public operator wrapper.
-    """
+    return_final_state: bool = True,
+) -> tuple[torch.Tensor, SolveDeltaState | None]:
+    """Execute the selected dense BF16 RLS path from raw gate logits."""
     if u.ndim != 4:
         raise ValueError("u must have shape [B,T,H,r]")
     batch, length, heads, rank = u.shape
@@ -56,13 +52,13 @@ def solvedelta_rls_native(
         raise ValueError("geometry_log_decay must have shape [B,T,H]")
     if associative_log_decay.shape != (batch, length, heads, rank):
         raise ValueError("associative_log_decay must have shape [B,T,H,r]")
-    if erase.shape != keys.shape or write.shape != values.shape:
-        raise ValueError("erase/write shapes must match keys/values")
+    if erase_raw.shape != keys.shape or write_raw.shape != values.shape:
+        raise ValueError("erase_raw/write_raw shapes must match keys/values")
     if geometry_strength.shape not in ((heads,), (1, heads)):
         raise ValueError("geometry_strength must have shape [H] or [1,H]")
     if u.device.type != "cuda" or u.dtype != torch.bfloat16:
         raise TypeError("the production RLS path requires BF16 CUDA operands")
-    if any(x.dtype != u.dtype for x in (h, q, keys, values, erase, write)):
+    if any(x.dtype != u.dtype for x in (h, q, keys, values, erase_raw, write_raw)):
         raise TypeError("all public vector operands must be BF16")
     if geometry_log_decay.dtype != torch.float32:
         raise TypeError("geometry_log_decay must be FP32")
@@ -114,15 +110,18 @@ def solvedelta_rls_native(
         updated_prediction,
         geometry_log_decay,
         associative_log_decay,
-        erase,
-        write,
+        erase_raw,
+        write_raw,
         previous_mass,
         current_mass,
         geometry_strength,
         state.S,
         token_chunk_size=TOKEN_CHUNK_SIZE,
     )
-    return output.to(torch.bfloat16), SolveDeltaState(
+    output = output.to(torch.bfloat16)
+    if not return_final_state:
+        return output, None
+    return output, SolveDeltaState(
         m=final_mass,
         J=0.5 * (final_j + final_j.transpose(-1, -2)),
         D=final_d,

@@ -220,12 +220,12 @@ def block_e3_action_statistics(
     d_tail: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build compact Q*, Bz, and Kz with library Tensor-Core GEMMs."""
-    ay = torch.bmm(A, Y, out_dtype=torch.float32)
-    q_star = (q_global.float() - ay).to(q_global.dtype)
-    b_z = torch.bmm(A, response, out_dtype=torch.float32).to(A.dtype)
-    k_z = torch.bmm(
-        d_tail.transpose(1, 2), response, out_dtype=torch.float32
-    ).to(d_tail.dtype)
+    # cuBLAS accumulates these BF16 contractions in FP32.  Writing the private
+    # BF16 panels from the GEMM epilogue avoids three FP32 HBM temporaries and
+    # their separate cast/add launches.
+    q_star = torch.baddbmm(q_global, A, Y, beta=1, alpha=-1)
+    b_z = torch.bmm(A, response)
+    k_z = torch.bmm(d_tail.transpose(1, 2), response)
     return q_star, b_z, k_z
 
 

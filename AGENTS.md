@@ -102,7 +102,7 @@ Delta edit/read while geometry continuation state still updates.
 
 The selected dense BF16 CUDA path is fixed as:
 
-1. FLA L2Norm for public vector normalization;
+1. a stride-aware specialization of FLA L2Norm for public vector normalization;
 2. MESA paired `Hkk/Hkv` state scans for `J/D` and their strict transpose;
 3. fixed CG5 matrix-free gain and implicit transpose;
 4. a scalar FP32 affine scan for effective mass;
@@ -116,10 +116,11 @@ Use GDN2-style selective fusion: preserve chunk and output parallelism, and
 accept a private boundary when fusion would lengthen lifetimes or reduce CTA
 occupancy.
 
-The native kernels require packed operand layouts. The public operator owns the
-single canonicalization boundary from strided fused-projection views. Removing
-those copies requires adding and testing native stride support in every
-consumer; silently treating a strided view as packed is incorrect.
+Public fused-projection views may retain arbitrary batch/token/head strides
+with unit innermost vector stride. Their source owners load those strides
+directly and write packed private panels. MESA's cross-moment value loads and
+their transpose use the same source strides. Treating a strided view as packed,
+or restoring a public canonicalization copy, is incorrect.
 
 Dense CUDA BF16 is the optimized training surface. Masks and resets currently
 use the same RLS reference semantics through the model fallback; they must not

@@ -139,21 +139,28 @@ never exposed as a public `3T` sequence.
 
 ## 4. Forward ownership
 
-1. `fla.modules.l2norm.l2norm` produces normalized `u`; the E3 source owner
-   normalizes `q/k` and saves their FP32 reciprocal norms for transpose.
+1. The stride-aware FLA L2Norm specialization loads the fused-projection `u`
+   view and writes a packed normalized panel. The E3 source owner directly
+   loads strided `q/k` and saves their FP32 reciprocal norms for transpose.
 2. The MESA paired state owner advances FP32 `J/D` chunk boundaries and emits
    the matrix-free gain and updated prediction. The dense states are not built
    per token in HBM.
 3. The FP32 mass affine scan emits previous/current mass and the final mass.
-4. The source owner emits BF16 `[token,3,r]` direct and `[token,4,r]` paired
-   panels plus the write value. It computes scalar denominators and diagonal
-   logs in FP32.
+4. The source owner directly loads strided `h/q/k/v` and raw erase/write
+   logits, evaluates `2 sigmoid` in FP32, rounds the gate to the declared BF16
+   public boundary in registers, and emits BF16 `[token,3,r]` direct and
+   `[token,4,r]` paired panels plus the write value. It computes scalar
+   denominators and diagonal logs in FP32. No activated gate panel is written.
 5. The C16 TileLang pair owner constructs strict `W`, read interaction `A`,
    globally gauged direct/dual panels, and tail panels using 16x16 MMA tiles
    with FP32 accumulators.
 6. The C48 WY owner solves the unit-lower interaction system and forms its
    compact response. The inverse is stored only in the consumer dtype.
-7. Separate action-statistics and state/output owners preserve chunk/rank/value
+7. The three action statistics use mature BF16 `bmm`/`baddbmm` epilogues:
+   Tensor Cores accumulate in FP32 and write the declared private BF16 panels
+   directly. No FP32 action-statistics HBM temporary or follow-up cast/add
+   kernel is part of the execution graph.
+8. Separate action-statistics and state/output owners preserve chunk/rank/value
    CTA parallelism. They advance FP32 chunk boundary `S`, emit BF16 outputs,
    and return FP32 final `S`.
 
@@ -174,9 +181,11 @@ an expanded sequence:
 3. Pair reverse owns each source output tile, streams all interaction
    contributions, and accumulates Tensor Core products in FP32. It does not
    materialize per-source full gradients or a `3T` checkpoint.
-4. The fused source transpose returns cotangents for normalized vectors,
-   gates, decay, mass, gain, prediction, and `gamma`. L2Norm VJPs consume the
-   exact rounded normalized panels saved by forward.
+4. The fused source transpose returns cotangents for normalized vectors, raw
+   gate logits, decay, mass, gain, prediction, and `gamma`. Its gate epilogues
+   reproduce the deleted BF16 intermediate rounding in registers. L2Norm VJPs
+   consume the exact rounded normalized panels saved by forward and write
+   compact final-shaped gradients for the original strided views.
 5. The MESA implicit transpose solves the adjoint gain action with the same
    fixed CG5 schedule, reverses `Hkk/Hkv`, and returns final-shaped
    `bar_u,bar_h,bar_log_lambda,bar_J0,bar_D0`.
@@ -205,16 +214,22 @@ FP16 templates for isolated diagnostics, but the public native path is BF16.
 
 ## 7. Layout and lifecycle
 
-The native kernels consume packed layouts. The public operator canonicalizes
-the five strided vector views produced by the fused projection. Raw gate views
-are activated into packed BF16 outputs. A future stride-aware implementation
-may remove this boundary only after every forward and transpose consumer is
-updated and the complete layer passes the same oracle/VJP gates.
+Public `u/h/q/k/v` and raw gate views retain the fused projection's row stride
+and require only unit innermost vector stride. The stride-aware L2Norm, MESA
+cross-moment/CG owners, E3 source owner, and their transposes load these views
+directly. Producer outputs (`u_normalized`, gain/prediction, E3 panels) remain
+packed private tensors for their matrix owners. Gate activation is
+generate-use-discard and never becomes an HBM ABI.
 
 The retained saved-tensor footprint is dominated by compact forward cache and
 FP32 reverse partials. Do not lower those tensors merely to reduce allocator
 metrics. A save-versus-recompute change needs a complete F+B A/B and identical
-production-observable gates.
+production-observable gates. The selected training path reconstructs the
+2 MiB BF16 query-gauge panel from the saved paired source and FP32 cumulative
+gate immediately before state reverse; all larger panel-recompute candidates
+lost their complete F+B A/B. Unrequested final-state outputs do not materialize
+zero cotangents, and their public `J` symmetrization is skipped when the caller
+does not request the state.
 
 ## 8. Acceptance and benchmark
 
@@ -231,7 +246,12 @@ Production-observable gates:
 - dense public layer forward/backward from real strided projection views.
 
 Report the core operator and complete projected layer separately. At
-`B1,T1024,H8,r=V=128`, the selected contiguous core measured median/p95
-`0.371/0.402 ms` forward and `1.103/1.320 ms` F+B under CUDA Graph. The full
-projected layer measured `0.649/0.854 ms` forward and `2.329/2.624 ms` F+B.
-Core allocation was `86.3 MiB`; full-layer allocation was `152.0 MiB`.
+`B1,T1024,H8,r=V=128`, three 50-warmup/200-replay CUDA Graph runs measured the
+selected contiguous core at median `0.348--0.349 ms` forward and
+`1.081--1.085 ms` F+B. Their p95 ranges were `0.363--0.365 ms` and
+`1.124--1.297 ms`. The full projected layer measured median
+`0.545--0.551 ms` forward and `1.805 ms` F+B, with p95 ranges
+`0.568--0.726 ms` and `2.110--2.182 ms`. Capture-incremental allocation was
+`173.456 MiB` for inference and `120.046 MiB` for training. Unique core
+forward-saved storage was `75.47 MiB`; the complete eager training peak was
+`248.04 MiB`.

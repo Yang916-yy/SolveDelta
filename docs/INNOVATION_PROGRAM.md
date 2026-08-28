@@ -86,8 +86,8 @@ rank, or value-tile concurrency.
 
 - CG5 approximates the exact FP64 gain action and must remain inside frozen
   BF16 output/state/VJP gates.
-- The public fused projection currently needs packed-vector canonicalization
-  before MESA/E3 kernels.
+- Public fused-projection views are consumed through native source strides;
+  activated erase/write gates are generate-use-discard inside E3 owners.
 - The selected block-E3 reverse keeps substantial forward cache and FP32
   partial storage.
 - The core remains materially slower and larger than matched GDN2 because it

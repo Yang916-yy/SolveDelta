@@ -20,8 +20,11 @@ Adapted production files:
 - `causallsso/ops/rls/block_e3_state.py`, `block_e3_reverse.py`, and
   `block_e3_exterior.py`: FLA/GDN2 state/output and transpose ownership adapted
   to the RLS source mapping;
-- `causallsso/ops/rls/gate.py`: FLA common beta-sigmoid specialized to BF16
-  output;
+- `causallsso/ops/rls/block_e3_sources.py` and
+  `block_e3_pair_reverse.py`: FLA common beta-sigmoid fused into the strided
+  source forward/transpose without an activated-gate HBM panel;
+- `causallsso/ops/rls/strided_l2norm.py`: FLA L2Norm arithmetic and row
+  ownership specialized to fused-projection source strides;
 - `causallsso/ops/rls/mass.py`: scalar affine scan and transpose following FLA
   chunk-state ownership;
 - `causallsso/ops/gates.py`: FLA GDN decay gate specialized to the model's
