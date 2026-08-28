@@ -33,6 +33,33 @@ The cotangent returned for the symmetric state is
 bar_J0 <- (bar_J0 + bar_J0^T) / 2.
 ```
 
+### 1.1 Geometry-decay initialization
+
+The model frontend initializes the zero-input geometry decay deterministically
+across heads. For head index `h`:
+
+```text
+lambda_init[h] = 0.99                              if H = 1
+lambda_init[h] = 0.985 + 0.010 h / (H - 1)        otherwise.
+```
+
+With the frontend parameterization
+
+```text
+log_lambda = -exp(geometry_log_rate) *
+             softplus(geometry_raw + geometry_decay_bias),
+```
+
+initialization sets `geometry_log_rate=0` and
+
+```text
+geometry_decay_bias[h] = softplus^-1(-log(lambda_init[h])).
+```
+
+This is a model initialization only. It adds no clamp, threshold, runtime
+fallback, or new native ABI; projected token input and learned parameters may
+move every head throughout the existing `(0,1)` decay domain.
+
 ## 2. Token recurrence
 
 Normalize

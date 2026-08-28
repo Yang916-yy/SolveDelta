@@ -8,6 +8,13 @@ available under the MIT License.
 
 Adapted production files:
 
+- `causallsso/modeling_solvedelta.py` and `causallsso/config.py`: FLA's
+  GatedDeltaNet/MESA Hugging Face model, hybrid-attention, recurrent Cache,
+  RMSNorm, GatedMLP, and fused-loss ownership specialized around the
+  SolveDelta mixer and `(m,J,D,S)` state;
+- `causallsso/model.py`: FLA GDN2/Mamba-style log-rate and inverse-softplus
+  decay initialization, with the geometry heads spread across the RLS
+  CG5-safe initial decay interval;
 - `causallsso/ops/rls/mesa_specialized.py`: paired MESA `Hkk/Hkv` state,
   matrix-free CG, covariance/cross-moment reverse, and implicit transpose;
 - `causallsso/ops/rls/mesa_gain.py`: SolveDelta ownership and composed VJP for
@@ -37,10 +44,13 @@ Principal upstream source areas:
 - `fla/ops/common/{chunk_h,gate}.py`;
 - `fla/ops/{gdn2,kda}/`;
 - `fla/modules/l2norm.py`;
-- `fla/ops/utils/`.
+- `fla/ops/utils/`;
+- `fla/models/{gated_deltanet,mesa_net}/`, `fla/models/hybrid.py`, and
+  `fla/models/utils.py`;
+- `fla/layers/{gated_deltanet,gdn2}.py`.
 
-The reviewed upstream revisions and measured adoption decisions are recorded
-in `docs/PRIOR_ART.md`.
+The reviewed upstream revisions, concrete mappings, and production decisions
+are recorded in `docs/PRIOR_ART.md`.
 
 > MIT License
 >
@@ -56,6 +66,14 @@ specialize FLA's TileLang scheduling patterns. TileLang 0.1.13 is distributed
 under the MIT License and includes separately licensed bundled components.
 Upstream repository:
 <https://github.com/tile-ai/tilelang>.
+
+## Mamba
+
+Mamba-2 and Mamba-3 informed fused-projection layout, resident value-tile
+state, output-owned reverse, and decay initialization. No Mamba source file is
+vendored in this repository. Mamba is distributed under the Apache License
+2.0. Upstream repository:
+<https://github.com/state-spaces/mamba>.
 
 ## causal-conv1d
 

@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "causallsso"
 version = "0.1.0"
-description = "Causal LSSO: SolveDelta"
+description = "Geometry-conditioned Delta memory for causal language models"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.7"]
+dependencies = ["torch>=2.7", "transformers>=4.53.3"]
 
 [project.optional-dependencies]
 native = [

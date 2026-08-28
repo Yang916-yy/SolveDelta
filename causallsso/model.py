@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
@@ -64,17 +65,42 @@ class SolveDelta(nn.Module):
             self.conv_weight = nn.Parameter(torch.empty(conv_width, 4))
             nn.init.kaiming_uniform_(self.conv_weight, a=5**0.5)
 
+        # Spread heads across stable long-memory scales without placing every
+        # head at the same initialization point. A single head uses the midpoint.
+        if heads == 1:
+            geometry_decay = torch.full((1,), 0.99, dtype=torch.float32)
+        else:
+            geometry_decay = torch.linspace(0.985, 0.995, heads, dtype=torch.float32)
+        geometry_step = -geometry_decay.log()
+        geometry_bias = geometry_step + torch.log(-torch.expm1(-geometry_step))
         self.geometry_log_rate = nn.Parameter(torch.zeros(heads, dtype=torch.float32))
+        self.geometry_decay_bias = nn.Parameter(geometry_bias)
+
+        # Match the mature GDN2/Mamba decay initialization: a positive rate
+        # and log-uniform step size, evaluated in FP32 by the gate owner.
+        associative_rate = torch.empty(heads, 1, dtype=torch.float32).uniform_(1, 16)
         self.associative_log_rate = nn.Parameter(
-            torch.zeros(heads, width, dtype=torch.float32)
+            associative_rate.log().expand(heads, width).clone()
+        )
+        associative_step = torch.exp(
+            torch.rand(heads, width, dtype=torch.float32)
+            * (math.log(0.1) - math.log(0.001))
+            + math.log(0.001)
+        ).clamp_min_(1e-4)
+        self.associative_decay_bias = nn.Parameter(
+            associative_step + torch.log(-torch.expm1(-associative_step))
         )
         self.geometry_strength_logit = nn.Parameter(
             torch.full((heads,), -2.0, dtype=torch.float32)
         )
-        self.geometry_decay_bias = nn.Parameter(torch.zeros(heads, dtype=torch.float32))
-        self.associative_decay_bias = nn.Parameter(
-            torch.zeros(heads, width, dtype=torch.float32)
-        )
+        for parameter in (
+            self.geometry_log_rate,
+            self.geometry_decay_bias,
+            self.associative_log_rate,
+            self.associative_decay_bias,
+            self.geometry_strength_logit,
+        ):
+            parameter._no_weight_decay = True
 
     def _packed_conv(
         self,
@@ -261,9 +287,10 @@ class SolveDelta(nn.Module):
         width = self.config.resolved_head_k_dim
         value_width = self.config.resolved_head_v_dim
         edits = self.config.num_edits
+        packed_projection = self.in_proj(hidden_states)
         native_inputs = (
-            hidden_states.device.type == "cuda"
-            and hidden_states.dtype == torch.bfloat16
+            packed_projection.device.type == "cuda"
+            and packed_projection.dtype == torch.bfloat16
         )
         use_native = native_inputs and valid_mask is None and reset_mask is None
         packed_segments = None
@@ -283,7 +310,6 @@ class SolveDelta(nn.Module):
                 raise ValueError("masks must share the activation device")
             packed_segments = build_packed_segments(valid_mask, reset_mask)
 
-        packed_projection = self.in_proj(hidden_states)
         conv_state = initial_state.conv if initial_state is not None else None
         if self.config.use_short_conv:
             qkv_width = sum(self.projection_sizes[:3])
