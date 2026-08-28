@@ -215,13 +215,17 @@ def _paired_geometry_forward_kernel(
 def _matrix_boundary_reverse_kernel(
     grad_j_boundary,
     grad_d_boundary,
+    grad_m_boundary,
     grad_j_final,
     grad_d_final,
+    grad_m_final,
     chunk_decay,
     end_j,
     end_d,
+    end_m,
     grad_j0,
     grad_d0,
+    grad_m0,
     chunk_offsets,
     N: tl.constexpr,
     R: tl.constexpr,
@@ -260,6 +264,8 @@ def _matrix_boundary_reverse_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
+    mass_owner = (tile_i == 0) & (tile_j == 0)
+    dm = tl.load(grad_m_final + bh).to(tl.float32)
     for reverse_index in range(N):
         chunk = N - 1 - reverse_index
         active_chunk = chunk < chunk_count
@@ -272,6 +278,8 @@ def _matrix_boundary_reverse_kernel(
         pointer = chunk_base + oi[:, None] * R + oj[None, :]
         tl.store(end_j + pointer, dj, mask=mask & active_chunk)
         tl.store(end_d + pointer, dd, mask=mask & active_chunk)
+        if mass_owner:
+            tl.store(end_m + panel, dm, mask=active_chunk)
         decay = tl.load(
             chunk_decay + panel, mask=active_chunk, other=1.0
         ).to(tl.float32)
@@ -292,45 +300,15 @@ def _matrix_boundary_reverse_kernel(
         )
         dj = tl.where(active_chunk, local_j + decay * dj, dj)
         dd = tl.where(active_chunk, local_d.to(tl.float32) + decay * dd, dd)
+        if mass_owner:
+            local_m = tl.load(
+                grad_m_boundary + panel, mask=active_chunk, other=0.0
+            ).to(tl.float32)
+            dm = tl.where(active_chunk, local_m + decay * dm, dm)
     tl.store(grad_j0 + state_base + oi[:, None] * R + oj[None, :], dj, mask=mask)
     tl.store(grad_d0 + state_base + oi[:, None] * R + oj[None, :], dd, mask=mask)
-
-
-@triton.jit
-def _mass_boundary_reverse_kernel(
-    grad_boundary,
-    grad_final,
-    chunk_decay,
-    end_cotangent,
-    grad_initial,
-    chunk_offsets,
-    N: tl.constexpr,
-    H: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    bh = tl.program_id(0)
-    sequence = bh // H
-    head = bh % H
-    if IS_VARLEN:
-        chunk_offset = tl.load(chunk_offsets + sequence).to(tl.int64)
-        chunk_count = tl.load(chunk_offsets + sequence + 1).to(tl.int64) - chunk_offset
-    else:
-        chunk_offset = 0
-        chunk_count = N
-    cotangent = tl.load(grad_final + bh).to(tl.float32)
-    for reverse_index in range(N):
-        chunk = N - 1 - reverse_index
-        active_chunk = chunk < chunk_count
-        offset = (
-            (chunk_offset + chunk) * H + head
-            if IS_VARLEN
-            else bh * N + chunk
-        )
-        tl.store(end_cotangent + offset, cotangent, mask=active_chunk)
-        decay = tl.load(chunk_decay + offset, mask=active_chunk, other=1.0).to(tl.float32)
-        local = tl.load(grad_boundary + offset, mask=active_chunk, other=0.0).to(tl.float32)
-        cotangent = tl.where(active_chunk, local + decay * cotangent, cotangent)
-    tl.store(grad_initial + bh, cotangent)
+    if mass_owner:
+        tl.store(grad_m0 + bh, dm)
 
 
 @triton.jit
@@ -386,45 +364,6 @@ def _mass_local_reverse_kernel(
         grad_log_decay + panel * C + rows,
         tl.where(valid, result, 0.0),
         mask=row_mask,
-    )
-
-
-@triton.jit
-def _panel_scalar_to_bth_kernel(
-    panel,
-    output,
-    cu_seqlens,
-    chunk_indices,
-    T: tl.constexpr,
-    H: tl.constexpr,
-    C: tl.constexpr,
-    N: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    p = tl.program_id(0)
-    if IS_VARLEN:
-        global_chunk = p // H
-        head = p % H
-        sequence = tl.load(chunk_indices + global_chunk * 2).to(tl.int32)
-        chunk = tl.load(chunk_indices + global_chunk * 2 + 1).to(tl.int64)
-        bos = tl.load(cu_seqlens + sequence).to(tl.int64)
-        eos = tl.load(cu_seqlens + sequence + 1).to(tl.int64)
-    else:
-        bh = p // N
-        chunk = p % N
-        batch = bh // H
-        head = bh % H
-        bos = batch * T
-        eos = bos + T
-    rows = tl.arange(0, C)
-    token = chunk * C + rows
-    output_token = bos + token
-    valid = output_token < eos
-    value = tl.load(panel + p * C + rows, mask=valid, other=0.0)
-    tl.store(
-        output + output_token * H + head,
-        value,
-        mask=valid,
     )
 
 
@@ -604,11 +543,17 @@ def _geometry_decay_finalize_kernel(
     tail_weight,
     chunk_decay,
     grad_extra,
-    grad_panel,
+    grad_output,
+    cu_seqlens,
+    chunk_indices,
+    T: tl.constexpr,
+    H: tl.constexpr,
     C: tl.constexpr,
+    N: tl.constexpr,
     BC: tl.constexpr,
     NB: tl.constexpr,
     BNB: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
 ):
     panel = tl.program_id(0).to(tl.int64)
     rows = tl.arange(0, BC)
@@ -656,10 +601,26 @@ def _geometry_decay_finalize_kernel(
         mask=valid_rows,
         other=0.0,
     ).to(tl.float32)
+    if IS_VARLEN:
+        global_chunk = panel // H
+        head = panel % H
+        sequence = tl.load(chunk_indices + global_chunk * 2).to(tl.int32)
+        chunk = tl.load(chunk_indices + global_chunk * 2 + 1).to(tl.int64)
+        bos = tl.load(cu_seqlens + sequence).to(tl.int64)
+        eos = tl.load(cu_seqlens + sequence + 1).to(tl.int64)
+    else:
+        bh = panel // N
+        chunk = panel % N
+        batch = bh // H
+        head = bh % H
+        bos = batch * T
+        eos = bos + T
+    output_token = bos + chunk * C + rows
+    output_valid = valid_rows & (output_token < eos)
     tl.store(
-        grad_panel + panel * C + rows,
+        grad_output + output_token * H + head,
         tl.where(valid, boundary + exclusive + extra, 0.0),
-        mask=valid_rows,
+        mask=output_valid,
     )
 
 
@@ -834,28 +795,6 @@ class _GeometryScan(torch.autograd.Function):
         end_d = torch.empty_like(d_boundary)
         grad_j0 = torch.empty_like(grad_j_final)
         grad_d0 = torch.empty_like(grad_d_final)
-        block = 16
-        _matrix_boundary_reverse_kernel[
-            (triton.cdiv(width, block), triton.cdiv(width, block), state_batch * heads)
-        ](
-            grad_j_boundary,
-            grad_d_boundary,
-            grad_j_final,
-            grad_d_final,
-            chunk_decay,
-            end_j,
-            end_d,
-            grad_j0,
-            grad_d0,
-            saved_chunk_offsets,
-            N=chunks,
-            R=width,
-            H=heads,
-            BR=block,
-            IS_VARLEN=is_varlen,
-            num_warps=4,
-        )
-
         grad_m_boundary = torch.empty_like(m_boundary)
         grad_g_extra = torch.empty_like(cumulative_panel)
         mass_block = triton.next_power_of_2(chunk_size)
@@ -879,17 +818,30 @@ class _GeometryScan(torch.autograd.Function):
         )
         end_m = torch.empty_like(m_boundary)
         grad_m0 = torch.empty_like(grad_m_final)
-        _mass_boundary_reverse_kernel[(state_batch * heads,)](
+        block = 16
+        _matrix_boundary_reverse_kernel[
+            (triton.cdiv(width, block), triton.cdiv(width, block), state_batch * heads)
+        ](
+            grad_j_boundary,
+            grad_d_boundary,
             grad_m_boundary,
+            grad_j_final,
+            grad_d_final,
             grad_m_final,
             chunk_decay,
+            end_j,
+            end_d,
             end_m,
+            grad_j0,
+            grad_d0,
             grad_m0,
             saved_chunk_offsets,
             N=chunks,
+            R=width,
             H=heads,
+            BR=block,
             IS_VARLEN=is_varlen,
-            num_warps=1,
+            num_warps=4,
         )
 
         valid = tail_weight > 0.0
@@ -958,7 +910,13 @@ class _GeometryScan(torch.autograd.Function):
             num_warps=8,
             num_stages=2,
         )
-        grad_g_panel = torch.empty_like(cumulative_panel)
+        grad_g = torch.empty(
+            batch,
+            length,
+            heads,
+            dtype=torch.float32,
+            device=u_panel.device,
+        )
         _geometry_decay_finalize_kernel[(panels,)](
             observation_partial,
             boundary_partial,
@@ -967,23 +925,6 @@ class _GeometryScan(torch.autograd.Function):
             tail_weight,
             decay,
             grad_g_extra,
-            grad_g_panel,
-            C=chunk_size,
-            BC=triton.next_power_of_2(chunk_size),
-            NB=scalar_tiles,
-            BNB=triton.next_power_of_2(scalar_tiles),
-            num_warps=4,
-            num_stages=1,
-        )
-        grad_g = torch.empty(
-            batch,
-            length,
-            heads,
-            dtype=torch.float32,
-            device=u_panel.device,
-        )
-        _panel_scalar_to_bth_kernel[(panels,)](
-            grad_g_panel,
             grad_g,
             saved_cu,
             saved_chunk_indices,
@@ -991,8 +932,12 @@ class _GeometryScan(torch.autograd.Function):
             H=heads,
             C=chunk_size,
             N=chunks,
+            BC=triton.next_power_of_2(chunk_size),
+            NB=scalar_tiles,
+            BNB=triton.next_power_of_2(scalar_tiles),
             IS_VARLEN=is_varlen,
-            num_warps=1,
+            num_warps=4,
+            num_stages=1,
         )
         return (
             grad_u_panel,

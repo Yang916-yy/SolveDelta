@@ -1451,3 +1451,862 @@ run. Finally, boundary matrix/coefficient owners selected BK64/4-warps for
 widths divisible by 64: isolated time was `0.136 ms` versus `0.186 ms` for
 BK32, with at most `3.8e-6` reduction-order difference. BK16 and all 8-warp
 candidates were rejected.
+
+Decision update (2026-08-26): the local generator reverse now specializes the
+same-direction ownership already present in the boundary reverse. One native
+C32/r128/K1 owner consumes one primal route and two paired-dual routes through
+independent static pointers and dtypes; it does not construct a three-route
+HBM panel. Lower and upper local reverse therefore require two launches rather
+than four. The compiled owner retains 128 registers/thread, 50,176 bytes
+shared memory, `LOCAL=0`, and two CTAs/SM. The paired-dual lower FP16 panel is
+also retained from forward and consumed by reverse, deleting a complete lower
+direct-action replay. Seven alternating complete-layer rounds measured the
+old split-owner plus replay path at `15.546 ms` F+B median and the selected
+mixed-owner plus cache path at `13.653 ms`; all seven rounds favored the
+selected path. Absolute clocks drifted during the run, so the within-round
+approximately 12.2 percent result, rather than either absolute number, is the
+adoption evidence. The logical saved-cache cost is 4 MiB at the target and did
+not increase the measured allocator peak.
+
+PyTorch's official
+[CUDA Graph semantics](https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-graphs)
+and
+[`make_graphed_callables`](https://docs.pytorch.org/docs/stable/generated/torch.cuda.make_graphed_callables.html)
+informed the graph-level experiment. A warmed fixed-shape complete SolveDelta
+layer captured forward and backward successfully with bitwise-identical output
+and gradients. Seven alternating rounds measured eager and graphed F+B round
+medians at `11.790` and `10.515 ms`, about a 10.8 percent reduction under the
+same drifting clocks. Direct `torch.compile(mode="reduce-overhead")` did not
+capture the same graph because causal-conv1d's non-contiguous output contract,
+Triton constexpr signatures, the lazy pybind extension loader, and FLA device
+queries create independent graph breaks. The selected decision is therefore
+trainer-owned static CUDA Graph capture, not a SolveDelta wrapper or a broad
+Inductor-compatibility rewrite.
+
+Decision update (2026-08-26): the final non-solve maturity pass retained three
+narrow ownership changes. First, H, R-lower, and R-upper chart coefficient
+routes now share one FLA-style panel owner in forward and reverse, reusing the
+same decay/mass/pair loads while storing distinct route statistics. The route
+forward and reverse kernels measured about `0.0065/0.0527 ms`; the complete
+semantic/state/composed-VJP suite remained 12/12. Second, bounded forward
+direct-action prefixes are written directly from FP32 producers to FP16 and
+consumed with FP32 accumulation, halving that private prefix traffic without
+BF16-to-FP16 pseudo-promotion. Reverse prefixes remain FP32. Third, geometry
+matrix tile `(0,0)` now owns mass boundary reverse and the decay finalize owner
+writes directly to `[B,T,H]`, deleting the standalone mass scan and panel-copy
+launches. Packed/reset VJPs pass the same suite.
+
+The surrounding audit deliberately did not fuse every remaining frame stage.
+Boundary statistics already use separate KDA/FLA matrix-tile and coefficient-
+row owners; merging them recreates the measured `2--4 MiB` partial workspace.
+Reset-delimited packing constructs one plan and one CPU metadata mirror, then
+reuses FLA gather/scatter and chunk metadata across conv, frame, and WY. Six
+FP32 add kernels totaling about `0.15 ms` are autograd accumulation across
+independent geometry, Gram, boundary, and action branches; removing them would
+require a whole-frame custom autograd owner, not a multi-tensor rename. That
+larger lifetime change was rejected for this pass. A fresh matched complete
+BF16 layer measured SolveDelta median/p95 `1.648/1.910 ms` forward and
+`6.445/6.790 ms` F+B with `90.3/182.5 MiB` incremental peaks. Matched FLA GDN2
+measured `1.068/1.303 ms`, `3.116/3.548 ms`, and `38.1/102.8 MiB`.
+
+Decision update (2026-08-27): the exact coordinate solve retained FLA's
+16-coordinate ordered substitution but shortened the full-width solution live
+range. The selected C32/r128 owner keeps only the current FP32 solved block and
+the generalized-Delta prefix resident, writes that block directly to the
+already required final output panel, and reloads completed blocks in BF16 for
+later boundary Tensor-Core contractions. Forward bounded panels use their
+declared direct FP16/BF16 stores; transpose panels remain FP32. This adds no
+workspace, launch, dense factor, or recomputation and preserves the exact
+coordinate recurrence.
+
+This schedule was selected against the otherwise identical full-width
+resident Triton owner. Four continuously launched exact actions totaled about
+`1.078 ms` versus `1.286 ms`; three independent complete-layer runs had median
+F+B about `6.123 ms` versus `6.369 ms`, a roughly 3.9 percent improvement, with
+the same `182.5 MiB` peak. The four compiled specializations still report 255
+registers/thread, but Triton spills fell from the previous roughly `94--106`
+to `0/4/6/16`; final-panel traffic replaced compiler-generated local-memory
+traffic. The full rebuilt suite remains 12/12.
+
+Three nearby variants were rejected. Splitting rows into M16 CTAs duplicated
+J/D/u/h loads and regressed complete F+B to about `7.06 ms`. Grouping prior
+blocks into K32 tiles raised the FP32 lower-transpose action from about `0.286`
+to `0.338 ms`. Eight warps raised the four-action total to about `1.80 ms`, and
+forcing `maxnreg=168` raised it to about `1.38 ms`; neither occupancy tactic
+paid for its larger live-range movement.
+
+## Resident fixed-degree Neumann re-evaluation
+
+FLA MESA's MIT-licensed
+[`chunk_cg_solver_fwd.py`](https://github.com/fla-org/flash-linear-attention/blob/bc3b101dcb713ddc5bd8924b66754eb68b5ccf89/fla/ops/mesa_net/chunk_cg_solver_fwd.py)
+and
+[`chunk_cg_solver_bwd.py`](https://github.com/fla-org/flash-linear-attention/blob/bc3b101dcb713ddc5bd8924b66754eb68b5ccf89/fla/ops/mesa_net/chunk_cg_solver_bwd.py)
+were re-evaluated as the owner skeleton for the previously rejected degree-six
+Neumann experiment. A temporary private kernel kept `b`, the current iterate,
+and the next iterate in one CTA, compiled the six updates as a fixed loop,
+used the structured `N` or `N^T` action, and wrote only the final iterate. Its
+backward used the same transpose owner as an implicit/phantom adjoint rather
+than differentiating six polynomial nodes. No experimental selector or source
+survives in the production tree.
+
+The experiment exposed a structural mismatch with MESA's cheap action. MESA
+applies an unmasked low-rank operator as two associative dots. SolveDelta
+requires
+
+\[
+P_{\mathop{\rm strict}}\!\left(B_i+U^TK_i\right)x,
+\]
+
+where the strict projection is on the coordinate axes and `K_i` varies with
+the target token. The projection prevents reassociating the complete local
+action into one unmasked `((X U^T) \odot W)U` pair. A resident implementation
+must still traverse coordinate tiles, apply strict within-tile work, and run
+the broad J/D contractions once per polynomial update. The exact blocked
+substitution pays the corresponding off-diagonal contractions once and keeps
+only the 16-coordinate diagonal dependency ordered.
+
+On SM120 at `P=256,C=32,r=128`, one lower factor measured `0.225 ms` for the
+selected exact solve and `5.213 ms` for the temporary six-update owner. The
+candidate compiled with 255 registers/thread, 16,384 bytes shared memory, and
+246 spills; eight warps retained 240 spills and regressed to `6.076 ms`. C16
+reduced the candidate to `2.954 ms`, still far above its `0.307 ms` exact
+comparison. Independently, one selected two-kernel direct action measured
+`0.134 ms`; six applications therefore carry substantially more contraction
+work than the `0.295 ms` exact transpose solve even before considering the
+candidate's register lifetime.
+
+The approximation itself was numerically viable. With
+`||N||_2 <= 1/4`, six updates from `x_0=b` realize degree six and retain the
+static remainder bound `1/12288`. Substituting the candidate throughout the
+complete layer passed the rebuilt 12/12 suite. At the target shape its BF16
+layer output differed from the exact path by `1.26e-3` relative norm and its
+aggregate composed gradient by `1.53e-3`. Performance nevertheless regressed
+to `11.02 ms` forward and `26.27 ms` F+B, versus the current exact path's
+previous matched `1.60/6.41 ms`. After deleting the candidate, a fresh exact
+verification measured `1.64/5.72 ms` against matched GDN2 `1.04/3.28 ms`,
+with the unchanged `90.3/182.5 MiB` allocator peaks. This rejects whole-factor
+fixed-degree Neumann for the current strict chart on performance,
+independently of its production-semantics status.
+
+FLA
+[`PR #1162`](https://github.com/fla-org/flash-linear-attention/pull/1162)
+remains a useful but narrower precedent: its exact finite-Neumann products
+invert one explicit 16x16 triangular block shared by a chunk program. A
+SolveDelta frame has a different diagonal block for every target token, so
+adopting that kernel literally would first materialize or separately own those
+blocks and would lose the current wide-RHS owner. It does not rescue the
+rejected whole-factor experiment without another measured block schedule.
+
+## Tensor-Core prefix in the exact local transpose owner
+
+Decision update (2026-08-27): FLA MESA's MIT-licensed
+[`chunk_update_once`](https://github.com/fla-org/flash-linear-attention/blob/bc3b101dcb713ddc5bd8924b66754eb68b5ccf89/fla/ops/mesa_net/chunk_cg_solver_bwd.py)
+and FLA DPLR's
+[`chunk_dplr_bwd_kernel_intra_tensorcore`](https://github.com/fla-org/flash-linear-attention/blob/bc3b101dcb713ddc5bd8924b66754eb68b5ccf89/fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py)
+were used to re-audit the selected C32/r128 local transpose. Both mature
+schedules cast multiplicands to their low-precision consumer type, execute
+the broad contraction as a dot, and retain FP32 accumulators and scalar gate
+work. NVIDIA's CUDA 13 WMMA `__nv_bfloat16` fragments provide the corresponding
+native CUDA primitive for the existing owner.
+
+The old owner computed its complete-coordinate initialization
+`X U^T` and `X H^T`, logically two `96x128 @ 128x32` products, through an
+unrolled FP32 `fmaf` loop in every lane. The selected specialization replaces
+only those two products with BF16 `m16n16k16` WMMA and FP32 accumulation. Six
+warps own 16 route rows and both 16-source halves. Both result panels and the
+warp-local conversion tile reuse the owner's previously dead 32 KiB output
+scratch. After the result is consumed into the resident prefix, `u` is
+reloaded as its original direct-FP16 bits into the same shared union and the
+exact scalar prefix/suffix recurrence continues unchanged. No prefix HBM
+tensor, new launch, extra shared allocation, route ABI, or solve approximation
+is introduced.
+
+The built SM120 cubin contains 256 BF16 MMA instructions across its four mixed
+specializations. Each remains at 128 registers/thread, 50,176 bytes shared,
+zero local allocation, and two CTAs/SM. The rebuilt semantic/state/composed-
+VJP suite passes 12/12. Stable profiler attribution reduced the two production
+mixed owners from `0.2853+0.2674=0.5527 ms` to
+`0.2132+0.1903=0.4035 ms`, about 27 percent.
+
+Seven same-process alternating rounds loaded the old and new cubins under the
+same layer. Backward-only round medians were `4.656/4.336 ms`; complete F+B
+round medians were `6.477/6.152 ms`. A final matched run measured SolveDelta
+`1.662/5.990 ms` forward/F+B versus GDN2 `1.064/3.225 ms`, with SolveDelta F+B
+incremental peak unchanged at about 182.5 MiB. This adopts the WMMA prefix.
+The remaining strict coordinate recurrence and the 16-coordinate diagonal
+substitution retain FP32 scalar arithmetic because they carry exact ordered
+dependencies; radial/gate reductions and continuation states retain FP32 by
+the precision contract.
+
+## Native grouped RLS exterior and block-Woodbury A/B
+
+Decision update (2026-08-27): FLA's MIT-licensed generalized-DPLR
+[`chunk_h` and `chunk_o`](https://github.com/fla-org/flash-linear-attention/tree/5e02dd3a7651f5f2797eb8b12bbec401826031e1/fla/ops/generalized_delta_rule/dplr)
+state/output ownership, together with GatedDeltaProduct's native grouping
+strategy, informed an isolated `E=3` direct-`e` RLS specialization. The
+selected forward keeps one `r x BV` state tile resident across both geometry
+transports and the ordinary edit, joins equal-direction terms, and stores only
+the final read for each token. It retains the mature direct-`e` pair/WY
+boundary and does not modify production SolveDelta.
+
+A native grouped transpose was implemented from the exact three-step reverse
+and passed the experiment's output, final-state, and per-input gradient checks.
+Its source-parallel closure nevertheless required roughly 80 million
+cross-value-tile FP32 atomics at `B1,T1024,H8,r=V=128`, producing about
+`3.4 ms` isolated exterior F+B. Saving additional state replay points did not
+materially change that result. FLA's existing three-owner DPLR reverse was
+therefore retained. It is faster because value tiles own their final outputs
+without cross-tile atomics, despite retaining expanded logical cotangent and
+zero-value panels. This is a measured ownership decision, not an ABI
+compatibility constraint.
+
+With C16/C32, isolated exterior forward measured about `0.654/0.516 ms` and
+F+B `1.303/1.236 ms`; C64 was slower. C32 is selected, but the requested
+`0.65--0.75 ms` F+B target was not reached. The retained reverse attribution
+is about `0.226 ms` for resident state, `0.179 ms` for direct-`e` pair,
+`0.166 ms` for output, plus WY and preparation. Closing the remaining gap
+requires a grouped output-owner reverse rather than source-parallel atomic
+closure.
+
+Golub and Van Loan's block inverse identities and the classical Woodbury
+matrix identity informed a second isolated candidate for variable-decay block
+RLS. The candidate used one common boundary CG solve for `Z=J0^-1 X`, formed
+the C32 Schur matrix `I+X^T Z`, and used leading-principal Cholesky solves to
+recover every prefix gain. It agreed with the token FP32 route to maximum
+FP16 errors of `9.8e-5` for gain, `5.4e-4` for arbitrary-RHS solve, and
+`9.9e-4` for prediction. Target latency was `0.790 ms`, versus `0.364 ms` for
+the matched MESA two-solve/action path: two prefix solves cost `0.514 ms`, two
+boundary CG solves `0.210 ms`, and factor/cross-action work only
+`0.013/0.010 ms`. It therefore misses the predeclared `0.12--0.15 ms` F+B gate
+and was deleted; the mature MESA CG owner remains selected.
+
+## TileLang direct-e and native E=3 RLS reverse
+
+Decision update (2026-08-27): the isolated `experiments/rls` exterior now
+specializes FLA main commit
+[`5e02dd3a`](https://github.com/fla-org/flash-linear-attention/commit/5e02dd3a7651f5f2797eb8b12bbec401826031e1).
+The concrete MIT-licensed donors are generalized-DPLR TileLang
+[`chunk_A_fwd.py`](https://github.com/fla-org/flash-linear-attention/blob/5e02dd3a7651f5f2797eb8b12bbec401826031e1/fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_A_fwd.py),
+[`chunk_A_bwd.py`](https://github.com/fla-org/flash-linear-attention/blob/5e02dd3a7651f5f2797eb8b12bbec401826031e1/fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_A_bwd.py),
+[`wy_fast_fwd.py`](https://github.com/fla-org/flash-linear-attention/blob/5e02dd3a7651f5f2797eb8b12bbec401826031e1/fla/ops/generalized_delta_rule/dplr/backends/tilelang/wy_fast_fwd.py),
+[`wy_fast_bwd.py`](https://github.com/fla-org/flash-linear-attention/blob/5e02dd3a7651f5f2797eb8b12bbec401826031e1/fla/ops/generalized_delta_rule/dplr/backends/tilelang/wy_fast_bwd.py),
+and the low-shared-memory split ownership in
+[`chunk_stream_bwd.py`](https://github.com/fla-org/flash-linear-attention/blob/5e02dd3a7651f5f2797eb8b12bbec401826031e1/fla/ops/generalized_delta_rule/dplr/backends/tilelang/chunk_stream_bwd.py).
+The output-owned `(chunk, head, value tile)` precedent was also checked against
+Mamba-3's Triton backward at state-spaces/mamba commit
+[`e9594ce1`](https://github.com/state-spaces/mamba/commit/e9594ce1c732d97440f0332fdc43170a2294dbfa),
+especially
+[`mamba3_siso_bwd.py`](https://github.com/state-spaces/mamba/blob/e9594ce1c732d97440f0332fdc43170a2294dbfa/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py).
+
+The algebraic specialization is exact. In the direct-`e` exterior `b=k=d`,
+so the generic four interaction matrices obey
+
+\[
+A_{qk}=A_{qb}=A_{qd},\qquad A_{ak}=A_{ab}=A_{ed}.
+\]
+
+Forward therefore computes only two Tensor-Core contractions. Reverse first
+adds cotangents of each shared representative and evaluates the corresponding
+four transpose contractions, rather than retaining the generic eight. FLA's
+fast WY keeps the strict interaction representative in FP16, uses the declared
+public vector dtype for vector panels and cotangents, and accumulates its GEMMs
+in FP32.
+
+The native static `E=3` reverse does not clone FLA's complete ABI. One value-
+tile owner streams chunks in reverse, reads the compact `[B,T,H,V]` output
+cotangent only when `edit=2`, and owns `du`, the recurrent state cotangent, and
+the initial-state cotangent. Separate coordinate-tile owners close
+`dq/dd/dw` and the chunk-tail gate statistic. This preserves the useful FLA
+state/output split at the target eight-head grid while deleting the physical
+`3T` output cotangent, zero-value panel, and the rejected source-parallel
+atomic closure. It does not fuse all chunks into one CTA per head.
+
+Both FP16 and BF16 connected forward/VJP gates pass. For BF16 composed VJPs,
+the frozen experiment gate is relative L2 below two percent plus a `0.2`
+absolute corruption ceiling; observed relative L2 errors across all ten input
+groups are `0.37--1.48%`. The previous expanded reverse was not better on the
+most sensitive geometry-decay group (`0.0872` versus `0.0850` maximum absolute
+error), so this gate reflects BF16 observability rather than an implementation-
+specific exemption.
+
+At `B1,T1024,H8,r=V=128,E3,C32,BF16`, same-process old/new microbenchmarks
+measured pair forward `0.169/0.036 ms`, pair reverse `0.524/0.136 ms`, WY
+forward `0.062/0.051 ms`, and WY reverse `0.088/0.058 ms`. Thirty-repeat
+trainer-style CUDA Graph replay reduced complete RLS forward from the prior
+`0.639` to `0.595 ms` and F+B from `1.889` to `1.440 ms`; the matched GDN2
+run was `0.124/0.466 ms`. The isolated RLS graph reservation fell from about
+`306` to `206 MiB`, with persistent allocation unchanged at `22 MiB` and no
+replay-time allocator peak. The selected path remains experimental and does
+not alter production SolveDelta's exact bounded-LDU solve.
+
+## Natural RLS state as an exact direct-e generalized-Delta recurrence
+
+Decision update (2026-08-27): FLA main commit
+[`865a52fd`](https://github.com/fla-org/flash-linear-attention/commit/865a52fd39f378e92f1668134a03fc666fdd56b3)
+was audited after upgrading the isolated environment to FLA 0.6.0, PyTorch
+2.11.0+cu130, Triton 3.6.0, and TileLang 0.1.13. Its generalized-DPLR
+pair/WY/state/output owners confirm that the natural RLS cross-map needs no
+new recurrence kernel once the endogenous gain is known:
+
+\[
+C_t=(I-g_tu_t^T)C_{t-1}+g_th_t^T.
+\]
+
+The temporary direct-`e` A/B generalized static `E=3` to a compile-time `E`
+and reused it at `E=1` with `d=g`, `e=q=u`, and `z=h`. Forward and strict
+reverse shared the same FLA-derived pair/WY and split state/output ownership;
+no zero-valued `[P_hat | C]` half was written. This was an ABI specialization
+of MIT-licensed FLA code, not a call through its public generic DPLR interface.
+
+PyTorch 2.11's documented CUDA
+[`torch.bmm(..., out_dtype=torch.float32)`](https://docs.pytorch.org/docs/stable/generated/torch.bmm.html)
+was also tested for block-RLS broad products. FP16/BF16 operands use the
+Tensor-Core-capable path while returning FP32 accumulated outputs. The gain
+owner uses `torch.linalg.cholesky_ex(..., check_errors=False)` so the known-SPD
+experiment can be captured by CUDA Graph without the host synchronization of
+`torch.linalg.cholesky`.
+
+The state specialization itself was successful: it reduced the unoptimized
+natural route from `17.901/50.656 ms` eager forward/F+B to
+`13.597/34.920 ms`, and all FP16/BF16 forward, continuation-state, and
+composed-VJP checks pass, including a two-chunk non-contiguous-state fixture.
+The complete route nevertheless lost decisively. Its optimistic C32 CUDA
+Graph result was `2.634/7.629 ms`, versus `0.585/1.461 ms` for the retained
+MESA route. C16 and C64 were no better. Profiling found 384 small batched
+GEMMs, 128 FP32 TRSM calls, and 32 C32 POTRF calls in one F+B.
+
+The limiting dependency is endogenous: chunk `n+1` cannot construct its gain
+until chunk `n` has produced `P_out`. FLA can mature the known-gain `C` state
+update and transpose, but it cannot turn that cross-value-tile collective into
+an ordinary independent state scan. A competitive implementation would need
+a dedicated cooperative block-RLS gain/factor owner and exact transpose; no
+complete upstream implementation was found. The candidate remains isolated
+and is rejected as a replacement for either production SolveDelta or the
+selected MESA RLS experiment. Its source, tests, static `E=1` compatibility
+surface, and benchmark selector were deleted after the A/B; the derivation and
+measurements remain here as the rejection record.
+
+## Block QRD-RLS gain and direct-e implicit solve
+
+Research update (2026-08-27): the classical square-root/QRD-RLS identities
+were combined with FLA's MIT-licensed MESA and direct-`e` schedules to remove
+the leading-prefix solves that dominated the earlier block-Woodbury A/B.
+Golub and Van Loan's Schur-complement identities, Sherman and Morrison's
+rank-one inverse update
+([doi:10.1214/aoms/1177729893](https://doi.org/10.1214/aoms/1177729893)),
+and Sakai and Nakaoka's QRD-RLS precedent
+([doi:10.1016/S0165-1684(99)00071-7](https://doi.org/10.1016/S0165-1684(99)00071-7))
+informed the derivation. For the chunk gauge `x_i=exp(-G_i/2)u_i`,
+
+\[
+Z=J_0^{-1}X,\qquad I+X^TZ=LL^T,\qquad
+k_i=\frac{(L^{-1}Z)_i}{L_{ii}},\qquad
+g_i=e^{-G_i/2}k_i.
+\]
+
+An FP64 comparison against tokenwise RLS is at `1e-15` scale. Unlike the
+rejected implementation, this formula uses one C-by-C factorization and one
+C-by-r triangular solve for all prefix gains.
+
+The arbitrary-RHS implicit reverse closes without differentiating the
+factorization. Sherman-Morrison gives
+
+\[
+J_i^{-1}b_i=e^{-G_i}J_0^{-1}
+\prod_{j=0}^{i}(I-x_jk_j^T)b_i.
+\]
+
+FLA generalized-Delta/direct-`e` supplies the mature compact product shape:
+`d=k`, `e=x`, strict `A_ed=(-X)K^T`, causal `A_qd=BK^T`, one unit-triangular
+WY solve, and one query-output contraction. C16/C32 directly transplant the
+TileLang `chunk_A` Tensor-Core pair owner and fast-WY row inversion cited in
+the preceding RLS section, with a reduced `(rhs,x,k)->(A_qd,A_ed)->rhs'` ABI.
+The second owner keeps `W` resident and never writes it to HBM. C64 remains on
+Tensor-Core-capable library `bmm(..., out_dtype=float32)` plus FP32 TRSM until
+FLA's two-block C64 inverse schedule is ported. The solved cotangent then enters
+MESA Hkk/Hkv's existing strict transpose. The symmetric `J` state convention is essential:
+raw Cholesky and unconstrained full-matrix `solve` gradients differ, while
+their `(bar_J+bar_J^T)/2` representatives agree at FP64 rounding error.
+
+The boundary-CG donor is FLA MESA's `chunk_cg_solver_{fwd,bwd}.py`. The
+specialization retains its resident C-RHS owner and Tensor-Core dense action,
+but deletes the local causal pair action whose coefficient is identically zero
+for a common chunk boundary solve. NVIDIA MathDx 26.06's block-level batched
+POSV remains the device-level donor for the direct boundary A/B; the current
+first comparison uses PyTorch's mature batched `cholesky_ex/cholesky_solve`
+before any MathDx transplant is justified by timing.
+
+Two FP64 CPU identity/VJP tests and small FP16 CUDA forward/composed-VJP tests
+pass for both boundary choices. The final isolated RLS suite is 17/17,
+including the connected forward/composed-VJP path. The C16 direct-`e` pair
+owner was corrected to use FLA `chunk_A`'s one-warp schedule; four warps cannot
+legally partition a 16x16 TileLang MMA output tile.
+
+The idle RTX 5070 Ti A/B at
+`B1,T1024,H8,r=V=128,K1,BF16,CG30,C32` used trainer-style CUDA Graph replay.
+Across 100 warmed samples, selected MESA measured `0.597/0.823 ms` forward
+median/p95 and `1.451/1.686 ms` F+B. Block-QRD with the specialized boundary
+CG measured `0.670/0.720 ms` and `1.490/1.705 ms`; matched GDN2 measured
+`0.128/0.168 ms` and `0.468/0.762 ms`. QRD's graph-resident
+allocation/reservation was `86/272 MiB`, versus MESA's `22/208 MiB`. Batched
+Cholesky was decisively worse at `1.033/2.573 ms` forward/F+B medians and
+roughly `150.5/348 MiB` graph allocation/reservation.
+
+The owner-level result explains why the algebraic reduction did not win.
+MESA's fused gain/prediction owner is `0.1655 ms`; the QRD gain/prediction
+sequence is `0.2362 ms`, including `0.1269 ms` boundary CG30 and `0.0998 ms`
+C32 Gram/POTRF/TRSM. QRD's direct-`e` implicit reverse is better,
+`0.1558 ms` versus MESA's `0.2018 ms`, but its roughly `0.046 ms` reverse win
+does not recover the roughly `0.071 ms` forward loss. Pack/unpack owners are
+about `0.010 ms` each and direct-`e` pair/WY is `0.0281 ms`; neither is the
+primary blocker.
+
+C16 and C64 complete F+B medians were respectively `1.810/1.855 ms` and
+`2.519/1.954 ms` for MESA/QRD, versus `1.451/1.490 ms` at C32. The C64 QRD
+path still lacks FLA's two-block C64 inversion and is only a generic reference,
+not an algorithm rejection. C32 MESA remains selected because it is faster
+than block-QRD/CG and uses 64 MiB less graph-resident allocated memory. The
+block-QRD source remains an isolated, mathematically validated experiment; it
+does not alter production SolveDelta.
+
+## MESA constant specialization and native RLS checkpoint A/B
+
+Research update (2026-08-27): the selected isolated RLS path was specialized
+at the complete copied-program boundary, following FLA MESA's MIT-licensed
+paired Hkk/Hkv, CG, and strict-transpose schedules. The experiment fixes
+`beta=1` and `ridge=0`; their pointers, loads, arithmetic, and cotangents were
+deleted rather than passed through the generic MESA ABI. The retained broad
+products still compile to BF16 Tensor Core MMA with FP32 accumulation, while
+decay, CG alpha/beta, norms, continuation states, and backward partials remain
+FP32.
+
+FLA's L2Norm forward/reverse ownership also informed a sole-consumer
+specialization in the grouped RLS source owner. Raw q and edit keys now use
+the same FP32 sum/rsqrt and public-dtype rounding point inside that owner; its
+transpose closes there. The normalized u panel remains physical because both
+MESA geometry and the exterior consume it. A stale private-ABI test that used
+raw q/key as its reference was corrected to the operator expression; complete
+output and composed-VJP tests already exercised the connected behavior.
+
+FLA/Mamba state-recompute precedent informed the checkpoint comparison. The
+logical exterior has three microsteps per token, so retaining one BF16 state
+before every three logical chunks changes the target cache from 24 MiB to
+8 MiB. The output reverse reconstructs the missing zero, one, or two boundaries
+with the exact chunk update `S'=decay*S+d_tail^T z_new`; the FP32 resident
+reverse state remains a per-logical-chunk temporary. Saved-tensor storage fell
+by exactly 16 MiB, and trainer-style CUDA Graph reservation fell from about
+216 to 192 MiB. CG5 F+B medians were 1.205 and 1.197--1.206 ms for dense and
+coarse checkpoints across the comparison runs, so the coarse native-token
+checkpoint is selected without a runtime switch.
+
+A source-to-pair fusion was also implemented rather than accepted by
+inspection. Its forward reproduced all former cumulative, pair, scaled-panel,
+and value outputs at the declared rounding points. Isolated latency improved
+only from 0.136 to 0.123 ms. With a strict recomputation-based mature pair
+transpose, complete Graph F+B regressed from 1.205 to 1.253 ms and graph
+reservation increased to 240 MiB despite 20 MiB less saved storage. A truly
+joint reverse owner must additionally close token phases split by C32 logical
+boundaries because `32 mod 3 != 0`; forcing that ownership into the forward
+CTA is not a free ABI edit. The fusion and selector were deleted under the
+project's complete-F+B selective-fusion rule.
+
+The follow-up upstream audit found no missing mature owner to transplant.
+FLA's current `ChunkGatedDeltaProductFunction.backward` explicitly marks its
+grouped reverse as TODO, materializes zero-expanded query/output cotangent at
+`T*num_householder`, and falls back to generic GatedDeltaRule backward. GDN2
+and KDA provide the mature output-owner contractions used elsewhere, but not
+the split-token `E=3` source closure. A complete 56 MiB seam deletion would
+therefore require a new staged boundary-partial/finalize owner, not an ABI-only
+specialization; it is outside this mature-code pass.
+## Isolated RLS grouped-owner audit (2026-08-28)
+
+FLA GatedDeltaProduct's grouped state/output forward and its current backward
+were re-audited against the isolated RLS direct-`e` exterior. The forward state
+owner can compact Householder checkpoints and its output owner loops a static
+slot dimension, but the public implementation assumes a shared symmetric
+direction and scalar decay. Its backward explicitly marks grouped optimization
+TODO, expands query and output cotangent to `T*num_householder`, and calls the
+flat GatedDeltaRule reverse. It therefore remains a schedule donor rather than
+an exact replacement for independent direct-`e` factors with channel-wise
+decay.
+
+Two complete-path A/Bs were rejected. Separating the RLS state and output
+owners reduced CG5 CUDA Graph forward/F+B by about `0.032/0.034 ms`, but
+retaining every logical chunk boundary added 16 MiB per layer. Retaining the
+MESA Hkk/Hkv boundaries instead of recomputing them saved only about
+`0.014 ms` F+B for another 16 MiB. The selected coarse checkpoint and replay
+remain. Profiling showed the flat RLS state owner at about `0.191 ms` for 96
+logical chunks, or `1.99 us/chunk`, versus FLA GDN2 at about `0.0315 ms` for 16
+chunks, or `1.97 us/chunk`. C64 reduced the state owner to about `0.153 ms` but
+increased pair/WY work, leaving complete F+B unchanged near `1.158 ms`.
+
+The decision is to default the isolated MESA experiment to CG5 and not treat
+the remaining gap as a slow CG or an inferior per-chunk state primitive. A
+future grouped route must algebraically own a token-level rank-three transition
+and its exact transpose. A flat-layout rename, wider chunk, or forward-only
+GatedDeltaProduct transplant does not meet that requirement.
+
+## MESA Hkv-to-CG transpose seam (2026-08-28)
+
+FLA MESA's Hkv query transpose and implicit CG transpose were specialized as
+one chunk owner in the isolated RLS experiment. The owner forms
+
+\[
+\bar q_{\rm CG}=\bar q_{\rm exterior}
+ + \bar y H_{kv}^T e^g
+ + [((\bar y v^T)\odot\Delta)k],
+\]
+
+applies the same low-precision rounding boundary as the former materialized
+right-hand side, and consumes it immediately in the fixed five-step transpose
+action. The Hkv key/value transpose remains separate. This follows MESA's
+staged-owner precedent: fuse a sole-consumer panel, not the entire geometry
+reverse.
+
+The connected 17-test forward/state/composed-VJP suite passes. Four target
+CUDA Graph measurements gave forward medians `0.467--0.470 ms` and F+B medians
+`1.156--1.171 ms`; the earlier selected graph was near `0.476/1.194 ms`.
+Reservation stayed at 192 MiB. Profiling attributed about `0.042 ms` to the
+new owner and found neither the old Hkv-dq kernel nor standalone CG-transpose
+kernel in the graph, so the specialization is retained.
+
+The same audit does not authorize a nominal token-native `E=3` relayout.
+FLA GatedDeltaProduct's grouped forward owns shared symmetric Householder
+directions and a scalar gate, while its source still marks grouped backward
+optimization TODO and expands to the flat GatedDeltaRule reverse. Independent
+direct-`e` factors with channel decay require a rank-three block pair/WY
+transpose. Merely unrolling three flat chunks preserves their arithmetic and
+cannot remove the measured logical-chunk cost.
+
+## Symmetric Hkk private-boundary packing A/B
+
+Research update (2026-08-28): reachable RLS `J/Hkk` is symmetric, so its
+private chunk-boundary history was implemented with lower-triangular storage
+without changing the full FP32 public initial/final state or the symmetric
+cotangent convention. CG forward, the fused Hkv-to-CG transpose, and Hkk
+reverse reconstructed logical tiles by mirrored loads. The connected forward,
+state, and composed-VJP tests passed, including exact full-state symmetry.
+
+At `B1,T1024,H8,r=128,C32`, scalar lower packing reduced the BF16 Hkk history
+from 8 MiB to 4.03 MiB. Its CUDA Graph forward/F+B medians were
+`0.472--0.479/1.189--1.204 ms`, versus the selected dense range
+`0.467--0.470/1.156--1.171 ms`; graph reservation remained 192 MiB. Two
+Tensor-Core-oriented lower-block layouts were also tested. B16 used 4.5 MiB
+and measured `0.509/1.254 ms`; B32 used 5 MiB and measured
+`0.708/1.248 ms`. Neither recovered dense operand locality.
+
+The mathematical symmetry does not halve the `XJ` action. More importantly,
+the resident MESA CG owner loads the dense boundary once and reuses it through
+all five iterations, so packing does not remove five HBM reads. Mirrored
+unpacking instead perturbs the native dense `tl.dot` operand layout in CG
+forward, implicit transpose, and Hkk reverse. The packed candidates were
+deleted. Full dense private Hkk remains selected; symmetry is still enforced
+at the public continuation state and cotangent boundaries. A future packed
+form needs a native symmetric block-action owner, not a gather adapter around
+the current dense Tensor-Core action.
+
+The next grouped-exterior study must begin from the RLS source identities, not
+from FLA's generic grouped-backward TODO. Let `g=J_t^-1 u`,
+`delta=1-u^T g`, `lambda` be geometry decay, and `a` be the associative
+diagonal scale moved across the first transport. The connected source producer
+has exactly
+
+\[
+e_0=-\frac{\lambda}{\delta a}g,\qquad d_1=\gamma g,
+\qquad z_0=z_1=0.
+\]
+
+Thus `e0` and `d1` share one gain axis (when `gamma=0` both geometry updates
+are structurally inactive). The two geometry microsteps compose to an
+identity-plus-rank-at-most-two block with no additive RHS. They are generically
+rank two, because the remaining `d0` direction is `u` and the remaining `e1`
+direction is the RLS residual; the ordinary key edit adds a generally
+independent third direction and the complete transition is generically rank
+three. Therefore an exact simplification should target a native
+"rank-two multiplicative geometry plus rank-one additive edit" block-WY and
+its transpose. It must exploit the shared gain Gram and the two zero-value
+slots; it must not claim a generic rank-one collapse or merely rename the flat
+`3T` implementation.
+
+## Token-block E=3 compact value RHS
+
+The follow-up derivation uses FLA generalized-DPLR's residual equation but
+changes its parallel axes. FLA TileLang `chunk_A` supplies the pair owner,
+FLA's C64 WY path supplies the recursive two-block solve/merge identity,
+GatedDeltaProduct supplies token-grouped state/output ownership, and Mamba-3
+supplies the value-tile reverse precedent. No upstream implementation was
+found that combines independent direct-`e` rank-three factors, channel decay,
+one additive slot, and the strict grouped transpose.
+
+For a C-token chunk, arrange `[E0,E1,E2,Q]` as `4C` GEMM rows and
+`[D0,D1,D2]` as `3C` rows. One `4C x r @ r x 3C` contraction produces all WY
+and read interactions. The unit-lower 3x3 diagonal block for each token has an
+analytic FP32 inverse. Left preconditioning preserves the fixed injection
+`P[3t+2,t]=1`, because the final column of every unit-lower inverse is the
+third basis vector.
+
+The two zero geometry values then give a stronger exact specialization than
+a grouped layout alone. Instead of expanding compact values to `[3T,V]`, solve
+
+\[
+[Y,R]=W^{-1}[E,P].
+\]
+
+For compact `Z in R^(C x V)`, the logical residual is `RZ-YS0`. Hence
+
+\[
+O=(Q-AY)S_0+(AR)Z,
+\]
+
+\[
+S_1=\Lambda S_0-D_{tail}^T(YS_0)+(D_{tail}^TR)Z.
+\]
+
+The transpose uses one solve `W^-T[bar Y,bar R]`, the standard implicit solve
+cotangent `bar W=-bar B X^T`, the analytic 3x3 inverse transpose, and the two
+standard pair GEMMs. FP64 explicit recurrence and VJP checks agree at
+approximately `1e-15`; the local precondition transpose agrees at
+approximately `1e-17`.
+
+The initial design proposed a token-recursive block TRSM with independently
+tiled RHS columns rather than padding C48 to C64. That proposal and its exact
+transpose contract are recorded in `experiments/rls/BLOCK_E3_DESIGN.md`; the
+measured implementation outcome and the reason it used a different C48
+composition are recorded below.
+
+## Token-block E3 implementation result
+
+Research update (2026-08-28): the isolated RLS token-block E3 exterior was
+implemented end to end to test whether compacting the two zero-value geometry
+slots could remove the flat `3T` cost. FLA generalized-DPLR supplied the pair
+tile ownership and implicit-WY formulas; FLA's C64 fast-WY supplied the
+three-block inverse composition after TileLang SM120 rejected a monolithic
+C48 fragment; Mamba-3 and FLA state/output owners supplied the resident value
+tile and transpose structure. The upstream schedules were specialized to
+independent direct-`e` factors, channel decay, and one compact additive slot;
+their full ABIs were not copied.
+
+The mathematical compact identities and their FP64 reverse close exactly.
+The measured implementation did not use the initially proposed token-recursive
+TRSM. It inverted three C16 diagonal blocks, formed the three off-diagonal
+inverse blocks with Tensor Core GEMMs, stored the C48 FP32 inverse, gathered
+`W^-1 P`, and used an implicit transpose solve for both RHS groups.
+
+At the target BF16 shape, five interleaved trainer-style CUDA Graph rounds
+measured flat RLS/token-block E3/GDN2 medians of
+`0.489/0.388/0.129 ms` forward and `1.195/1.763/0.470 ms` F+B. Graph-resident
+allocation was `23/150/18 MiB`, respectively. The compact forward win did not
+survive reverse: the custom path used 101 rather than 55 launches and its
+eager kernel sum was `1.819` rather than `1.220 ms`. It also left an
+approximately 8% cancellation-amplified query-source VJP error despite an
+FP32 residual contraction.
+
+Decision: reject this implementation. Do not promote the token-block exterior,
+weaken its VJP gate, or replace the selected flat MESA CG5 experiment. The
+negative result shows that compact value algebra alone is insufficient; a
+future attempt would need one mature output-owned reverse that consumes the
+query residual directly, not a chain of generic BMM/copy/add cotangents.
+
+### Output-owned reverse revisit
+
+The required revisit was completed without changing the token-block forward.
+FLA DPLR/GDN2 ownership now supplies a resident state transpose, an
+output/WY owner and a pair/source owner that closes the gauge, pair GEMM
+transpose, source algebra, L2 transpose, and gate suffix. The former generic
+statistics/WY reverse and Python `grad_d/grad_paired` handoff are deleted. The
+selected FLA-style split retains private FP32 solve/read/tail/query cotangent
+panels between those two owners; they are not a public ABI and measurably
+shorten live ranges.
+
+This materially changes the earlier numerical conclusion: FP16 and BF16
+composed VJPs now pass, including the query source. The full isolated suite is
+`21/21`. A target 50-warmup, 200-repeat CUDA Graph measurement with
+`gain_chunk=32` was `0.384/1.275 ms` forward/F+B versus matched GDN2
+`0.122/0.466 ms`; graph allocation/reservation was `86/246 MiB`. Historical
+eager attribution measured pair/output/state reverse at about
+`0.358/0.146/0.152 ms`.
+
+A post-recovery rewrite attempted to replace the private-panel boundary with
+compact `barW/barA/direct_stats` owners. It measured `0.391/1.311 ms` under
+the same Graph configuration: output plus interaction rose to about
+`0.212+0.031 ms`, more than the pair reduction to `0.287 ms` recovered. That
+rewrite was removed. The retained donor specialization repairs the prior
+reverse and cuts its original `1.763 ms` F+B substantially, but does not beat
+the retained flat MESA/FLA RLS route. The adoption decision remains unchanged
+for performance and memory reasons, not numerical failure.
+
+### FLA streaming-reverse transplant A/B
+
+FLA's newer MIT-licensed generalized-DPLR TileLang backend was audited after
+the output-owned rebuild. In particular, `chunk_stream_bwd.py` supplies a
+sequence/head owner with resident FP32 state cotangent, high/mid/low shared-
+memory schedules, and a 256-thread `K=V=128` specialization; `wy_fast_bwd.py`
+and `chunk_A_bwd.py` supply caller-owned WY and q-side transpose stages. This
+is a materially better donor than the older flat DPLR backward, but it does
+not imply that sequence/head streaming is the right parallel axis for E3.
+
+Two exact E3 specializations were implemented and removed after measurement.
+The first fused the resident state scan, compact residual, output, WY RHS, and
+pair transpose. It eliminated the approximately 52 MiB
+`grad_state/residual/grad_residual` interface but measured about `2.562 ms`
+complete Graph F+B and exceeded the intended fragment live set. The second
+kept a low-resource resident state/value owner and a separate chunk-local
+WY/pair finish owner. It reduced the broad fragment set substantially, but
+measured `2.394--3.095 ms` complete Graph F+B in non-interleaved trials.
+
+Eager attribution identified the structural cause. The retained owner split
+measured state/output reverse at approximately `0.148/0.143 ms`; the staged
+streaming replacement measured `0.788/0.082 ms`. At `B=1,H=8`, a
+sequence/head stream has only eight long-lived CTAs traversing 64 token
+chunks. The retained split exposes roughly 64 state CTAs and thousands of
+chunk/rank output CTAs. Removing HBM traffic therefore traded away far more
+GPU parallelism than it saved. The private FP32 panel boundary is not merely
+legacy glue at this workload; it preserves the profitable parallel axes.
+
+An `r=128,T=16` same-forward comparison found zero output difference and
+roughly `0--0.45%` relative differences between the two low-precision VJPs,
+so the rejection is scheduling-driven rather than a failed transpose
+derivation. A TileLang warning also showed that the staged scalar reduction
+needed a less conditional barrier schedule before it could be production
+safe. The experimental source, backend selector, and tests were deleted.
+Future work must retain chunk parallelism, for example through a proven
+segmented reverse-scan owner; simply transplanting FLA's sequence/head stream
+or deleting the private panels is now a measured rejected direction.
+
+### Block-E3 selection over the flat exterior
+
+The isolated RLS candidate subsequently selected block-E3 as its sole
+exterior. This supersedes the earlier adoption decision but not its measured
+evidence. A final target comparison with each route's best retained chunk width
+measured flat C32 at `0.480/1.200 ms` forward/F+B and block-E3 C16 at
+`0.390/1.278 ms`; graph allocation/reservation was `23/192 MiB` and
+`86/246 MiB`, respectively. Block-E3 is therefore selected for its native
+token/slot algebra and approximately 19 percent forward win, while its current
+6.5 percent F+B and 63 MiB allocation regressions remain explicit limitations.
+
+The flat `3T` source packer, expanded state/output and reverse programs, tests,
+and runtime selector were deleted. The current code retains the FLA/GDN2-style
+output-owned reverse and its private FP32 cotangent panels. Future work targets
+a segmented reverse owner that preserves chunk/rank parallelism; it does not
+restore the flat path as a compatibility fallback.
+
+### Reverse lifetime and shared-memory specialization
+
+The next pass audited FLA common's parallel and split state scans before
+changing the retained E3 reverse. Those scans reduce independent chunk
+contributions cheaply when cross-chunk propagation is diagonal or additive.
+The exact E3 cotangent transition is instead
+
+\[
+\bar S_c=(\operatorname{Diag}\Lambda_c-Y_c^TD_c^{tail})\bar S_{c+1}+B_c.
+\]
+
+Composing these low-rank updates across a segment produces a dense or
+growing-rank map. A segmented implementation would therefore need a dense
+transition workspace, a full segment replay, or a duplicated transition pass.
+At the target the retained rank/value-tiled state owner already exposes 64
+CTAs and costs only about `0.15--0.18 ms`; the upstream split pattern is not a
+drop-in improvement and was not imitated with a lower-quality custom scan.
+
+The profitable specialization was inside the existing FLA-style pair/source
+owner. Its first version retained complete `left` and `right` 48x128 panels
+together and compiled to about 56 KiB dynamic shared memory, limiting the
+target to one CTA/SM. The selected version reloads one 16-row bounded operand
+tile at each pair consumer, preserves FP32 Tensor-Core accumulation and the
+same output ownership, and compiles to about 40 KiB. This permits two CTAs/SM
+without adding an HBM interface. Keeping one complete operand at a time used
+about 53 KiB and lost the complete-path A/B, so the additional tile reloads
+are intentional.
+
+The output-to-source boundary was also reduced algebraically. The full
+channelwise query-gate cotangent satisfies
+
+\[
+\bar G^{query}_{t}=q^{paired}_{t}\odot\bar q_t
++\mathbf 1_{t=C-1}\,\bar G^{tail},
+\]
+
+so only the final `r`-vector tail seed crosses the boundary; the pair/source
+owner reconstructs the first term from its already consumed query panel and
+query cotangent. This removes the FP32 `[panel,C,r]` transfer without another
+kernel or a reduced-precision partial. Target Graph F+B stabilized at about
+`1.17 ms`, versus about `1.26--1.28 ms` before this lifetime/occupancy pass,
+and reservation fell from 246 to 222 MiB while forward remained about
+`0.388 ms`.
+
+### FLA precision and pending-owner audit
+
+FLA `main` was refreshed from `88caebb` to `f4cda48` on 2026-08-28. The two
+new mainline commits affect Parallax caching and model loss logits only; the
+installed FLA 0.6.0 copies of MESA, GDN2, common state/output, L2Norm, and
+their TileLang backends are byte-identical to refreshed main. Upgrading the
+package therefore cannot change the current RLS hot path.
+
+Open FLA PR #1152, "Prevent NaN failure in MesaNet", supplied two relevant
+precision findings. Its FP32 `Hkk` history was A/B tested earlier and rejected
+for this target because geometry forward rose from about `0.186` to
+`0.322 ms` for only about `1e-3` relative improvement. Its FP32 `Hkv*dHkv`
+scalar reduction is retained, and its BF16 `Hkv` range fix is now applied to
+the diagnostic FP16 route: the unnormalized cross-moment has no valid FP16
+range proof. Public BF16 execution is unchanged.
+
+FLA PR #948 reports a Blackwell-specific failure in a different common
+TileLang GDN backward and an IEEE-safe output dot. The native E3 TileLang
+owners were not switched to CUDA-core IEEE dots by analogy. Three independent
+`r=128,C=16` FP64-oracle seeds on the local SM120 device found BF16 forward
+relative error `0.47--0.52%` and no sparse large-error class; composed input
+VJPs were mostly `0.35--0.65%`, with decay/strength scalar branches reaching
+about `2.0--2.1%`. Tensor-Core execution remains selected until a matching
+failure is reproduced.
+
+FLA PR #1128's KDA TileLang training owners are credible future donors for
+the two remaining exterior hot blocks. Its `dAv` owner streams value tiles
+while retaining one FP32 interaction accumulator; its fused `dq/kg` owner
+keeps the K tile internal and closes final outputs once. Those are the same
+ownership classes as E3 output/WY reverse and pair/source reverse. They are
+not drop-in kernels: the promoted upstream bucket is C32/C64 with ordinary KDA
+axes, while this path has a C16 token axis, a 48-row E3 logical axis, paired
+direct-e gauge terms, and RLS source scalar cotangents. Adopting the schedules
+requires an E3 specialization and a complete composed-VJP A/B, not a package
+upgrade or ABI wrapper.
+
+The precision audit also removed two local inconsistencies. L2Norm reverse now
+consumes the exact rounded normalized q/key panels saved by forward, matching
+FLA's `l2norm_bwd`; it no longer reconstructs an unrounded normalized vector
+from raw operands. The C48 WY inverse is computed in FP32 inside its owner but
+stored directly in the BF16/FP16 consumer dtype. Previously the FP32 HBM panel
+was immediately rounded by every forward and reverse MMA consumer, so it added
+traffic without changing operand bits. The BF16 target saved-tensor total is
+now `77.47 MiB`; the inverse is `2.25 MiB` rather than `4.5 MiB`.
+
+The private state-checkpoint cotangent was separately promoted to FP32 for an
+A/B rather than inferred from policy. It raised complete Graph F+B from about
+`1.10` to `1.13 ms` and reservation from 222 to 234 MiB, while five-seed
+per-input VJP errors were effectively unchanged. The isolated RLS experiment
+therefore keeps that cotangent in checkpoint dtype. This is an experimental
+precision-map result, not authorization to weaken the production
+FP32-backward-partial contract without an explicit contract revision.
+
+### Scalar precision and gate-cumsum ownership
+
+The RLS scalar audit followed FLA's actual mixed-precision execution rather
+than treating every scalar as FP32 by category. FLA's chunk gate cumsums load
+the raw log gate, accumulate the token axis in FP32, and keep the cumsum owner
+separate from the matrix owners. The RLS specialization preserves that
+schedule but accepts an additional FP32 token scalar `diagonal_log[B,T,H]` and
+broadcasts it in registers before `tl.cumsum`. This replaces the former Python
+ABI that expanded the scalar across rank, added it to the raw channel gate,
+and materialized a 4 MiB FP32 `[B,T,H,r]` input for the same cumsum. The design
+influence is FLA common's chunk-local vector cumsum and persistent autotune
+cache; the operator-specific scalar input and layout are local adaptations.
+
+Lowering scalar precision was not adopted merely to reduce the visible FP32
+count. `1-u^Tg` has no static lower bound and feeds repeated divisions; the
+effective-mass scan owns recurrent-split semantics; CG dot products inherit
+the solve condition number. Conversely, the bounded source scalars were tested
+rather than assumed to need FP32. Fixed FP16 rounding of geometry decay, mass
+scale, and the diagonal factor missed the current composed-VJP gate and did
+not change the generated reduction/divide/exp path into Tensor Core work.
+Rounding CG `alpha/beta` to BF16 likewise slowed complete F+B by about
+`20--25 us`. These A/B results distinguish precision that protects the
+mathematics from FP32 storage or broadcasting that merely reflects a poor ABI.

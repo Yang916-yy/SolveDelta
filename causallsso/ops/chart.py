@@ -8,41 +8,22 @@ from ..reference import C_H, C_R, S_H, S_R
 
 
 @triton.jit
-def _route_forward_kernel(
-    cumulative,
-    mass,
+def _route_forward_value(
     gram,
     correlation,
     boundary_norm,
-    strength,
-    decay,
-    boundary_coefficient,
-    kappa_output,
+    w,
+    a,
+    safe_m,
+    gamma,
+    valid,
+    pair,
+    pair_mask,
+    panel,
+    oi,
     C: tl.constexpr,
-    BC: tl.constexpr,
     RADIUS: tl.constexpr,
-    COMPUTE_DECAY: tl.constexpr,
-    H: tl.constexpr,
-    N: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
 ):
-    panel = tl.program_id(0).to(tl.int64)
-    oi = tl.arange(0, BC)
-    valid = tl.load(mass + panel * C + oi, mask=oi < C, other=0.0) > 0.0
-    g = tl.load(cumulative + panel * C + oi, mask=oi < C, other=0.0).to(tl.float32)
-    pair = panel * C * C + oi[:, None] * C + oi[None, :]
-    pair_mask = (oi[:, None] < C) & (oi[None, :] < C)
-    if COMPUTE_DECAY:
-        w = tl.exp(g[:, None] - g[None, :])
-        w = tl.where(
-            (oi[:, None] >= oi[None, :]) & valid[:, None] & valid[None, :],
-            w,
-            0.0,
-        )
-        tl.store(decay + pair, w, mask=pair_mask)
-    else:
-        w = tl.load(decay + pair, mask=pair_mask, other=0.0).to(tl.float32)
-    a = tl.exp(g)
     gram_value = tl.load(
         gram + pair,
         mask=pair_mask,
@@ -56,41 +37,35 @@ def _route_forward_kernel(
     radial = a * a * norm
     radial += 2.0 * a * tl.sum(w * correlation_value[None, :], axis=1)
     radial += tl.sum(product * w, axis=1)
-    head = panel % H if IS_VARLEN else (panel // N) % H
-    gamma_scalar = tl.load(strength + head).to(tl.float32)
-    gamma = tl.where(oi < C, gamma_scalar, 0.0)
-    m = tl.load(mass + panel * C + oi, mask=oi < C, other=1.0).to(tl.float32)
-    safe_m = tl.where(valid, m, 1.0)
     denominator = tl.sqrt(RADIUS * RADIUS * safe_m * safe_m + gamma * gamma * radial)
     kappa = tl.where(valid, RADIUS * gamma / denominator, 0.0)
-    tl.store(
-        boundary_coefficient + panel * C + oi,
-        kappa * a,
-        mask=oi < C,
-    )
-    tl.store(kappa_output + panel * C + oi, kappa, mask=oi < C)
+    return kappa * a, kappa
 
 
 @triton.jit
-def _route_backward_kernel(
+def _routes_forward_kernel(
     cumulative,
-    decay,
     mass,
-    gram,
-    correlation,
-    boundary_norm,
+    gram_h,
+    gram_lower,
+    gram_upper,
+    corr_h,
+    corr_lower,
+    corr_upper,
+    norm_h,
+    norm_lower,
+    norm_upper,
     strength,
-    grad_kappa_input,
-    grad_mass,
-    grad_gram,
-    grad_correlation,
-    grad_norm,
-    grad_strength,
-    grad_cumulative,
+    decay,
+    boundary_h,
+    boundary_lower,
+    boundary_upper,
+    kappa_h,
+    kappa_lower,
+    kappa_upper,
     C: tl.constexpr,
     BC: tl.constexpr,
     RADIUS: tl.constexpr,
-    ACCUMULATE_SHARED: tl.constexpr,
     H: tl.constexpr,
     N: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -101,23 +76,69 @@ def _route_backward_kernel(
     g = tl.load(cumulative + panel * C + oi, mask=oi < C, other=0.0).to(tl.float32)
     pair_mask = (oi[:, None] < C) & (oi[None, :] < C)
     pair = panel * C * C + oi[:, None] * C + oi[None, :]
-    w = tl.load(decay + pair, mask=pair_mask, other=0.0).to(tl.float32)
+    w = tl.exp(g[:, None] - g[None, :])
+    w = tl.where(
+        (oi[:, None] >= oi[None, :]) & valid[:, None] & valid[None, :],
+        w,
+        0.0,
+    )
+    tl.store(decay + pair, w, mask=pair_mask)
     a = tl.exp(g)
+    head = panel % H if IS_VARLEN else (panel // N) % H
+    gamma_scalar = tl.load(strength + head).to(tl.float32)
+    gamma = tl.where(oi < C, gamma_scalar, 0.0)
+    m = tl.load(mass + panel * C + oi, mask=oi < C, other=1.0).to(tl.float32)
+    safe_m = tl.where(valid, m, 1.0)
+    bh, kh = _route_forward_value(
+        gram_h, corr_h, norm_h, w, a, safe_m, gamma, valid, pair,
+        pair_mask, panel, oi, C, RADIUS,
+    )
+    bl, kl = _route_forward_value(
+        gram_lower, corr_lower, norm_lower, w, a, safe_m, gamma, valid,
+        pair, pair_mask, panel, oi, C, RADIUS,
+    )
+    bu, ku = _route_forward_value(
+        gram_upper, corr_upper, norm_upper, w, a, safe_m, gamma, valid,
+        pair, pair_mask, panel, oi, C, RADIUS,
+    )
+    output = panel * C + oi
+    output_mask = oi < C
+    tl.store(boundary_h + output, bh, mask=output_mask)
+    tl.store(boundary_lower + output, bl, mask=output_mask)
+    tl.store(boundary_upper + output, bu, mask=output_mask)
+    tl.store(kappa_h + output, kh, mask=output_mask)
+    tl.store(kappa_lower + output, kl, mask=output_mask)
+    tl.store(kappa_upper + output, ku, mask=output_mask)
+
+
+@triton.jit
+def _route_backward_value(
+    gram,
+    correlation,
+    boundary_norm,
+    grad_kappa_input,
+    w,
+    a,
+    m,
+    safe_m,
+    gamma,
+    valid,
+    pair,
+    pair_mask,
+    panel,
+    oi,
+    C: tl.constexpr,
+    RADIUS: tl.constexpr,
+):
     gv = tl.load(gram + pair, mask=pair_mask, other=0.0).to(tl.float32)
     cv = tl.load(correlation + panel * C + oi, mask=oi < C, other=0.0).to(tl.float32)
     n0 = tl.load(boundary_norm + panel).to(tl.float32)
     wg = tl.dot(w, gv, input_precision="ieee")
     radial = a * a * n0 + 2.0 * a * tl.sum(w * cv[None, :], axis=1)
     radial += tl.sum(wg * w, axis=1)
-    head = panel % H if IS_VARLEN else (panel // N) % H
-    gamma_scalar = tl.load(strength + head).to(tl.float32)
-    gamma = tl.where(oi < C, gamma_scalar, 0.0)
-    m = tl.load(mass + panel * C + oi, mask=oi < C, other=1.0).to(tl.float32)
-    safe_m = tl.where(valid, m, 1.0)
     den2 = RADIUS * RADIUS * safe_m * safe_m + gamma * gamma * radial
     den = tl.sqrt(den2)
     inv_den3 = 1.0 / (den2 * den)
-    kappa = tl.where(valid, RADIUS * gamma / den, 0.0)
     grad_kappa = tl.load(
         grad_kappa_input + panel * C + oi, mask=oi < C, other=0.0
     ).to(tl.float32)
@@ -145,23 +166,95 @@ def _route_backward_kernel(
     grad_g = grad_a * a
     grad_g += tl.sum(grad_w * w, axis=1) - tl.sum(grad_w * w, axis=0)
     grad_g = tl.where(valid, grad_g, 0.0)
+    return gm, gs, grad_g, grad_gm, grad_c, grad_n0
 
-    if ACCUMULATE_SHARED:
-        gm += tl.load(
-            grad_mass + panel * C + oi, mask=oi < C, other=0.0
-        ).to(tl.float32)
-        gs += tl.load(
-            grad_strength + panel * C + oi, mask=oi < C, other=0.0
-        ).to(tl.float32)
-        grad_g += tl.load(
-            grad_cumulative + panel * C + oi, mask=oi < C, other=0.0
-        ).to(tl.float32)
-    tl.store(grad_mass + panel * C + oi, gm, mask=oi < C)
-    tl.store(grad_gram + pair, grad_gm, mask=pair_mask)
-    tl.store(grad_correlation + panel * C + oi, grad_c, mask=oi < C)
-    tl.store(grad_norm + panel, grad_n0)
-    tl.store(grad_strength + panel * C + oi, gs, mask=oi < C)
-    tl.store(grad_cumulative + panel * C + oi, grad_g, mask=oi < C)
+
+@triton.jit
+def _routes_backward_kernel(
+    cumulative,
+    decay,
+    mass,
+    gram_h,
+    gram_lower,
+    gram_upper,
+    corr_h,
+    corr_lower,
+    corr_upper,
+    norm_h,
+    norm_lower,
+    norm_upper,
+    strength,
+    grad_kappa_h,
+    grad_kappa_lower,
+    grad_kappa_upper,
+    grad_mass,
+    grad_gram_h,
+    grad_gram_lower,
+    grad_gram_upper,
+    grad_corr_h,
+    grad_corr_lower,
+    grad_corr_upper,
+    grad_norm_h,
+    grad_norm_lower,
+    grad_norm_upper,
+    grad_strength,
+    grad_cumulative,
+    C: tl.constexpr,
+    BC: tl.constexpr,
+    RADIUS: tl.constexpr,
+    H: tl.constexpr,
+    N: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    panel = tl.program_id(0).to(tl.int64)
+    oi = tl.arange(0, BC)
+    row_mask = oi < C
+    valid = tl.load(mass + panel * C + oi, mask=row_mask, other=0.0) > 0.0
+    g = tl.load(cumulative + panel * C + oi, mask=row_mask, other=0.0).to(tl.float32)
+    pair_mask = row_mask[:, None] & row_mask[None, :]
+    pair = panel * C * C + oi[:, None] * C + oi[None, :]
+    w = tl.load(decay + pair, mask=pair_mask, other=0.0).to(tl.float32)
+    a = tl.exp(g)
+    head = panel % H if IS_VARLEN else (panel // N) % H
+    gamma_scalar = tl.load(strength + head).to(tl.float32)
+    gamma = tl.where(row_mask, gamma_scalar, 0.0)
+    m = tl.load(mass + panel * C + oi, mask=row_mask, other=1.0).to(tl.float32)
+    safe_m = tl.where(valid, m, 1.0)
+
+    gm_h, gs_h, gg_h, ggram_h, gc_h, gn_h = _route_backward_value(
+        gram_h, corr_h, norm_h, grad_kappa_h, w, a, m, safe_m, gamma,
+        valid, pair, pair_mask, panel, oi, C, RADIUS,
+    )
+    gm_l, gs_l, gg_l, ggram_l, gc_l, gn_l = _route_backward_value(
+        gram_lower, corr_lower, norm_lower, grad_kappa_lower, w, a, m,
+        safe_m, gamma, valid, pair, pair_mask, panel, oi, C, RADIUS,
+    )
+    gm_u, gs_u, gg_u, ggram_u, gc_u, gn_u = _route_backward_value(
+        gram_upper, corr_upper, norm_upper, grad_kappa_upper, w, a, m,
+        safe_m, gamma, valid, pair, pair_mask, panel, oi, C, RADIUS,
+    )
+
+    gm = gm_h + gm_l + gm_u
+    gs = gs_h + gs_l + gs_u
+    grad_g = gg_h + gg_l + gg_u
+    gm += tl.load(grad_mass + panel * C + oi, mask=row_mask, other=0.0).to(tl.float32)
+    gs += tl.load(grad_strength + panel * C + oi, mask=row_mask, other=0.0).to(tl.float32)
+    grad_g += tl.load(
+        grad_cumulative + panel * C + oi, mask=row_mask, other=0.0
+    ).to(tl.float32)
+
+    tl.store(grad_mass + panel * C + oi, gm, mask=row_mask)
+    tl.store(grad_strength + panel * C + oi, gs, mask=row_mask)
+    tl.store(grad_cumulative + panel * C + oi, grad_g, mask=row_mask)
+    tl.store(grad_gram_h + pair, ggram_h, mask=pair_mask)
+    tl.store(grad_gram_lower + pair, ggram_l, mask=pair_mask)
+    tl.store(grad_gram_upper + pair, ggram_u, mask=pair_mask)
+    tl.store(grad_corr_h + panel * C + oi, gc_h, mask=row_mask)
+    tl.store(grad_corr_lower + panel * C + oi, gc_l, mask=row_mask)
+    tl.store(grad_corr_upper + panel * C + oi, gc_u, mask=row_mask)
+    tl.store(grad_norm_h + panel, gn_h)
+    tl.store(grad_norm_lower + panel, gn_l)
+    tl.store(grad_norm_upper + panel, gn_u)
 
 
 @triton.jit
@@ -406,24 +499,35 @@ class _ChartCoefficients(torch.autograd.Function):
         kappa_h = torch.empty_like(mass)
         kappa_lower = torch.empty_like(mass)
         kappa_upper = torch.empty_like(mass)
-        for route, (gram, corr, norm, boundary, kappa, radius) in enumerate((
-            (gram_h, corr_h, norm_h, boundary_h, kappa_h, C_H),
-            (gram_lower, corr_lower, norm_lower, boundary_lower, kappa_lower, C_R),
-            (gram_upper, corr_upper, norm_upper, boundary_upper, kappa_upper, C_R),
-        )):
-            _route_forward_kernel[(panels,)](
-                cumulative, mass, gram, corr, norm, strength, decay, boundary,
-                kappa,
-                C=chunk_size,
-                BC=bc,
-                RADIUS=radius,
-                COMPUTE_DECAY=route == 0,
-                H=heads,
-                N=chunks,
-                IS_VARLEN=is_varlen,
-                num_warps=4,
-                num_stages=1,
-            )
+        _routes_forward_kernel[(panels,)](
+            cumulative,
+            mass,
+            gram_h,
+            gram_lower,
+            gram_upper,
+            corr_h,
+            corr_lower,
+            corr_upper,
+            norm_h,
+            norm_lower,
+            norm_upper,
+            strength,
+            decay,
+            boundary_h,
+            boundary_lower,
+            boundary_upper,
+            kappa_h,
+            kappa_lower,
+            kappa_upper,
+            C=chunk_size,
+            BC=bc,
+            RADIUS=C_H,
+            H=heads,
+            N=chunks,
+            IS_VARLEN=is_varlen,
+            num_warps=4,
+            num_stages=1,
+        )
         sigma = torch.empty_like(u, dtype=torch.float16)
         _sigma_forward_kernel[(panels,)](
             cumulative, decay, mass, diagonal_j, diagonal_d, u, h, strength,
@@ -498,30 +602,50 @@ class _ChartCoefficients(torch.autograd.Function):
             num_stages=1,
         )
 
-        route_inputs = (
-            (gram_h, corr_h, norm_h, grad_outputs[5], C_H),
-            (gram_lower, corr_lower, norm_lower, grad_outputs[6], C_R),
-            (gram_upper, corr_upper, norm_upper, grad_outputs[7], C_R),
+        gram_gradients = tuple(
+            torch.empty_like(gram)
+            for gram in (gram_h, gram_lower, gram_upper)
         )
-        route_results = []
-        for gram, corr, norm, grad_kappa, radius in route_inputs:
-            gg = torch.empty_like(gram)
-            gc = torch.empty_like(corr)
-            gn = torch.empty_like(norm)
-            _route_backward_kernel[(panels,)](
-                cumulative, decay, mass, gram, corr, norm, strength, grad_kappa,
-                grad_mass, gg, gc, gn, grad_strength_panel, grad_cumulative,
-                C=chunk_size,
-                BC=ctx.bc,
-                RADIUS=radius,
-                ACCUMULATE_SHARED=True,
-                H=heads,
-                N=chunks,
-                IS_VARLEN=is_varlen,
-                num_warps=4,
-                num_stages=1,
-            )
-            route_results.append((gg, gc, gn))
+        correlation_gradients = tuple(
+            torch.empty_like(corr)
+            for corr in (corr_h, corr_lower, corr_upper)
+        )
+        norm_gradients = tuple(
+            torch.empty_like(norm)
+            for norm in (norm_h, norm_lower, norm_upper)
+        )
+        _routes_backward_kernel[(panels,)](
+            cumulative,
+            decay,
+            mass,
+            gram_h,
+            gram_lower,
+            gram_upper,
+            corr_h,
+            corr_lower,
+            corr_upper,
+            norm_h,
+            norm_lower,
+            norm_upper,
+            strength,
+            grad_outputs[5],
+            grad_outputs[6],
+            grad_outputs[7],
+            grad_mass,
+            *gram_gradients,
+            *correlation_gradients,
+            *norm_gradients,
+            grad_strength_panel,
+            grad_cumulative,
+            C=chunk_size,
+            BC=ctx.bc,
+            RADIUS=C_H,
+            H=heads,
+            N=chunks,
+            IS_VARLEN=is_varlen,
+            num_warps=4,
+            num_stages=1,
+        )
         if is_varlen:
             grad_strength = grad_strength_panel.view(-1, heads, chunk_size).sum(
                 dim=(0, 2)
@@ -534,9 +658,9 @@ class _ChartCoefficients(torch.autograd.Function):
         return (
             grad_cumulative, grad_mass, sigma_dj, sigma_dd, sigma_u, sigma_h,
             grad_strength,
-            route_results[0][0], route_results[1][0], route_results[2][0],
-            route_results[0][1], route_results[1][1], route_results[2][1],
-            route_results[0][2], route_results[1][2], route_results[2][2],
+            *gram_gradients,
+            *correlation_gradients,
+            *norm_gradients,
             None, None, None,
         )
 

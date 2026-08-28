@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .native_local import local_transpose
+from .native_local import local_transpose, local_transpose_mixed
 
 
 @triton.jit
@@ -52,25 +52,11 @@ def _exact_coordinate_solve_kernel(
     chunk = tl.program_id(0).to(tl.int64)
     rows = C * NRHS
     o_row = tl.arange(0, BM)
-    o_k = tl.arange(0, BK)
     o_s = tl.arange(0, C)
     o_b = tl.arange(0, BC)
     valid_row = o_row < rows
-    valid_k = o_k < R
     token = o_row % C
     rhs_index = o_row // C
-
-    p_rhs = (
-        chunk * stride_rhs_p
-        + rhs_index[:, None] * stride_rhs_n
-        + token[:, None] * stride_rhs_c
-        + o_k[None, :] * stride_rhs_r
-    )
-    solution = tl.load(
-        rhs + p_rhs,
-        mask=valid_row[:, None] & valid_k[None, :],
-        other=0.0,
-    ).to(tl.float32)
 
     panel_vector = chunk * C * R
     panel_pair = chunk * C * C
@@ -102,10 +88,8 @@ def _exact_coordinate_solve_kernel(
     for block in range(tl.cdiv(R, BC)):
         if reverse:
             coord = R - 1 - (block * BC + o_b)
-            prior = o_k >= R - block * BC
         else:
             coord = block * BC + o_b
-            prior = o_k < block * BC
         valid_b = (coord >= 0) & (coord < R)
 
         p_block_rhs = (
@@ -127,18 +111,42 @@ def _exact_coordinate_solve_kernel(
             ).to(tl.float32)
             rhs_block /= b_sigma
 
-        if TRANSPOSE:
-            p_j = panel_matrix + o_k[None, :] * R + coord[:, None]
-            p_d = panel_matrix + o_k[None, :] * R + coord[:, None]
-        else:
-            p_j = panel_matrix + coord[:, None] * R + o_k[None, :]
-            p_d = panel_matrix + coord[:, None] * R + o_k[None, :]
-        matrix_mask = valid_b[:, None] & valid_k[None, :] & prior[None, :]
-        block_j = tl.load(J + p_j, mask=matrix_mask, other=0.0).to(tl.bfloat16)
-        block_d = tl.load(D + p_d, mask=matrix_mask, other=0.0).to(tl.bfloat16)
-        solution_bf16 = solution.to(tl.bfloat16)
-        boundary_prior = tl.dot(solution_bf16, tl.trans(block_j)) * coeff_h[:, None]
-        boundary_prior += tl.dot(solution_bf16, tl.trans(block_d)) * coeff_r[:, None]
+        boundary_prior = tl.zeros([BM, BC], dtype=tl.float32)
+        for previous in range(block):
+            if reverse:
+                prior_coord = R - 1 - (previous * BC + o_b)
+            else:
+                prior_coord = previous * BC + o_b
+            valid_prior = (prior_coord >= 0) & (prior_coord < R)
+            prior_pointer = (
+                chunk * rows * R
+                + o_row[:, None] * R
+                + prior_coord[None, :]
+            )
+            prior_solution = tl.load(
+                output + prior_pointer,
+                mask=valid_row[:, None] & valid_prior[None, :],
+                other=0.0,
+            ).to(tl.bfloat16)
+            if TRANSPOSE:
+                p_j = panel_matrix + prior_coord[None, :] * R + coord[:, None]
+                p_d = panel_matrix + prior_coord[None, :] * R + coord[:, None]
+            else:
+                p_j = panel_matrix + coord[:, None] * R + prior_coord[None, :]
+                p_d = panel_matrix + coord[:, None] * R + prior_coord[None, :]
+            matrix_mask = valid_b[:, None] & valid_prior[None, :]
+            block_j = tl.load(
+                J + p_j, mask=matrix_mask, other=0.0
+            ).to(tl.bfloat16)
+            block_d = tl.load(
+                D + p_d, mask=matrix_mask, other=0.0
+            ).to(tl.bfloat16)
+            boundary_prior += (
+                tl.dot(prior_solution, tl.trans(block_j)) * coeff_h[:, None]
+            )
+            boundary_prior += (
+                tl.dot(prior_solution, tl.trans(block_d)) * coeff_r[:, None]
+            )
 
         p_u_block = u + panel_vector + o_s[:, None] * R + coord[None, :]
         p_h_block = h + panel_vector + o_s[:, None] * R + coord[None, :]
@@ -216,18 +224,18 @@ def _exact_coordinate_solve_kernel(
             )
             delta_h += value[:, None] * u_value[None, :]
             delta_r += value[:, None] * r_input_value[None, :]
-            target = R - 1 - (block * BC + step) if reverse else block * BC + step
-            solution = tl.where(o_k[None, :] == target, value[:, None], solution)
 
         prefix_h += delta_h
         prefix_r += delta_r
-
-    output_offset = chunk * rows * R + o_row[:, None] * R + o_k[None, :]
-    tl.store(
-        output + output_offset,
-        solution,
-        mask=valid_row[:, None] & valid_k[None, :],
-    )
+        output_offset = chunk * rows * R + o_row[:, None] * R + coord[None, :]
+        tl.store(
+            output + output_offset,
+            solved_block,
+            mask=valid_row[:, None] & valid_b[None, :],
+        )
+        # The next block reloads values written by other lanes from this final
+        # panel, so this is a real CTA producer/consumer boundary.
+        tl.debug_barrier()
 
 
 @triton.jit
@@ -1154,7 +1162,11 @@ def _chunked_factor_direct(
     blocks = width // block
     prefix = torch.empty(
         chunks, blocks, chunk_size * rhs_count, chunk_size,
-        dtype=torch.float32, device=rhs.device,
+        # Forward direct-action RHS panels are analytically bounded, so their
+        # FP32-produced block prefix is a legal direct FP16 private panel.
+        # Reverse cotangents are unbounded and keep an FP32 prefix.
+        dtype=torch.float16 if bounded_rhs else torch.float32,
+        device=rhs.device,
     )
     sigma_arg = rhs if sigma is None else sigma
     _direct_prefix_states_kernel[(chunks,)](
@@ -1260,7 +1272,7 @@ def resident_dual(
     sigma: torch.Tensor,
     *,
     num_warps: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     lower_output = _chunked_factor_direct(
         rhs,
         J,
@@ -1279,7 +1291,7 @@ def resident_dual(
         bounded_rhs=True,
         num_warps=num_warps,
     )
-    return _chunked_factor_direct(
+    output = _chunked_factor_direct(
         lower_output,
         J,
         D,
@@ -1297,6 +1309,7 @@ def resident_dual(
         bounded_rhs=True,
         num_warps=num_warps,
     )
+    return output, lower_output
 
 
 def resident_factor_transpose(
@@ -1562,6 +1575,103 @@ def factor_local_representation_vjp(
     )
 
 
+def factor_local_mixed_representation_vjp(
+    primal_x: torch.Tensor,
+    primal_cotangent: torch.Tensor,
+    dual_x: torch.Tensor,
+    dual_cotangent: torch.Tensor,
+    u: torch.Tensor,
+    h: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r: torch.Tensor,
+    mass: torch.Tensor,
+    grad_u: torch.Tensor,
+    grad_h: torch.Tensor,
+    grad_kappa_h: torch.Tensor,
+    grad_kappa_r: torch.Tensor,
+    grad_cumulative: torch.Tensor,
+    *,
+    lower: bool,
+    accumulate: bool,
+    num_warps: int,
+) -> None:
+    if (
+        primal_x.ndim == 4
+        and primal_x.shape[1:] == (1, 32, 128)
+        and dual_x.ndim == 4
+        and dual_x.shape[1:] == (2, 32, 128)
+        and primal_x.shape == primal_cotangent.shape
+        and dual_x.shape == dual_cotangent.shape
+        and primal_x.shape[0] == dual_x.shape[0]
+        and primal_x.is_contiguous()
+        and primal_cotangent.is_contiguous()
+        and dual_x.is_contiguous()
+        and dual_cotangent.is_contiguous()
+        and u.is_contiguous()
+        and h.is_contiguous()
+        and decay.is_contiguous()
+    ):
+        local_transpose_mixed(
+            primal_x,
+            primal_cotangent,
+            dual_x,
+            dual_cotangent,
+            u,
+            h,
+            decay,
+            kappa_h,
+            kappa_r,
+            mass,
+            grad_u,
+            grad_h,
+            grad_kappa_h,
+            grad_kappa_r,
+            grad_cumulative,
+            lower=lower,
+            accumulate=accumulate,
+        )
+        return
+    factor_local_representation_vjp(
+        primal_x,
+        primal_cotangent,
+        u,
+        h,
+        decay,
+        kappa_h,
+        kappa_r,
+        mass,
+        grad_u,
+        grad_h,
+        grad_kappa_h,
+        grad_kappa_r,
+        grad_cumulative,
+        primal=True,
+        lower=lower,
+        accumulate=accumulate,
+        num_warps=num_warps,
+    )
+    factor_local_representation_vjp(
+        dual_x,
+        dual_cotangent,
+        u,
+        h,
+        decay,
+        kappa_h,
+        kappa_r,
+        mass,
+        grad_u,
+        grad_h,
+        grad_kappa_h,
+        grad_kappa_r,
+        grad_cumulative,
+        primal=False,
+        lower=lower,
+        accumulate=True,
+        num_warps=num_warps,
+    )
+
+
 def boundary_route_forward(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -1662,6 +1772,7 @@ def boundary_route_vjp(
 __all__ = [
     "boundary_route_forward",
     "boundary_route_vjp",
+    "factor_local_mixed_representation_vjp",
     "factor_local_representation_vjp",
     "packed_factor_boundary_vjp",
     "resident_dual",

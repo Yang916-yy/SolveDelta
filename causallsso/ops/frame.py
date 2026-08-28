@@ -14,6 +14,7 @@ from .radial import strict_gram
 from .resident_frame import (
     boundary_route_forward,
     boundary_route_vjp,
+    factor_local_mixed_representation_vjp,
     factor_local_representation_vjp,
     packed_factor_boundary_vjp,
     resident_dual,
@@ -439,6 +440,7 @@ def _primal_reverse(
 def _dual_reverse(
     grad_output: torch.Tensor,
     rhs: torch.Tensor,
+    lower_output: torch.Tensor,
     J: torch.Tensor,
     D: torch.Tensor,
     u: torch.Tensor,
@@ -455,22 +457,7 @@ def _dual_reverse(
     *,
     num_warps: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    t = resident_factor_direct(
-        rhs,
-        J,
-        D,
-        u,
-        h,
-        decay,
-        kappa_h,
-        kappa_r_lower,
-        boundary_h,
-        boundary_r_lower,
-        lower=True,
-        transpose=True,
-        num_warps=num_warps,
-        output_dtype=torch.float16,
-    )
+    t = lower_output
     s = torch.empty_like(t, dtype=torch.float16)
     panels, rhs_count, chunk_size, width = t.shape
     cr = chunk_size * width
@@ -590,7 +577,7 @@ class _ResidentFrameActions(torch.autograd.Function):
             sigma,
             num_warps=num_warps,
         )
-        dual = resident_dual(
+        dual, dual_lower_cache = resident_dual(
             dual_rhs,
             J,
             D,
@@ -610,6 +597,7 @@ class _ResidentFrameActions(torch.autograd.Function):
             lower_cache,
             final_cache,
             dual_rhs,
+            dual_lower_cache,
             J,
             D,
             u,
@@ -636,6 +624,7 @@ class _ResidentFrameActions(torch.autograd.Function):
             lower_cache,
             final_cache,
             dual_rhs,
+            dual_lower_cache,
             J,
             D,
             u,
@@ -675,6 +664,7 @@ class _ResidentFrameActions(torch.autograd.Function):
         dual_rhs_grad, dual_upper_cotangent, dual_lower_input = _dual_reverse(
             grad_dual,
             dual_rhs,
+            dual_lower_cache,
             J,
             D,
             u,
@@ -707,26 +697,9 @@ class _ResidentFrameActions(torch.autograd.Function):
             accumulate=False,
             num_warps=ctx.num_warps,
         )
-        factor_local_representation_vjp(
+        factor_local_mixed_representation_vjp(
             final_cache,
             primal_upper_cotangent,
-            u,
-            h,
-            decay,
-            kappa_h,
-            kappa_r_upper,
-            mass,
-            grad_u,
-            grad_h,
-            upper[0],
-            upper[1],
-            upper[2],
-            primal=True,
-            lower=False,
-            accumulate=False,
-            num_warps=ctx.num_warps,
-        )
-        factor_local_representation_vjp(
             grad_dual,
             dual_upper_cotangent,
             u,
@@ -740,9 +713,8 @@ class _ResidentFrameActions(torch.autograd.Function):
             upper[0],
             upper[1],
             upper[2],
-            primal=False,
             lower=False,
-            accumulate=True,
+            accumulate=False,
             num_warps=ctx.num_warps,
         )
         lower = packed_factor_boundary_vjp(
@@ -764,26 +736,9 @@ class _ResidentFrameActions(torch.autograd.Function):
             shared_cumulative=upper[2],
             num_warps=ctx.num_warps,
         )
-        factor_local_representation_vjp(
+        factor_local_mixed_representation_vjp(
             lower_cache,
             primal_rhs,
-            u,
-            h,
-            decay,
-            kappa_h,
-            kappa_r_lower,
-            mass,
-            grad_u,
-            grad_h,
-            lower[0],
-            lower[1],
-            lower[2],
-            primal=True,
-            lower=True,
-            accumulate=True,
-            num_warps=ctx.num_warps,
-        )
-        factor_local_representation_vjp(
             dual_lower_input,
             dual_rhs,
             u,
@@ -797,7 +752,6 @@ class _ResidentFrameActions(torch.autograd.Function):
             lower[0],
             lower[1],
             lower[2],
-            primal=False,
             lower=True,
             accumulate=True,
             num_warps=ctx.num_warps,

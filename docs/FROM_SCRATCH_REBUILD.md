@@ -333,9 +333,13 @@ FLA GDN2/DPLR's blocked substitution: 16-coordinate diagonal blocks use its
 exact ordered solve, while complete off-diagonal blocks use Tensor-Core pair
 dots. Boundary tiles and `K_i` tiles are generated directly at the consuming
 block; neither the target-dependent generator, a dense factor, its inverse,
-nor iterative coordinate panels reach HBM. A direct action may write one FP32
-block-prefix tensor to preserve coordinate-block CTA parallelism. It must not
-write separate H and R prefixes.
+nor an auxiliary iterative coordinate panel reaches HBM. The selected inverse
+owner writes each completed 16-coordinate block directly into its already
+required final output panel. Later boundary contractions reload completed
+blocks from that panel, while the generalized-Delta prefix remains resident.
+This final-panel rendezvous is not an extra workspace or a polynomial iterate.
+A direct action may write one FP32 block-prefix tensor to preserve
+coordinate-block CTA parallelism. It must not write separate H and R prefixes.
 
 The transpose swaps the two local generator sides:
 
@@ -403,6 +407,24 @@ the final FP32 `bar U/bar H` stores. After the last coordinate block, the same
 shared storage is reused for the row/column decay reduction. One- and two-RHS
 programs are static specializations. Neither the strict cotangent nor a
 source-partial tensor reaches HBM.
+
+The mixed one-primal/two-dual owner forms its initial complete-coordinate
+scores
+
+\[
+[XU^T,\;XH^T]\in\mathbb R^{96\times 32}\times
+\mathbb R^{96\times 32}
+\]
+
+with native BF16 `m16n16k16` WMMA and FP32 accumulators. Six warps own the six
+16-row tiles and both 16-column halves. The two score panels and warp-local
+BF16 packing tile overlay the owner's existing 32 KiB output-reduction shared
+storage; they are consumed into the resident prefix before that storage is
+reused. The FP16 `u` panel is then reloaded into the same 8 KiB shared union for
+the exact coordinate recurrence. This adds no HBM object or shared-memory
+allocation and preserves the H-route FP16 operand bits after the prefix phase.
+The strict prefix/suffix recurrence remains ordered FP32 work; only its broad
+initial contractions use Tensor Cores.
 
 On SM120 the selected owner uses 256 threads, 128 registers/thread, 50,176
 bytes shared memory, and zero local-memory allocation, permitting two CTAs per
@@ -1299,6 +1321,14 @@ to SolveDelta. No load, scan, matrix multiply, reduction, or state-store
 mechanism is newly designed. Geometry scan remains separate; serializing all
 chunks in a frame kernel would expose only `B*H=8` CTAs at the target.
 
+The selected resident specialization assigns scalar mass to matrix tile
+`(0,0)` in both directions. In reverse that tile carries `bar m` through the
+same chunk-boundary loop that carries `bar J/bar D`; no standalone mass
+boundary scan is launched. The final decay owner writes its FP32 result
+directly to the model-native `[B,T,H]` layout, so a panel-to-token copy is not
+part of the backward graph. These are ownership specializations of the same
+affine transpose, not fusion with the chart or frame kernels.
+
 For full symmetric J storage the cotangent representative is
 
 \[
@@ -1444,9 +1474,11 @@ The initial schedule search includes four- and eight-warp programs for each
 `C in {16,32,64}`. Tile width, stages, shared allocation, register lifetime,
 spill traffic, and achieved CTAs/SM follow the complete mature schedule being
 adapted; none is a semantic constant or an isolated pass/fail threshold. The
-forward program keeps the source, solved blocks, and generalized-Delta prefix
-state resident across coordinate blocks. Reverse uses the matching suffix
-state and FP32 cotangents because their magnitude is not statically bounded.
+selected inverse program keeps only the current solved block and the
+generalized-Delta prefix resident. It writes completed blocks directly to the
+final panel and reloads them for later boundary contractions. Reverse uses the
+same block schedule with FP32 final-panel storage because its cotangents are
+not statically bounded.
 
 The following is the C32/four-warp resource estimate used to seed one candidate,
 not a contract for the winner:
@@ -1470,7 +1502,9 @@ halves by two coordinate halves. A `32x32x16` score update is eight MMA
 instructions. Each off-diagonal coordinate block uses these pair products;
 each 16-coordinate diagonal block uses the ordered FLA solve because that is
 where the true dependency lives. Solved blocks update the resident prefix once
-and are never replayed as polynomial iterates.
+and are never replayed as polynomial iterates. Reloading a completed block
+from the final output replaces a spilled full-width live range; it does not
+recompute the block.
 
 The only project-owned arithmetic is the strict H/R specialization and its
 transpose around MESA's resident two-dot action. MathDx exact TRSM remains an
@@ -1501,8 +1535,10 @@ sequence:
    generalized-Delta prefix state.
 3. Traverse 16-coordinate blocks in increasing order. Generate each diagonal
    pair tile, run the exact FLA ordered solve, update the resident prefix, and
-   apply the solved block to later complete blocks with the upstream pair-dot
-   schedule. Generate-use-discard every pair tile.
+   write the completed block directly to the final private panel. Later
+   boundary contractions reload prior blocks from that panel in 16-coordinate
+   Tensor-Core tiles; local actions consume the resident prefix. Generate-use-
+   discard every pair tile and allocate no additional solve workspace.
 4. Apply `exp(-ell)` in FP32 to the exact lower result and directly pack the
    upper-solve source.
 5. Traverse the same program in decreasing coordinate order with
@@ -1521,9 +1557,9 @@ declared direct FP16 panels are analytically safe. FP32 produces each ordered
 update before its direct store. Casting an already rounded BF16 result to FP16
 is not permitted.
 
-Every CTA barrier in this list protects an actual shared producer/consumer.
-Adding a barrier, a global score store, or a second shared-memory owner is a
-design change that must win a complete-path A/B.
+Every CTA barrier in this list protects an actual shared or final-panel
+producer/consumer. Adding a barrier, a global score store, or a second
+shared-memory owner is a design change that must win a complete-path A/B.
 
 ### 12.3 Frame reverse microprogram
 
@@ -1532,8 +1568,10 @@ The primal transpose CTA runs the exact reversed block substitution for
 those fragments to the upper H/R pair transpose. It then forms
 `bar_y/bar_ell`, runs the exact reversed block substitution for `L^-T bar_y`,
 and consumes `-bar_k y^T` in the lower pair transpose. Forward `y` is consumed
-from the declared cache or recomputed with the same exact recurrence; no
-coordinate descriptor or iterative panel is written to HBM.
+from the declared cache or recomputed with the same exact recurrence. The
+transpose solve similarly writes completed FP32 blocks directly to its final
+cotangent panel and reloads them for later boundary contractions; no separate
+coordinate descriptor or iterative workspace is written to HBM.
 
 Reverse iterates and base additions remain FP32 because upstream cotangents
 have no static FP16 magnitude bound. Their Tensor Core action operands use one
@@ -1552,6 +1590,18 @@ chart contributions are consumed before register reuse. Only three FP32
 owns the norm-dependent global reduction and writes final FP32 geometry
 partials directly.
 
+The paired-dual forward already produces the bounded FP16 intermediate after
+its lower direct action. Training retains that panel and the reverse consumes
+it directly; replaying the complete lower action is forbidden on the selected
+target schedule. At `B1,T1024,H8,K1,r=128,C32` the cache is 4 MiB. It adds no
+forward kernel or store because the producer already writes the panel, and an
+alternating complete-path A/B selected it over replay.
+
+Forward direct-action block prefixes are direct FP16 private panels when their
+RHS is analytically bounded. The FP32 producer rounds once at that store, and
+every block consumer accumulates in FP32. Reverse direct-action prefixes
+remain FP32 because cotangents have no static FP16 magnitude bound.
+
 The four factor contributions use output-owned accumulation. A boundary or
 vector tile has one CTA owner; the primal-upper, primal-lower, dual-upper, and
 dual-lower launches update the same FP32 `bar J/bar D/bar u/bar h` tile in
@@ -1559,6 +1609,15 @@ stream order and no additional combined matrix panel is written. This is
 cross-kernel accumulation with disjoint tile ownership, not an atomic
 reduction or a cross-chunk mega-kernel. Only the small route-scalar and sigma
 cotangents retain separate reduction buffers.
+
+For the C32/r128/K1 native specialization, each strict direction combines its
+one primal RHS and two paired-dual RHS in one static local-generator transpose
+owner. The route pointers and dtypes remain independent; no HBM `cat` or
+three-route staging panel is constructed. This changes four local launches to
+two while retaining 128 registers/thread, 50,176 bytes shared memory, no local
+spill, and two CTAs/SM. Other legal widths, chunk sizes, and K values use the
+same mathematical owner through the generic schedule until a matching static
+specialization wins its own complete-path A/B.
 
 Thus forward and reverse have paired ownership: solve versus transpose solve,
 action versus transpose action, and Gram reduction versus Gram transpose. No
@@ -1594,6 +1653,17 @@ when it lets mature kernels keep a better layout or CTA schedule, and removed
 only when a measured fused or transformed-panel alternative wins end to end.
 Only model-visible outputs and continuation states remain fixed public API.
 
+CUDA Graph capture is an outer training-schedule choice, not another internal
+fusion boundary. A fixed-shape all-valid layer can be warmed and wrapped by
+`torch.cuda.make_graphed_callables` after the trainer has fixed parameter,
+input, optimizer, and distributed-storage addresses. The operator does not
+own that graph pool or bake static addresses into its API. Current direct
+`torch.compile(mode="reduce-overhead")` tracing is not a production path:
+causal-conv1d output layout, Triton constexpr signatures, the lazy native
+extension boundary, and FLA device-query helpers break or reject capture.
+These graph breaks must not justify rewriting mature kernels. A trainer-level
+CUDA Graph A/B is reported separately from eager implementation timings.
+
 The locally compiled upstream DPLR output kernel uses four warps, three stages,
 28,672 bytes shared, `cp.async`, `ldmatrix`, FP16 `mma.sync`, and zero TMEM.
 This is one source schedule and comparison point, not a required warp/stage
@@ -1618,6 +1688,17 @@ count or isolated-latency ratio for the selected exterior.
 
 Default FP32 atomics are frozen only after drift and complete-latency gates.
 Deterministic mode is a compile-time schedule, not a numeric fallback.
+
+At C32/r128/K1, the B4/B5 factor-local contributions share two
+direction-owned native launches as described in Section 12.3. Their solve,
+sigma, and boundary stages remain separate owners; this is selective fusion,
+not a frame mega-kernel.
+
+The three radial chart routes likewise share one forward owner and one reverse
+owner. They reuse the same mass, cumulative decay, pair table, and geometry
+strength loads while retaining separate H, R-lower, and R-upper Gram outputs.
+This removes four launches without joining chart lifetimes to the much larger
+factor-action CTAs.
 
 Forbidden allocations:
 
@@ -1733,6 +1814,10 @@ projections, output projection, dtype, gradients, and state policy.
 Timing uses alternating A/B order, warmup, CUDA events, at least seven medians,
 and identical process/clocks. A candidate is deleted if complete F+B regresses
 even when an isolated kernel wins.
+
+Static CUDA Graph results are labeled deployment measurements and compared
+against eager execution of the identical selected kernels. They do not replace
+the eager GDN2 comparison or redefine operator acceptance.
 
 ## 17. Replacement order
 

@@ -63,4 +63,45 @@ def local_transpose(
     )
 
 
-__all__ = ["local_transpose"]
+def local_transpose_mixed(
+    primal_x: torch.Tensor,
+    primal_cotangent: torch.Tensor,
+    dual_x: torch.Tensor,
+    dual_cotangent: torch.Tensor,
+    u: torch.Tensor,
+    h: torch.Tensor,
+    decay: torch.Tensor,
+    kappa_h: torch.Tensor,
+    kappa_r: torch.Tensor,
+    mass: torch.Tensor,
+    grad_u: torch.Tensor,
+    grad_h: torch.Tensor,
+    grad_kappa_h: torch.Tensor,
+    grad_kappa_r: torch.Tensor,
+    grad_cumulative: torch.Tensor,
+    *,
+    lower: bool,
+    accumulate: bool,
+) -> None:
+    _extension().local_transpose_mixed(
+        primal_x,
+        primal_cotangent,
+        dual_x,
+        dual_cotangent,
+        u,
+        h,
+        decay,
+        kappa_h,
+        kappa_r,
+        mass,
+        grad_u,
+        grad_h,
+        grad_kappa_h,
+        grad_kappa_r,
+        grad_cumulative,
+        lower,
+        accumulate,
+    )
+
+
+__all__ = ["local_transpose", "local_transpose_mixed"]
