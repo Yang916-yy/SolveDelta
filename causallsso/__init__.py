@@ -20,6 +20,7 @@ try:
         SolveDeltaModel,
         SolveDeltaPreTrainedModel,
     )
+    from .cuda_graph import SolveDeltaGraphedTrainingStep
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("fla"):
         raise
@@ -43,6 +44,7 @@ if "SolveDeltaModel" in globals():
         "SolveDeltaBlock",
         "SolveDeltaCacheAdapter",
         "SolveDeltaForCausalLM",
+        "SolveDeltaGraphedTrainingStep",
         "SolveDeltaModel",
         "SolveDeltaPreTrainedModel",
     ]

@@ -29,74 +29,95 @@ def _reference_inputs(*, length: int = 6, rank: int = 8, value_dim: int = 5):
     values = torch.randn(
         batch, length, heads, 1, value_dim, dtype=torch.float64
     )
-    geometry_decay = torch.full(
-        (batch, length, heads),
-        torch.log(torch.tensor(0.99, dtype=torch.float64)),
-    )
     associative_decay = -0.02 * torch.rand(
         batch, length, heads, rank, dtype=torch.float64
     )
     erase = 2.0 * torch.rand_like(keys)
     write = 2.0 * torch.rand_like(values)
-    strength = torch.full((heads,), 0.25, dtype=torch.float64)
+    geometry_write = torch.full((heads,), 0.25, dtype=torch.float64)
     return (
         u,
         h,
         q,
         keys,
         values,
-        geometry_decay,
         associative_decay,
         erase,
         write,
-        strength,
+        geometry_write,
     )
 
 
-def test_fp64_geometry_recurrence_and_cross_map():
+def test_fp64_residual_predictor_and_local_similarity():
     args = _reference_inputs()
-    _, state = solvedelta_reference(*args, prior_mass=2.0)
-    u, h, _, _, _, geometry_decay, _, _, _, _ = args
+    _, state = solvedelta_reference(*args)
+    u, h, q, keys, _, _, erase, _, geometry_write = args
     batch, length, heads, rank = u.shape
     expected = solvedelta_zero_state(
         batch,
         heads,
         rank,
         state.S.shape[-1],
-        prior_mass=2.0,
         dtype=torch.float64,
         device=u.device,
     )
     normalized_u = F.normalize(u, dim=-1)
-    mass, J, D = expected.m, expected.J, expected.D
+    normalized_q = F.normalize(q, dim=-1)
+    normalized_keys = F.normalize(keys, dim=-1)
+    predictor = expected.predictor
+    identity = torch.eye(rank, dtype=torch.float64).view(1, 1, rank, rank)
     for token in range(length):
-        decay = geometry_decay[:, token].exp()
         direction = normalized_u[:, token]
-        mass = decay * mass + 1.0
-        J = (
-            decay[..., None, None] * J
-            + direction[..., :, None] * direction[..., None, :]
+        residual = h[:, token] - (
+            predictor @ direction.unsqueeze(-1)
+        ).squeeze(-1)
+        delta = geometry_write.view(1, heads, 1) * residual
+        predictor = (
+            predictor + delta[..., :, None] * direction[..., None, :]
         )
-        D = (
-            decay[..., None, None] * D
-            + direction[..., :, None] * h[:, token, ..., None, :]
+        residual_after = h[:, token] - (
+            predictor @ direction.unsqueeze(-1)
+        ).squeeze(-1)
+        torch.testing.assert_close(
+            residual_after,
+            (1.0 - geometry_write).view(1, heads, 1) * residual,
+            rtol=2e-12,
+            atol=2e-12,
         )
-    torch.testing.assert_close(state.m, mass, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(state.J, J, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(state.D, D, rtol=2e-11, atol=2e-11)
+
+        frame = identity + direction[..., :, None] * delta[..., None, :]
+        denominator = 1.0 + (direction * delta).sum(dim=-1)
+        key = normalized_keys[:, token, :, 0]
+        erase_key = erase[:, token, :, 0] * key
+        direct = key + direction * (delta * key).sum(dim=-1, keepdim=True)
+        dual = erase_key - delta * (
+            (direction * erase_key).sum(dim=-1, keepdim=True)
+            / denominator[..., None]
+        )
+        query = normalized_q[:, token] - delta * (
+            (direction * normalized_q[:, token]).sum(dim=-1, keepdim=True)
+            / denominator[..., None]
+        )
+        torch.testing.assert_close(
+            (dual * direct).sum(dim=-1),
+            (erase_key * key).sum(dim=-1),
+            rtol=2e-12,
+            atol=2e-12,
+        )
+        expected_query = torch.linalg.solve(
+            frame.transpose(-1, -2), normalized_q[:, token].unsqueeze(-1)
+        ).squeeze(-1)
+        torch.testing.assert_close(query, expected_query, rtol=2e-12, atol=2e-12)
     torch.testing.assert_close(
-        torch.linalg.solve(state.J, state.D),
-        torch.linalg.solve(J, D),
-        rtol=2e-11,
-        atol=2e-11,
+        state.predictor, predictor, rtol=2e-12, atol=2e-12
     )
 
 
-def test_zero_geometry_strength_reduces_to_gdn2_edit():
+def test_zero_geometry_write_reduces_to_gdn2_edit():
     args = list(_reference_inputs())
     args[-1] = torch.zeros_like(args[-1])
-    output, state = solvedelta_reference(*args, prior_mass=2.0)
-    _, _, q, keys, values, _, associative_decay, erase, write, _ = args
+    output, state = solvedelta_reference(*args)
+    _, _, q, keys, values, associative_decay, erase, write, _ = args
     q = F.normalize(q, dim=-1)
     keys = F.normalize(keys, dim=-1)
     memory = torch.zeros_like(state.S)
@@ -125,7 +146,7 @@ def test_reference_masks_resets_recurrent_split_and_vjp():
     reset[0, 4] = True
     reset[1, 2] = True
     output, state = solvedelta_reference(
-        *args, prior_mass=2.0, valid_mask=valid, reset_mask=reset
+        *args, valid_mask=valid, reset_mask=reset
     )
     assert torch.equal(output[~valid], torch.zeros_like(output[~valid]))
 
@@ -134,13 +155,11 @@ def test_reference_masks_resets_recurrent_split_and_vjp():
     right_args = tuple(value[:, split:] for value in args[:-1]) + (args[-1],)
     left_output, left_state = solvedelta_reference(
         *left_args,
-        prior_mass=2.0,
         valid_mask=valid[:, :split],
         reset_mask=reset[:, :split],
     )
     right_output, right_state = solvedelta_reference(
         *right_args,
-        prior_mass=2.0,
         initial_state=left_state,
         valid_mask=valid[:, split:],
         reset_mask=reset[:, split:],
@@ -167,8 +186,8 @@ def test_current_contract_rejects_multiple_edits():
     args = list(_reference_inputs())
     args[3] = args[3].expand(-1, -1, -1, 2, -1).clone()
     args[4] = args[4].expand(-1, -1, -1, 2, -1).clone()
+    args[6] = args[6].expand(-1, -1, -1, 2, -1).clone()
     args[7] = args[7].expand(-1, -1, -1, 2, -1).clone()
-    args[8] = args[8].expand(-1, -1, -1, 2, -1).clone()
     with pytest.raises(ValueError, match="num_edits=1"):
         solvedelta_reference(*args)
 
@@ -188,30 +207,20 @@ def _native_inputs(*, length: int = 16, rank: int = 16, value_dim: int = 16):
         leaf((batch, length, heads, rank)),
         leaf((batch, length, heads, 1, rank)),
         leaf((batch, length, heads, 1, value_dim)),
-        torch.full(
-            (batch, length, heads),
-            torch.log(torch.tensor(0.99)),
-            device="cuda",
-            requires_grad=True,
-        ),
         (-0.02 * torch.rand(batch, length, heads, rank, device="cuda"))
         .detach()
         .requires_grad_(),
         leaf((batch, length, heads, 1, rank), 0.5),
         leaf((batch, length, heads, 1, value_dim), 0.5),
-        torch.full((heads,), 0.2, device="cuda", requires_grad=True),
+        torch.full(
+            (batch, length, heads), 0.2, device="cuda", requires_grad=True
+        ),
     )
 
 
 def _native_state(*, rank: int = 16, value_dim: int = 16):
     torch.manual_seed(31)
-    raw = 0.05 * torch.randn(1, 2, rank, rank, device="cuda")
-    J = raw @ raw.transpose(-1, -2)
-    J = 0.5 * (J + J.transpose(-1, -2))
-    J = J + 2.0 * torch.eye(rank, device="cuda")
     return SolveDeltaState(
-        torch.full((1, 2), 2.0, device="cuda", requires_grad=True),
-        J.detach().requires_grad_(),
         (0.02 * torch.randn(1, 2, rank, rank, device="cuda")).requires_grad_(),
         (0.02 * torch.randn(1, 2, rank, value_dim, device="cuda"))
         .requires_grad_(),
@@ -221,7 +230,7 @@ def _native_state(*, rank: int = 16, value_dim: int = 16):
 @CUDA_ONLY
 def test_native_strided_sources_and_fused_raw_gates_match_packed_path():
     packed = tuple(value.detach().clone().requires_grad_() for value in _native_inputs())
-    vector_indices = {0, 1, 2, 3, 4, 7, 8}
+    vector_indices = {0, 1, 2, 3, 4, 6, 7}
     strided = []
     for index, value in enumerate(packed):
         if index not in vector_indices:
@@ -241,6 +250,11 @@ def test_native_strided_sources_and_fused_raw_gates_match_packed_path():
     packed_output, packed_state = solvedelta_native(
         *packed, return_final_state=True
     )
+    output_without_state, absent_state = solvedelta_native(
+        *packed, return_final_state=False
+    )
+    assert absent_state is None
+    assert torch.equal(output_without_state, packed_output)
     strided_output, strided_state = solvedelta_native(
         *strided, return_final_state=True
     )
@@ -280,10 +294,10 @@ def test_native_forward_and_composed_state_vjp_match_fp64_oracle():
         *(value.detach().double().requires_grad_() for value in initial_state)
     )
     reference_output, expected_state = solvedelta_reference(
-        *reference_leaves[:7],
+        *reference_leaves[:6],
+        2.0 * torch.sigmoid(reference_leaves[6]),
         2.0 * torch.sigmoid(reference_leaves[7]),
-        2.0 * torch.sigmoid(reference_leaves[8]),
-        reference_leaves[9],
+        reference_leaves[8],
         initial_state=reference_state,
     )
     torch.testing.assert_close(
@@ -292,18 +306,14 @@ def test_native_forward_and_composed_state_vjp_match_fp64_oracle():
     for actual, expected, rtol, atol in zip(
         state,
         expected_state,
-        (2e-6, 4e-3, 8e-3, 1e-2),
-        (2e-5, 4e-3, 1.5e-2, 3e-2),
+        (8e-3, 1e-2),
+        (1.5e-2, 3e-2),
     ):
         torch.testing.assert_close(actual, expected.float(), rtol=rtol, atol=atol)
-    assert torch.equal(state.J, state.J.transpose(-1, -2))
 
     torch.manual_seed(29)
     output_cotangent = torch.randn_like(output)
     state_cotangents = [torch.randn_like(value) for value in state]
-    state_cotangents[1] = 0.5 * (
-        state_cotangents[1] + state_cotangents[1].transpose(-1, -2)
-    )
     loss = (output * output_cotangent).sum() + sum(
         (value * cotangent).sum()
         for value, cotangent in zip(state, state_cotangents)
@@ -316,23 +326,19 @@ def test_native_forward_and_composed_state_vjp_match_fp64_oracle():
     expected_gradients = list(
         torch.autograd.grad(reference_loss, (*reference_leaves, *reference_state))
     )
-    expected_gradients[-3] = 0.5 * (
-        expected_gradients[-3] + expected_gradients[-3].transpose(-1, -2)
-    )
     for actual, expected in zip(gradients, expected_gradients):
         assert torch.isfinite(actual).all()
         relative = (actual.float() - expected.float()).norm()
         relative = relative / expected.float().norm().clamp_min(1e-8)
         assert relative < 3e-2
-    assert torch.equal(gradients[-3], gradients[-3].transpose(-1, -2))
 
 
 @CUDA_ONLY
 def test_native_aligned_recurrent_split():
     args = _native_inputs(length=32)
     whole_output, whole_state = solvedelta_native(*args, return_final_state=True)
-    first = tuple(value[:, :16] for value in args[:-1]) + (args[-1],)
-    second = tuple(value[:, 16:] for value in args[:-1]) + (args[-1],)
+    first = tuple(value[:, :16] for value in args)
+    second = tuple(value[:, 16:] for value in args)
     left_output, left_state = solvedelta_native(*first, return_final_state=True)
     right_output, right_state = solvedelta_native(
         *second, initial_state=left_state, return_final_state=True

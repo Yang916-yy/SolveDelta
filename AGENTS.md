@@ -63,68 +63,78 @@ Do not build a low-parallelism mega-kernel to remove a small HBM handoff.
 ## Current Operator Contract
 
 This repository maintains one operator and one production path. The current
-operator is the RLS moving-state recurrence in `causallsso/reference.py`. The
-older bounded-LDU generalized-Delta operator is available only as history at
-commit `2237875`; it is not a variant or compatibility target.
+operator is the relative Residual-Frame recurrence in
+`causallsso/reference.py`. The older bounded-LDU and RLS operators are Git
+history, not variants or compatibility targets.
 
 The geometry width is the resolved key-head width `r := d_k`. `r=128` is the
 first optimized profile, not a mathematical default. There is exactly one
-ordinary Delta edit per token (`K=1`). The fixed prior is
+ordinary Delta edit per token (`K=1`). The zero state is
 
 ```text
-m_0 = 2,  J_0 = 2I,  D_0 = 0,  S_0 = 0.
+C_0 = 0,  S_0 = 0.
 ```
 
-The FP32 continuation state is `(m,J,D,S)`. `J` is symmetric positive definite
-and currently stored as a full matrix. A supplied `J0` must be exactly
-symmetric; its full-tensor cotangent is represented by
-`(bar_J + bar_J^T) / 2`.
-
-For normalized geometry direction `u_t`, the geometry update is
+The FP32 continuation state is `(C,S)`. `C` is the residual predictor in the
+orientation `prediction = C u`; it is not an inverse, covariance, or
+accumulated absolute frame. For normalized geometry direction `u_t`, the
+predictor update is
 
 ```text
-m_t = lambda_t m_{t-1} + 1
-J_t = lambda_t J_{t-1} + u_t u_t^T
-D_t = lambda_t D_{t-1} + u_t h_t^T
-g_t = solve(J_t, u_t)
-p_t = solve(J_{t-1}, u_t)
-C_{t-1} = solve(J_{t-1}, D_{t-1})
-r_t = h_t - C_{t-1}^T u_t
-rho_t = m_{t-1} / m_t
-F_H,t = rho_t (lambda_t I + u_t p_t^T)
-F_C,t = I + g_t r_t^T.
+r_t = h_t - C_{t-1} u_t
+delta_t = gamma_t r_t
+C_t = C_{t-1} + delta_t u_t^T.
 ```
 
-Learned geometry strength interpolates both transports with identity:
+The token-local relative frame is
 
 ```text
-F_H,t(gamma) = I + gamma (F_H,t - I)
-F_C,t(gamma) = I + gamma (F_C,t - I).
+F_t = I + u_t delta_t^T
+den_t = 1 + delta_t^T u_t
+d_t = F_t k_t
+e_t = F_t^-T (erase_t * k_t)
+chi_t = F_t^-T q_t.
 ```
 
-The memory is transported by `F_H`, channel-decayed, transported by `F_C`,
-updated by one gated Delta edit, and read by the normalized query. Raw erase
-and write logits use `2 sigmoid(x)`. Query, geometry direction, and edit key
-are L2-normalized. The frontend applies independent depthwise causal conv4 plus
-SiLU to query, edit key, and edit value by default.
+The implementation uses the exact rank-one inverse-transpose action
+
+```text
+F_t^-T x = x - delta_t (u_t^T x) / den_t.
+```
+
+This preserves `e_t^T d_t = (erase_t*k_t)^T k_t` and makes the erase transition
+an exact local similarity transform. It does not claim that `F_t` is the
+accumulated absolute frame `I+X_t`.
+
+The memory is channel-decayed, updated by the conjugated Delta edit, and read
+through the same relative frame:
+
+```text
+S'_t = Diag(exp(log_alpha_t)) S_{t-1}
+z_t = write_t * v_t
+S_t = S'_t + d_t (z_t - S'_t^T e_t)^T
+o_t = S_t^T chi_t.
+```
+
+Raw erase and write logits use `2 sigmoid(x)`. Query, geometry direction, and
+edit key are L2-normalized. The frontend applies independent depthwise causal
+conv4 plus SiLU to query, edit key, and edit value by default. The token-local
+write rate is `gamma_t = sigmoid(geometry_raw_t + geometry_write_bias)`.
 
 At `gamma=0`, the memory path must reduce exactly at finite parameters to the
-ordinary gated Delta edit/read while `(m,J,D)` continues to update.
+ordinary gated Delta edit/read and `C` remains unchanged. The geometry write
+bias initializes to `-2` for every head. This is an initialization, not a
+clamp, threshold, or runtime fallback.
 
-At zero projected geometry input, model initialization deterministically
-spreads heads across `lambda in [0.985, 0.995]`; a single head uses `0.99`.
-This is an initialization, not a clamp or a runtime fallback. Every head remains
-learnable through the ordinary geometry gate.
-
-Masks leave state unchanged and return zero operator output. A valid reset
-restores the fixed prior before consuming that token. Recurrent splitting must
-preserve the same continuation semantics.
+Masks leave `(C,S)` unchanged and return zero operator output. A valid reset
+restores `(0,0)` before consuming that token. Recurrent splitting must preserve
+the same continuation semantics.
 
 ## Precision and Native Ownership
 
 - Public/raw vector operands and native outputs are BF16.
-- `(m,J,D,S)`, log-decays, effective mass, normalization/CG reductions,
-  sensitive divisions, and backward partials are FP32.
+- `(C,S)`, `gamma`, log-decays, normalization reductions, relative-frame
+  denominators, sensitive divisions, and backward partials are FP32.
 - Tensor Core pair/WY/state contractions use BF16 multiplicands and FP32
   accumulation.
 - A private FP16 panel requires a static range proof and a direct FP32-to-FP16
@@ -138,27 +148,29 @@ preserve the same continuation semantics.
 The selected dense CUDA path is:
 
 1. stride-aware FLA L2 normalization;
-2. paired MESA `Hkk/Hkv` scans for `J/D` and their strict transpose;
-3. fixed five-step matrix-free CG gain and implicit transpose;
-4. a scalar FP32 affine scan for effective mass;
-5. token-block `E=3` direct-`e` pair/WY/state/output owners with C32 geometry
-   chunks and C16 exterior chunks;
-6. matching output-owned reverse and source transpose.
+2. a C32 FLA gated-Oja pair/WY/state specialization for the residual predictor
+   and its strict transpose;
+3. fused generation of `d`, paired `(e,chi)`, and `z` directly in C16 exterior
+   panels;
+4. a TileLang direct-`e` pair owner plus FLA generalized-DPLR WY/state/output;
+5. matching output-owned reverse, pair transpose, source transpose, and
+   predictor transpose.
 
-The three micro-edits are private fixed slots, not a public `3T` sequence.
 Public fused-projection views may have arbitrary outer strides but require unit
-innermost vector stride. Do not restore public canonicalization copies.
+innermost vector stride. Packed private panels are implementation details, not
+public ABI.
 
 Dense CUDA BF16 is the optimized training surface. Masks and resets currently
-use the same RLS semantics through the model reference path; they must never
-fall back to the archived bounded-LDU operator.
+use the same Residual-Frame semantics through the model reference path; they
+must never fall back to an archived operator.
 
 ## Scope Boundaries
 
-Do not restore bounded-LDU, QRD, Neumann, flat `3T`, multiple-edit, inverse
-state, backend selectors, or abandoned private ABIs as maintained alternatives.
-An ablation may disable a component for a controlled experiment, but it must
-not create a second public model contract.
+Do not restore bounded-LDU, RLS, covariance state, CG, QRD, Neumann, flat
+`3T`, multiple-edit, inverse-frame state, backend selectors, or abandoned
+private ABIs as maintained alternatives. An ablation may disable a component
+for a controlled experiment, but it must not create a second public model
+contract.
 
 Parameters, `nn.Module` behavior, reference mathematics, and public variants
 must each have one owner. Avoid duplicate model classes or Python glue that
@@ -168,13 +180,15 @@ unpacks a chain of private VJPs.
 
 The minimum suite covers:
 
-- FP64 recurrence and the fixed SPD prior;
+- FP64 residual predictor and relative-frame recurrence;
 - masks, resets, recurrent splits, and a non-128 width;
 - the finite-parameter GDN2 reduction at `gamma=0`;
+- the exact local similarity and inverse-transpose identities;
 - raw gate activation;
-- native BF16 outputs and FP32 `(m,J,D,S)` against the FP64 oracle;
-- composed VJPs, including initial/final state and symmetric `J` convention;
-- the public model's dense native, mask/reset, cache, and loss paths.
+- native BF16 outputs and FP32 `(C,S)` against the FP64 oracle;
+- composed VJPs, including initial and final `(C,S)`;
+- the public model's dense native, mask/reset, cache, and loss paths;
+- fixed-shape CUDA Graph loss forward/backward against eager model gradients.
 
 Report performance as forward, backward, and F+B median/p95, with allocator
 peak and the exact shape/dtype/device. State whether a number covers the core

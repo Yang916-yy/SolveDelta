@@ -65,16 +65,10 @@ class SolveDelta(nn.Module):
             self.conv_weight = nn.Parameter(torch.empty(conv_width, 4))
             nn.init.kaiming_uniform_(self.conv_weight, a=5**0.5)
 
-        # Spread heads across stable long-memory scales without placing every
-        # head at the same initialization point. A single head uses the midpoint.
-        if heads == 1:
-            geometry_decay = torch.full((1,), 0.99, dtype=torch.float32)
-        else:
-            geometry_decay = torch.linspace(0.985, 0.995, heads, dtype=torch.float32)
-        geometry_step = -geometry_decay.log()
-        geometry_bias = geometry_step + torch.log(-torch.expm1(-geometry_step))
-        self.geometry_log_rate = nn.Parameter(torch.zeros(heads, dtype=torch.float32))
-        self.geometry_decay_bias = nn.Parameter(geometry_bias)
+        # The projected scalar is a token-local normalized-LMS write rate.
+        self.geometry_write_bias = nn.Parameter(
+            torch.full((heads,), -2.0, dtype=torch.float32)
+        )
 
         # Match the mature GDN2/Mamba decay initialization: a positive rate
         # and log-uniform step size, evaluated in FP32 by the gate owner.
@@ -90,15 +84,10 @@ class SolveDelta(nn.Module):
         self.associative_decay_bias = nn.Parameter(
             associative_step + torch.log(-torch.expm1(-associative_step))
         )
-        self.geometry_strength_logit = nn.Parameter(
-            torch.full((heads,), -2.0, dtype=torch.float32)
-        )
         for parameter in (
-            self.geometry_log_rate,
-            self.geometry_decay_bias,
+            self.geometry_write_bias,
             self.associative_log_rate,
             self.associative_decay_bias,
-            self.geometry_strength_logit,
         ):
             parameter._no_weight_decay = True
 
@@ -361,24 +350,12 @@ class SolveDelta(nn.Module):
         if native_inputs:
             from .ops.gates import fused_decay_gate
 
-            geometry_log_decay = fused_decay_gate(
-                geometry_raw,
-                self.geometry_log_rate.float(),
-                self.geometry_decay_bias.float(),
-            )
             associative_log_decay = fused_decay_gate(
                 associative_raw,
                 self.associative_log_rate.float().flatten(),
                 self.associative_decay_bias.float().flatten(),
             ).view(batch, length, heads, width)
         else:
-            geometry_log_decay = -torch.exp(
-                self.geometry_log_rate.float()
-            ).view(1, 1, heads)
-            geometry_log_decay = geometry_log_decay * F.softplus(
-                geometry_raw.float()
-                + self.geometry_decay_bias.float().view(1, 1, heads)
-            )
             associative_log_decay = -torch.exp(
                 self.associative_log_rate.float()
             ).view(1, 1, heads, width)
@@ -386,9 +363,12 @@ class SolveDelta(nn.Module):
                 associative_raw.float().view(batch, length, heads, width)
                 + self.associative_decay_bias.float().view(1, 1, heads, width)
             )
-        strength = torch.sigmoid(self.geometry_strength_logit)
+        geometry_write = torch.sigmoid(
+            geometry_raw.float()
+            + self.geometry_write_bias.float().view(1, 1, heads)
+        )
         if not geometry_enabled:
-            strength = torch.zeros_like(strength)
+            geometry_write = torch.zeros_like(geometry_write)
         if not associative_decay_enabled:
             associative_log_decay = torch.zeros_like(associative_log_decay)
 
@@ -400,11 +380,10 @@ class SolveDelta(nn.Module):
                 q.to(torch.bfloat16),
                 keys.to(torch.bfloat16),
                 values.to(torch.bfloat16),
-                geometry_log_decay.float(),
                 associative_log_decay.float(),
                 erase_raw.view(batch, length, heads, edits, width),
                 write_raw.view(batch, length, heads, edits, value_width),
-                strength.float(),
+                geometry_write.float(),
                 initial_state=operator_initial,
                 return_final_state=return_final_state,
             )
@@ -433,11 +412,10 @@ class SolveDelta(nn.Module):
                 q.to(reference_dtype),
                 keys.to(reference_dtype),
                 values.to(reference_dtype),
-                geometry_log_decay.to(reference_dtype),
                 associative_log_decay.to(reference_dtype),
                 erase.to(reference_dtype),
                 write.to(reference_dtype),
-                strength.to(reference_dtype),
+                geometry_write.to(reference_dtype),
                 initial_state=reference_initial,
                 valid_mask=valid_mask,
                 reset_mask=reset_mask,

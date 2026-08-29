@@ -1,284 +1,261 @@
 # SolveDelta Native Blueprint
 
-This document defines the sole current native implementation. The production
-operator is the RLS moving-state recurrence in `causallsso/reference.py`. The
-bounded-LDU implementation was archived at Git commit `2237875` and is not a
-fallback, ABI, or acceptance source.
+This document defines the sole current native implementation. Executable
+mathematics belongs to `causallsso/reference.py`. The production operator is
+relative Residual-Frame SolveDelta; the former bounded-LDU and RLS operators
+are Git history, not fallbacks or compatibility targets.
 
 ## 1. Public surface
 
-For batch `B`, length `T`, heads `H`, key width `r`, and value width `V`:
+For batch `B`, length `T`, heads `H`, key width `r`, and value width
+`V`:
 
 ```text
 u,h,q                 [B,T,H,r]
 k,v                   [B,T,H,1,r] / [B,T,H,1,V]
-log_lambda            [B,T,H]
 log_alpha             [B,T,H,r]
 erase_raw,write_raw   shapes of k,v
-gamma                 [H]
-m0,J0,D0,S0           [B,H], [B,H,r,r], [B,H,r,r], [B,H,r,V]
-output                 [B,T,H,V]
+gamma                 [B,T,H]
+C0,S0                 [B,H,r,r], [B,H,r,V]
+output                [B,T,H,V]
 ```
 
-The native vector operands and output are BF16. Log gates, `gamma`, and all
-continuation states are FP32. `K=1`, prior mass is `2`, geometry chunk size is
-32, exterior token chunk size is 16, and the gain action uses five CG steps.
-These constants are one selected production implementation, not runtime
-backend choices.
+The native vector operands and output are BF16. `log_alpha`, `gamma`, and
+both continuation states are FP32. `K=1`; predictor chunks use C32 and the
+memory exterior uses C16. These chunk sizes are selected schedules, not model
+semantics or public layout.
 
-`J0` is symmetric positive definite. Its stored representation is full FP32.
-The cotangent returned for the symmetric state is
+The predictor is stored in the orientation
 
 ```text
-bar_J0 <- (bar_J0 + bar_J0^T) / 2.
+prediction = C u.
 ```
 
-### 1.1 Geometry-decay initialization
-
-The model frontend initializes the zero-input geometry decay deterministically
-across heads. For head index `h`:
-
-```text
-lambda_init[h] = 0.99                              if H = 1
-lambda_init[h] = 0.985 + 0.010 h / (H - 1)        otherwise.
-```
-
-With the frontend parameterization
-
-```text
-log_lambda = -exp(geometry_log_rate) *
-             softplus(geometry_raw + geometry_decay_bias),
-```
-
-initialization sets `geometry_log_rate=0` and
-
-```text
-geometry_decay_bias[h] = softplus^-1(-log(lambda_init[h])).
-```
-
-This is a model initialization only. It adds no clamp, threshold, runtime
-fallback, or new native ABI; projected token input and learned parameters may
-move every head throughout the existing `(0,1)` decay domain.
+It is neither a covariance nor an inverse state. The zero continuation is
+`C0=0,S0=0`.
 
 ## 2. Token recurrence
 
-Normalize
+Normalize `u`, `q`, and `k` in the last dimension. Activate raw gates as
 
 ```text
-u <- u / ||u||_2
-q <- q / ||q||_2
-k <- k / ||k||_2
-b <- 2 sigmoid(erase_raw) elementwise-multiplied by k
-z <- 2 sigmoid(write_raw) elementwise-multiplied by v.
+b = 2 sigmoid(erase_raw) * k
+z = 2 sigmoid(write_raw) * v.
 ```
 
-The geometry state updates once:
+The residual predictor update is
 
 ```text
-lambda = exp(log_lambda_t)
-m_t = lambda m_prev + 1
-J_t = lambda J_prev + u u^T
-D_t = lambda D_prev + u h^T.
+r = h - C_prev u
+delta = gamma r
+C = C_prev + delta u^T.
 ```
 
-Define the RLS quantities
+Because `u` is normalized, the just-observed residual becomes
+`(1-gamma)r`. Orthogonal source directions are unchanged. No full-state
+forgetting factor, covariance, ridge, or linear solve is part of this model.
+
+The token-local relative frame and its exact inverse-transpose action are
 
 ```text
-g = solve(J_t, u)
-p = solve(J_prev, u)
-C_prev = solve(J_prev, D_prev)
-r_h = h - C_prev^T u
-rho = m_prev / m_t.
+F = I + u delta^T
+den = 1 + delta^T u
+F^-T x = x - delta (u^T x) / den.
 ```
 
-The two exact rank-one transport factors are
+The three public source actions are
 
 ```text
-F_H = rho (lambda I + u p^T)
-F_C = I + g r_h^T.
+d   = F k
+e   = F^-T b
+chi = F^-T q.
 ```
 
-Geometry strength interpolates each factor with identity:
+Therefore
 
 ```text
-F_H_gamma = I + gamma (F_H - I)
-F_C_gamma = I + gamma (F_C - I).
+e^T d = b^T k
+I - d e^T = F (I - k b^T) F^-1.
 ```
 
-Memory update and read are
+This is an exact local similarity transform. `F_t` is a relative factor
+generated from the current residual; it is not the accumulated absolute frame
+`I+X_t`.
+
+The memory recurrence is
 
 ```text
-S_a = F_H_gamma S_prev
-S_b = Diag(exp(log_alpha_t)) S_a
-S_c = F_C_gamma S_b
-prediction = S_c^T b
-S_t = S_c + k (z - prediction)^T
-o_t = S_t^T q.
+S_decay = Diag(exp(log_alpha)) S_prev
+S = S_decay + d (z - S_decay^T e)^T
+o = S^T chi.
 ```
 
-At `gamma=0`, both geometry transports are identity and this is the ordinary
-gated Delta edit/read. Geometry state still advances so a later nonzero
-`gamma` observes the prefix.
+At finite `gamma=0`, `delta=0`, `F=I`, `C` is unchanged, and the memory
+path is exactly the ordinary gated Delta edit/read.
 
-## 3. RLS identities used by native code
+## 3. Chunk predictor
 
-The native source owner avoids separately solving `J_prev p=u` and
-`J_prev C_prev=D_prev`. From Sherman-Morrison identities, with
+For one chunk, stack source rows in `U`, target rows in `H`, and write rates
+in diagonal `Gamma`. Define `D_gamma=Gamma U`. With entry predictor `C0`,
 
 ```text
-den = 1 - u^T g,
+W = I + tril(U D_gamma^T, -1)
+R = W^-1 (H - U C0^T)
+C_out = C0 + (D_gamma^T R)^T.
 ```
 
-the required previous-state quantities are
+The stored implementation uses `C=X^T`, so equivalent transposes may appear
+in code. The production owner is a specialization of FLA gated Oja:
 
 ```text
-p = lambda g / den
-r_h = (h - updated_prediction) / den,
+FLA key    <- h
+FLA value  <- u
+FLA beta   <- gamma
+FLA state  <- C.
 ```
 
-where the MESA paired owner supplies `g` and the matching prediction
-`updated_prediction = h - den (h - C_prev^T u)`. The implementation must
-preserve the exact mapping in `reference.py`; these identities only remove
-redundant dense solves.
+Its pair GEMM, unit-lower triangular WY solve, state GEMM, chunk boundaries,
+and reverse schedule are retained. The unrelated Oja query/output branch is
+absent. Forward emits the token-local `delta` panel and final FP32 `C`.
+Reverse applies `W^-T` and returns final-shaped cotangents for
+`h,u,gamma,C0`; it does not differentiate through a Python token loop.
 
-The first transport is diagonal plus rank one:
+## 4. Relative source owner
+
+The source owner consumes normalized `u,q,k`, predictor update `delta`,
+raw erase/write logits, and value. Per token it evaluates
 
 ```text
-F_H_gamma = a I + d0 e0^T
-a  = 1 + gamma (rho lambda - 1)
-d0 = exp(log_alpha) * gamma rho/a * u
-e0 = -p / exp(log_alpha).
+den = 1 + delta^T u
+d = k + u (delta^T k)
+e = b - delta (u^T b) / den
+chi = q - delta (u^T q) / den
+z = 2 sigmoid(write_raw) * v.
 ```
 
-After absorbing `a` into the channel gate, the second transport and ordinary
-edit give three ordered generalized-Delta slots per token:
+Erase/write sigmoid arithmetic is evaluated in FP32 and rounded at the public
+BF16 gate boundary before multiplication. The owner writes exterior-native
+panels directly:
 
 ```text
-slot 0: (d0, e0)              geometry H transport
-slot 1: (gamma g, -r_h)       geometry C transport
-slot 2: (k, erase*k)          ordinary edit
+d           [panels,1,C16,r]
+paired e,q  [panels,2,C16,r]
+z           [B,T,H,V].
 ```
 
-The slot convention uses the generalized update `S <- S - d e^T S`; signs in
-the source panel above follow that convention. The ordinary slot additionally
-injects `k z^T`. This fixed `E=3` axis is kept inside token/chunk owners and is
-never exposed as a public `3T` sequence.
+There is no token-major `d/e/chi` HBM ABI followed by
+`cat/permute/contiguous`. The source transpose consumes the same panel
+cotangents, closes the shared denominator once, and writes one gradient for
+each public source.
 
-## 4. Forward ownership
+## 5. Memory exterior
 
-1. The stride-aware FLA L2Norm specialization loads the fused-projection `u`
-   view and writes a packed normalized panel. The E3 source owner directly
-   loads strided `q/k` and saves their FP32 reciprocal norms for transpose.
-2. The MESA paired state owner advances FP32 `J/D` chunk boundaries and emits
-   the matrix-free gain and updated prediction. The dense states are not built
-   per token in HBM.
-3. The FP32 mass affine scan emits previous/current mass and the final mass.
-4. The source owner directly loads strided `h/q/k/v` and raw erase/write
-   logits, evaluates `2 sigmoid` in FP32, rounds the gate to the declared BF16
-   public boundary in registers, and emits BF16 `[token,3,r]` direct and
-   `[token,4,r]` paired panels plus the write value. It computes scalar
-   denominators and diagonal logs in FP32. No activated gate panel is written.
-5. The C16 TileLang pair owner constructs strict `W`, read interaction `A`,
-   globally gauged direct/dual panels, and tail panels using 16x16 MMA tiles
-   with FP32 accumulators.
-6. The C48 WY owner solves the unit-lower interaction system and forms its
-   compact response. The inverse is stored only in the consumer dtype.
-7. The three action statistics use mature BF16 `bmm`/`baddbmm` epilogues:
-   Tensor Cores accumulate in FP32 and write the declared private BF16 panels
-   directly. No FP32 action-statistics HBM temporary or follow-up cast/add
-   kernel is part of the execution graph.
-8. Separate action-statistics and state/output owners preserve chunk/rank/value
-   CTA parallelism. They advance FP32 chunk boundary `S`, emit BF16 outputs,
-   and return FP32 final `S`.
-
-This boundary is selective fusion. Combining the state and output traversal
-into one sequence/head CTA was measured slower because it reduced the target
-from chunk/rank parallelism to eight long-lived CTAs.
-
-## 5. Reverse ownership
-
-Backward is the transpose of the selected blocks, not differentiation through
-an expanded sequence:
-
-1. The state/output reverse walks chunk boundaries in reverse, consumes
-   `bar_o` and `bar_S_final`, and produces final-shaped cotangents for WY,
-   pair statistics, write values, and `S0`.
-2. WY reverse applies the transpose unit-triangular action and closes the
-   compact interaction cotangent.
-3. Pair reverse owns each source output tile, streams all interaction
-   contributions, and accumulates Tensor Core products in FP32. It does not
-   materialize per-source full gradients or a `3T` checkpoint.
-4. The fused source transpose returns cotangents for normalized vectors, raw
-   gate logits, decay, mass, gain, prediction, and `gamma`. Its gate epilogues
-   reproduce the deleted BF16 intermediate rounding in registers. L2Norm VJPs
-   consume the exact rounded normalized panels saved by forward and write
-   compact final-shaped gradients for the original strided views.
-5. The MESA implicit transpose solves the adjoint gain action with the same
-   fixed CG5 schedule, reverses `Hkk/Hkv`, and returns final-shaped
-   `bar_u,bar_h,bar_log_lambda,bar_J0,bar_D0`.
-6. The mass transpose is a chunk affine reverse scan and returns
-   `bar_log_lambda,bar_m0`.
-7. Contributions to shared inputs and `log_lambda` are added only after each
-   owner has closed its private reduction. The returned `bar_J0` is
-   symmetrized exactly once.
-
-The native CG reverse is the implicit transpose action for the exact solve
-equations evaluated with the selected five-step numerical action. It does not
-backpropagate through five stored polynomial nodes.
-
-## 6. Precision map
+The exterior maps directly to FLA generalized DPLR with
 
 ```text
-BF16: public vector operands/output, E3/WY multiplicands and checkpoints
-FP32: m,J,D,S, log gates, gamma, norm and CG reductions, denominators,
-      mass scan, MMA accumulators, backward partials, continuation boundaries
+q = chi,  k = d,  a = e,  b = -d,  v = z,  scale = 1.
+```
+
+Production ownership is:
+
+1. an FP32 chunk cumsum for channel decay;
+2. a C16 TileLang direct-`e` pair owner for strict edit/read interactions;
+3. FLA fast-WY preparation and unit-lower action;
+4. FLA chunk boundary state and chunk-parallel output owners;
+5. the matching output/state, WY, pair, and decay transposes.
+
+The state owner advances FP32 chunk-boundary `S`; Tensor Core pair, WY, and
+state contractions use BF16 multiplicands with FP32 accumulation. Output is
+written BF16 and requested final `S` is FP32.
+
+This is selective fusion. Source generation and panelization are fused because
+they share ownership and delete a real HBM boundary. Predictor, pair/WY, state,
+and output remain separate where chunk/rank/value CTA parallelism is more
+valuable than eliminating a small handoff. Do not replace them with a
+sequence/head mega-kernel.
+
+## 6. Reverse graph
+
+Backward is the strict transpose of the composed forward blocks:
+
+1. output/state reverse walks chunk boundaries backward and consumes
+   `bar_o,bar_S_final`;
+2. fast-WY reverse applies the transpose triangular action;
+3. the direct-`e` pair transpose owns final source tiles and closes decay;
+4. the source transpose returns `bar_u,bar_delta,bar_q,bar_k,bar_v` and raw
+   gate cotangents;
+5. the gated-Oja transpose combines `bar_delta` with `bar_C_final` and
+   returns `bar_h,bar_u,bar_gamma,bar_C0`;
+6. L2Norm transposes return gradients to the original strided public views.
+
+No descriptor bundle, coordinate VJP, covariance replay, CG implicit
+transpose, expanded sequence, or dense inverse-state cotangent exists.
+Contributions to shared `u` close only after their independent owners have
+produced final-shaped gradients.
+
+## 7. Precision map
+
+```text
+BF16: public vector operands/output; pair, WY, and state multiplicands
+FP32: C,S,gamma,log_alpha,norm and denominator reductions, divisions,
+      Tensor Core accumulators, backward partials, continuation boundaries
 FP64: token oracle only
 ```
 
-No BF16-to-FP16 pseudo-promotion, runtime dtype branch, threshold, fallback,
-or data-dependent compensation is permitted. Low-level E3 helpers may retain
-FP16 templates for isolated diagnostics, but the public native path is BF16.
+The relative denominator has no artificial clamp, threshold, fallback, or
+data-dependent compensation. Its behavior is a model-state acceptance risk and
+must be measured directly. Private FP16 panels still require a static range
+proof and a direct FP32 producer; BF16-to-FP16 casting is not promotion.
 
-## 7. Layout and lifecycle
+## 8. Layout and lifecycle
 
-Public `u/h/q/k/v` and raw gate views retain the fused projection's row stride
-and require only unit innermost vector stride. The stride-aware L2Norm, MESA
-cross-moment/CG owners, E3 source owner, and their transposes load these views
-directly. Producer outputs (`u_normalized`, gain/prediction, E3 panels) remain
-packed private tensors for their matrix owners. Gate activation is
-generate-use-discard and never becomes an HBM ABI.
+Public fused-projection vector views may have arbitrary outer strides and
+require unit innermost vector stride. Native owners may pack private normalized
+or WY panels. Those layouts are not public ABI.
 
-The retained saved-tensor footprint is dominated by compact forward cache and
-FP32 reverse partials. Do not lower those tensors merely to reduce allocator
-metrics. A save-versus-recompute change needs a complete F+B A/B and identical
-production-observable gates. The selected training path reconstructs the
-2 MiB BF16 query-gauge panel from the saved paired source and FP32 cumulative
-gate immediately before state reverse; all larger panel-recompute candidates
-lost their complete F+B A/B. Unrequested final-state outputs do not materialize
-zero cotangents, and their public `J` symmetrization is skipped when the caller
-does not request the state.
+The only recurrent operator state is FP32 `(C,S)`. No `P^-T`, `J/D/m`,
+CG cache, or per-token dense matrix is saved. Forward caches are retained only
+when a complete F+B A/B beats local recomputation under the same VJP gate.
 
-## 8. Acceptance and benchmark
+Dense native currently requires lengths aligned to C16. Masks and resets use
+the same FP64/PyTorch recurrence through the model reference path. This is a
+performance limit, not a second operator.
+
+## 9. Acceptance and benchmark
 
 Hard gates:
 
-- FP64 recurrence, SPD prior, mask/reset, recurrent split, and `K=1` surface;
-- finite `gamma=0` GDN2 reduction;
-- symmetric `J` continuation and cotangent convention.
+- FP64 predictor recurrence and exact relative-frame action;
+- exact local similarity and finite `gamma=0` GDN2 reduction;
+- masks, resets, recurrent splits, `K=1`, and a non-128 reference width;
+- complete initial/final `(C,S)` composed VJP.
 
 Production-observable gates:
 
-- BF16 output and FP32 final `(m,J,D,S)` against quantized-input FP64 oracle;
-- complete VJP for every public input and initial/final state;
-- dense public layer forward/backward from real strided projection views.
+- BF16 output and FP32 final `(C,S)` against quantized-input FP64 oracle;
+- complete VJP for every public input and state endpoint;
+- dense projected layer forward/backward from real strided projection views;
+- fixed-shape CausalLM CUDA Graph loss and gradients against eager.
 
-Report the core operator and complete projected layer separately. At
-`B1,T1024,H8,r=V=128`, three 50-warmup/200-replay CUDA Graph runs measured the
-selected contiguous core at median `0.348--0.349 ms` forward and
-`1.081--1.085 ms` F+B. Their p95 ranges were `0.363--0.365 ms` and
-`1.124--1.297 ms`. The full projected layer measured median
-`0.545--0.551 ms` forward and `1.805 ms` F+B, with p95 ranges
-`0.568--0.726 ms` and `2.110--2.182 ms`. Capture-incremental allocation was
-`173.456 MiB` for inference and `120.046 MiB` for training. Unique core
-forward-saved storage was `75.47 MiB`; the complete eager training peak was
-`248.04 MiB`.
+At `B1,T1024,H8,r=V=128`, BF16 public operands and FP32 state, the
+panel-native production composition measured:
+
+```text
+eager forward median/p95  0.498 / 0.644 ms
+eager F+B median/p95      1.861 / 2.056 ms
+Graph forward median/p95  0.187 / 0.193 ms
+Graph F+B median/p95      0.717 / 0.918 ms
+eager allocator increment 105.1 MiB
+```
+
+These are core-operator measurements on the development RTX 5070 Ti, not
+complete mixer or causal-LM numbers. Benchmark reports must continue to state
+shape, dtype, device, scope, and execution mode.
+
+The complete projected mixer at the same shape measured Graph forward
+`0.406/0.518 ms` median/p95 and F+B `1.428/1.639 ms`, with about
+`120.0 MiB` capture-incremental training allocation.
+
+Model-level capture uses `SolveDeltaGraphedTrainingStep` around a fixed-shape
+loss-only CausalLM wrapper. The trainer owns optimizer steps, clipping,
+gradient accumulation, distributed reduction, and recapture policy.

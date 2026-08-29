@@ -1,11 +1,11 @@
-"""Public BF16 CUDA entry for the selected SolveDelta RLS path."""
+"""Public BF16 CUDA entry for Residual-Frame SolveDelta."""
 
 from __future__ import annotations
 
 import torch
 
 from ..reference import SolveDeltaState
-from .rls import solvedelta_rls_native
+from .residual_frame import solvedelta_residual_frame_native
 
 
 def solvedelta_native(
@@ -14,11 +14,10 @@ def solvedelta_native(
     q: torch.Tensor,
     keys: torch.Tensor,
     values: torch.Tensor,
-    geometry_log_decay: torch.Tensor,
     associative_log_decay: torch.Tensor,
     erase_raw: torch.Tensor,
     write_raw: torch.Tensor,
-    geometry_strength: torch.Tensor,
+    geometry_write: torch.Tensor,
     *,
     initial_state: SolveDeltaState | None = None,
     return_final_state: bool = False,
@@ -38,17 +37,16 @@ def solvedelta_native(
     ):
         raise ValueError("native vector operands require unit innermost stride")
 
-    output, final_state = solvedelta_rls_native(
+    output, final_state = solvedelta_residual_frame_native(
         u,
         h,
         q,
         keys,
         values,
-        geometry_log_decay,
         associative_log_decay,
         erase_raw,
         write_raw,
-        geometry_strength,
+        geometry_write,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )

@@ -1,91 +1,140 @@
 # SolveDelta Research Program
 
-This document explains the current RLS SolveDelta operator. It does not define
-a second recurrence; executable mathematics belongs to
+This document explains the current relative Residual-Frame operator. It does
+not define a second recurrence; executable mathematics belongs to
 `causallsso/reference.py`.
 
-## Geometry as online regression
+## Residual geometry
 
-The states
-
-```text
-J_t = lambda_t J_{t-1} + u_t u_t^T
-D_t = lambda_t D_{t-1} + u_t h_t^T
-```
-
-are a decayed covariance and cross moment. Their natural coordinate is
+SolveDelta observes a normalized direction `u_t` and target `h_t`. Its
+geometry state is an online linear predictor:
 
 ```text
-C_t = J_t^-1 D_t.
+r_t = h_t - C_{t-1} u_t
+delta_t = gamma_t r_t
+C_t = C_{t-1} + delta_t u_t^T.
 ```
 
-With `g_t=J_t^-1u_t`, Sherman-Morrison gives the exact RLS update
+This is normalized LMS, or equivalently an ungated Oja-style residual update
+under a change of variable names. Since `||u_t||=1`, the residual on the
+observed direction immediately becomes `(1-gamma_t)r_t`. A large residual
+writes quickly, a small residual writes little, and directions orthogonal to
+`u_t` are unaffected.
+
+Unlike the former RLS route, there is no covariance that is globally
+multiplied by a forgetting factor and later inverted. The model therefore has
+no persistent-excitation requirement, SPD prior, covariance windup, or CG
+accuracy contract. History is stored directly in the predictor's solution
+coordinates.
+
+The predictor still has full `r^2` state capacity. Each token contributes one
+rank-one update; products and sums across tokens can populate the full matrix.
+This is a statement about reachable state rank, not a claim that one token has
+`r^2` instantaneous degrees of freedom.
+
+## Relative frame
+
+The current operator does not use `P_t=I+X_t` as a dense accumulated frame.
+Instead, the current residual generates one relative factor:
 
 ```text
-C_t = C_{t-1} + g_t (h_t - C_{t-1}^T u_t)^T.
+F_t = I + u_t delta_t^T.
 ```
 
-This converts a dense geometry change into a rank-one innovation. The
-effective mass
+Its inverse transpose is exact by Sherman-Morrison:
 
 ```text
-m_t = lambda_t m_{t-1} + 1
+F_t^-T x =
+    x - delta_t (u_t^T x) / (1 + delta_t^T u_t).
 ```
 
-tracks the normalization of the covariance state and supplies the matching
-history transport.
-
-The model does not initialize every head at one identical history scale. At
-zero projected gate input, multiple heads are deterministically spread from
-`lambda=0.985` to `0.995`; a single head uses `0.99`. Their initial EMA-style
-effective horizons therefore span roughly `67` to `200` tokens instead of
-collapsing to one horizon near `100`. This distribution keeps the SPD prior
-alive while the rank-128 state acquires geometry, but it is not a bound: the
-ordinary learned gate remains token-dependent.
-
-## Moving-state Delta rule
-
-The memory is transported by two identity-plus-rank-one factors before the
-ordinary Delta edit:
+The ordinary edit key, erase covector, and query are mapped as
 
 ```text
-history transport -> channel decay -> RLS innovation transport -> Delta edit
+d_t   = F_t k_t
+e_t   = F_t^-T (erase_t * k_t)
+chi_t = F_t^-T q_t.
 ```
 
-Each factor is a generalized-Delta update. Therefore a token is represented by
-the ordered composition of two geometry transports and one ordinary edit.
-This composition does not change the model's public token axis.
+This gives the exact local identities
 
-This is the current model, not an algebraically exact implementation of the
-archived bounded-LDU chart. It gives up that chart's full local differential
-rank in exchange for rank-one transport structure and practical latency. The
-expressivity tradeoff must be evaluated by training, not hidden behind the
-older model's claims.
+```text
+e_t^T d_t = (erase_t*k_t)^T k_t
+I-d_t e_t^T = F_t (I-k_t(erase_t*k_t)^T) F_t^-1.
+```
 
-## Exact reductions
+The residual predictor can learn gradually while every realized edit remains
+an exact similarity transform. No inverse frame is carried across chunks.
 
-At finite `gamma=0`, both geometry transports become identity. The memory path
-is then exactly the ordinary gated Delta edit/read, including normalized key,
-paired erase covector, channel decay, and post-edit query. This is the required
-GDN2 reduction.
+## Memory rule
 
-The fixed RLS prior keeps `J` SPD and the gain defined from the first token.
-Masks preserve state, resets restore that prior, and recurrent splits carry the
-same continuation state into the next segment.
+After channel decay, the memory uses the transformed Delta edit:
+
+```text
+S'_t = Diag(exp(log_alpha_t)) S_{t-1}
+z_t = write_t * v_t
+S_t = S'_t + d_t (z_t - S'_t^T e_t)^T
+o_t = S_t^T chi_t.
+```
+
+At `gamma_t=0`, `delta_t=0` and `F_t=I`. If the whole layer has
+`gamma=0`, `C` remains fixed and the memory path is exactly the ordinary
+gated Delta edit/read. This is a finite-parameter structural reduction, not a
+limit argument.
+
+## Why it maps to mature kernels
+
+The predictor is FLA gated Oja with renamed operands and no vector decay:
+
+```text
+target <- h
+source <- u
+beta   <- gamma
+state  <- C.
+```
+
+Within a chunk it is pair GEMM, unit-lower WY solve, and state GEMM. The
+relative frame is identity plus rank one, and the memory update is a
+generalized-Delta/DPLR transition. Its forward and strict transpose therefore
+reuse the same pair, WY, state, output, and output-owner reverse families used
+by FLA rather than introducing a tokenwise dense solve.
+
+This equivalence concerns concrete computation blocks. SolveDelta still owns
+the operand mapping, local similarity contract, composition, public state, and
+precision boundaries.
+
+## Expressivity
+
+Residual-Frame and RLS can write the same one-token predictor update direction
+when their gains coincide, but they select that direction differently:
+
+- RLS rotates and scales the observation by an inverse covariance;
+- Residual-Frame writes the observed normalized direction directly with a
+  learned token-local rate.
+
+Residual-Frame may need repeated correlated observations where an ideal RLS
+gain would take a larger one-step move. In exchange, it does not lose a prior
+or unobserved subspace through repeated decay, and it avoids making
+invertibility of a decayed covariance part of model semantics.
+
+The archived bounded-LDU operator had full-rank instantaneous chart
+derivatives. Residual-Frame does not reproduce that operator. Its hypothesis is
+that full predictor state accumulated through fast rank-one residual writes,
+plus exact local primal/dual actions, is a better quality/latency trade.
 
 ## Open limitations
 
-- The native CG5 action approximates the exact FP64 gain solve. Its usefulness
-  depends on remaining inside the declared BF16-observable output, state, and
-  composed-VJP envelope.
-- Two rank-one RLS transports have less local differential rank than the
-  archived bounded-LDU chart. Whether the cheaper structure is sufficient is
-  an empirical training question.
-- Compared with ordinary GDN2, SolveDelta necessarily pays for covariance,
-  cross-moment, effective-mass, and two geometry transports. Their value must
-  be justified by model quality, not kernel novelty alone.
-- Masks, resets, and recurrent cache semantics are defined, but optimized
-  packed training and decode remain open implementation work.
+- The scalar `1+delta_t^T u_t` has no structural positive lower bound.
+  Training must monitor its distribution and the realized relative-frame
+  condition number. Production must not hide failure with a clamp or fallback.
+- The optimized dense path currently requires C16-aligned sequence lengths.
+  Masks, resets, and irregular segments use the reference path.
+- The predictor uses one rank-one write per token. Whether a second residual
+  slot improves quality enough to justify its cost is an empirical model
+  question, not an implementation equivalence.
+- Compared with GDN2, SolveDelta pays for the predictor and relative source
+  actions. Their value must be established by matched training, not by kernel
+  novelty or state-rank arguments alone.
 
-These are current facts, not invitations to restore archived paths or add
-runtime backend selectors.
+These limitations are research questions. They are not invitations to restore
+RLS, bounded-LDU, inverse state, or runtime backend selectors.

@@ -57,8 +57,8 @@ def _state_from_cache(last_state: dict[str, Any] | None) -> SolveDeltaLayerState
     recurrent_state = last_state.get("recurrent_state")
     if recurrent_state is None:
         return None
-    if not isinstance(recurrent_state, (tuple, list)) or len(recurrent_state) != 4:
-        raise ValueError("SolveDelta cache recurrent_state must contain (m,J,D,S)")
+    if not isinstance(recurrent_state, (tuple, list)) or len(recurrent_state) != 2:
+        raise ValueError("SolveDelta cache recurrent_state must contain (predictor,S)")
     return SolveDeltaLayerState(
         operator=SolveDeltaState(*recurrent_state),
         conv=last_state.get("conv_state"),

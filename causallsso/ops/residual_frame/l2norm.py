@@ -1,3 +1,4 @@
+# Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026 SolveDelta contributors
 # SPDX-License-Identifier: MIT
 """FLA L2Norm specialized for fused-projection views.

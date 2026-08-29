@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
@@ -10,6 +12,7 @@ from causallsso import (
     SolveDelta,
     SolveDeltaConfig,
     SolveDeltaForCausalLM,
+    SolveDeltaGraphedTrainingStep,
     SolveDeltaModel,
 )
 
@@ -55,16 +58,13 @@ def test_huggingface_checkpoint_roundtrip(tmp_path):
     torch.manual_seed(2)
     model = SolveDeltaForCausalLM(_tiny_config(num_hidden_layers=1))
     mixer = model.model.layers[0].mixer.mixer
-    initial_geometry_decay = torch.exp(
-        -mixer.geometry_log_rate.exp()
-        * torch.nn.functional.softplus(mixer.geometry_decay_bias)
-    )
-    expected_geometry_decay = torch.linspace(
-        0.985, 0.995, model.config.num_heads
+    initial_geometry_write = torch.sigmoid(mixer.geometry_write_bias)
+    expected_geometry_write = torch.full_like(
+        initial_geometry_write, torch.sigmoid(torch.tensor(-2.0))
     )
     torch.testing.assert_close(
-        initial_geometry_decay,
-        expected_geometry_decay,
+        initial_geometry_write,
+        expected_geometry_write,
         rtol=1e-6,
         atol=1e-6,
     )
@@ -78,13 +78,10 @@ def test_huggingface_checkpoint_roundtrip(tmp_path):
             num_hidden_layers=1,
         )
     )
-    single_head_decay = torch.exp(
-        -single_head.geometry_log_rate.exp()
-        * torch.nn.functional.softplus(single_head.geometry_decay_bias)
-    )
+    single_head_write = torch.sigmoid(single_head.geometry_write_bias)
     torch.testing.assert_close(
-        single_head_decay,
-        torch.full_like(single_head_decay, 0.99),
+        single_head_write,
+        torch.full_like(single_head_write, torch.sigmoid(torch.tensor(-2.0))),
         rtol=1e-6,
         atol=1e-6,
     )
@@ -141,19 +138,28 @@ def test_recurrent_cache_matches_unsplit_model_and_owns_fp32_state():
     assert len(left.past_key_values) == model.config.num_hidden_layers
     for layer_state in left.past_key_values:
         recurrent = layer_state["recurrent_state"]
-        assert len(recurrent) == 4
+        assert len(recurrent) == 2
         assert all(tensor.dtype == torch.float32 for tensor in recurrent)
-        assert recurrent[0].shape == (1, model.config.num_heads)
-        assert recurrent[1].shape[-2:] == (
+        assert recurrent[0].shape[-2:] == (
             model.config.resolved_head_k_dim,
             model.config.resolved_head_k_dim,
         )
-        assert torch.equal(recurrent[1], recurrent[1].transpose(-1, -2))
 
     with torch.no_grad():
         generated = model.generate(input_ids[:, :4], max_new_tokens=2, do_sample=False)
     assert torch.equal(generated[:, :4], input_ids[:, :4])
     assert 4 < generated.shape[1] <= 6
+
+
+def test_cuda_graph_training_rejects_fused_linear_loss_before_capture():
+    config = _tiny_config(
+        fuse_cross_entropy=False,
+        fuse_linear_cross_entropy=True,
+    )
+    model = SolveDeltaForCausalLM(config).train()
+    sample_ids = torch.randint(0, config.vocab_size, (1, 8))
+    with pytest.raises(ValueError, match="fused linear cross entropy"):
+        SolveDeltaGraphedTrainingStep(model, sample_ids, sample_ids)
 
 
 @CUDA_ONLY
@@ -195,5 +201,95 @@ def test_causal_lm_cuda_bf16_native_forward_backward(monkeypatch):
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
     mixer = model.model.layers[0].mixer.mixer
-    assert mixer.geometry_log_rate.dtype == torch.float32
+    assert mixer.geometry_write_bias.dtype == torch.float32
     assert mixer.associative_log_rate.dtype == torch.float32
+
+
+@CUDA_ONLY
+def test_causal_lm_cuda_graph_training_matches_eager():
+    torch.manual_seed(11)
+    config = _tiny_config(
+        hidden_size=128,
+        num_heads=1,
+        head_k_dim=128,
+        head_v_dim=128,
+        num_hidden_layers=1,
+        vocab_size=256,
+        fuse_norm=True,
+        fuse_swiglu=True,
+        fuse_cross_entropy=True,
+    )
+    eager_model = SolveDeltaForCausalLM(config).cuda().train()
+    graphed_model = copy.deepcopy(eager_model).train()
+    sample_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
+    graph_step = SolveDeltaGraphedTrainingStep(
+        graphed_model,
+        sample_ids,
+        sample_ids,
+    )
+
+    input_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
+    eager_model.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        eager_loss = eager_model(
+            input_ids=input_ids,
+            labels=input_ids,
+            use_cache=False,
+            return_dict=False,
+        )[0]
+    eager_loss.backward()
+
+    graphed_model.zero_grad(set_to_none=True)
+    graphed_loss = graph_step(input_ids, input_ids)
+    graphed_loss.backward()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graphed_loss, eager_loss, rtol=0, atol=0)
+    for (eager_name, eager_parameter), (graph_name, graph_parameter) in zip(
+        eager_model.named_parameters(), graphed_model.named_parameters()
+    ):
+        assert eager_name == graph_name
+        assert eager_parameter.grad is not None
+        assert graph_parameter.grad is not None
+        torch.testing.assert_close(
+            graph_parameter.grad,
+            eager_parameter.grad,
+            rtol=0,
+            atol=0,
+        )
+
+    eager_optimizer = torch.optim.SGD(eager_model.parameters(), lr=1e-3)
+    graph_optimizer = torch.optim.SGD(graphed_model.parameters(), lr=1e-3)
+    eager_optimizer.step()
+    graph_optimizer.step()
+
+    next_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
+    eager_model.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        next_eager_loss = eager_model(
+            input_ids=next_ids,
+            labels=next_ids,
+            use_cache=False,
+            return_dict=False,
+        )[0]
+    next_eager_loss.backward()
+
+    graphed_model.zero_grad(set_to_none=True)
+    next_loss = graph_step(next_ids, next_ids)
+    next_loss.backward()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(next_loss, next_eager_loss, rtol=0, atol=0)
+    for eager_parameter, graph_parameter in zip(
+        eager_model.parameters(), graphed_model.parameters()
+    ):
+        assert eager_parameter.grad is not None
+        assert graph_parameter.grad is not None
+        torch.testing.assert_close(
+            graph_parameter.grad,
+            eager_parameter.grad,
+            rtol=0,
+            atol=0,
+        )
+
+    with pytest.raises(ValueError, match="requires input shape"):
+        graph_step(next_ids[:, :16], next_ids[:, :16])
