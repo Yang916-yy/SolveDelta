@@ -107,7 +107,10 @@ class _RelativeExterior(torch.autograd.Function):
             grad_output,
             grad_final_state,
             ctx.chunk_size,
-            panel_gradient_dtype=torch.float32,
+            # These are final-shaped source cotangents, not cross-owner
+            # reduction partials. Both adjacent owners accumulate in FP32;
+            # BF16 keeps exponent range while halving this HBM handoff.
+            panel_gradient_dtype=torch.bfloat16,
         )
         source_gradients = relative_sources_backward(
             u,

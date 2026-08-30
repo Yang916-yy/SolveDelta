@@ -14,14 +14,14 @@ paths.
 
 | Scope | Path | Forward | F+B | Graph allocated |
 | --- | --- | ---: | ---: | ---: |
-| Core operator | SolveDelta | 0.175 / 0.182 | 0.635 / 0.645 | 61.1 MiB |
-| Core operator | FLA GDN2 | 0.108 / 0.124 | 0.464 / 0.476 | 46.0 MiB |
-| Projected mixer | SolveDelta | 0.425 / 0.434 | 1.493 / 1.861 | 247.7 MiB |
-| Projected mixer | FLA GDN2 | 0.366 / 0.380 | 1.272 / 1.450 | 233.2 MiB |
+| Core operator | SolveDelta | 0.172 / 0.178 | 0.611 / 0.793 | 58.1 MiB |
+| Core operator | FLA GDN2 | 0.107 / 0.112 | 0.467 / 0.643 | 46.0 MiB |
+| Projected mixer | SolveDelta | 0.430 / 0.603 | 1.435 / 1.623 | 245.8 MiB |
+| Projected mixer | FLA GDN2 | 0.364 / 0.534 | 1.276 / 1.468 | 233.2 MiB |
 
 The core comparison exposes all predictor and relative-source work, so its
 percentage gap is larger. Common projection, conv4, normalization, gating, and
-output work reduce the projected-mixer gap to about `16%` forward and `17%`
+output work reduce the projected-mixer gap to about `18%` forward and `12%`
 F+B. The mixer boundary excludes the MLP, LM head, optimizer, gradient clipping,
 and distributed communication.
 
@@ -31,8 +31,44 @@ projected-mixer rows are the primary hidden-to-hidden comparison.
 
 Graph reserved memory is intentionally omitted: independent capture pools and
 allocator buckets changed it across otherwise identical runs. Allocated bytes
-were stable. The projected mixers contain `8.94M` SolveDelta parameters and
+were stable. The projected mixers contain `8.99M` SolveDelta parameters and
 `6.83M` GDN2 parameters at this width.
+
+The synchronized per-replay p95 samples above include a roughly `0.17 ms`
+device P-state tail in both F+B paths and in both mixer forwards. Medians and
+minimums remained stable; the tail is reported rather than filtered.
+
+## Projection and accumulation A/B
+
+At the same projected-mixer shape, padding the fused input projection's
+physical row from `7432` to `7488` reduced Graph F+B from `1.477` to
+`1.442 ms` in an interleaved A/B. Output bits and all logical parameter
+gradients were identical; the upstream hidden gradient changed by `0.373%`
+relative from the low-precision GEMM reduction order. The 56 unused FP32 rows
+cost `0.219 MiB` per layer before optimizer state.
+
+Grouping the two `[1024,128] -> [1024,1024]` decay and output-gate projections
+did not recover their launch bound. Complete two-projection F+B measured
+`172.9 us` for independent `F.linear` calls and `210.0 us` for
+`grouped_mm`, including the required strided-input and weight packing plus the
+separate bias epilogue. The grouped candidate was rejected.
+
+For a one-layer `D=1024,H=8,T=1024,vocab=4096` CausalLM Graph, an
+optimizer-bound BF16 Linear shadow produced the following complete
+microbatch-accumulation step times. Each shadow row includes one refresh:
+
+| Accumulation | FP32 master autocast | BF16 shadow | Change |
+| ---: | ---: | ---: | ---: |
+| 1 | 2.939 ms | 2.971 ms | +1.1% |
+| 2 | 6.199 ms | 6.100 ms | -1.6% |
+| 4 | 13.048 ms | 12.631 ms | -3.2% |
+| 8 | 26.668 ms | 25.574 ms | -4.1% |
+
+Loss was bitwise identical and the maximum parameter-gradient relative error
+was `7.4e-8`. The shadow added `41.63 MiB` of buffers and about `43.63 MiB`
+to post-capture allocation; measured capture peak increased by `27.5 MiB`.
+It is therefore an explicit accumulation throughput option, not a default or
+a memory optimization.
 
 ## Exploratory 200M-token comparison
 

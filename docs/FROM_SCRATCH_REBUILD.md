@@ -135,7 +135,10 @@ absent. Forward emits the token-local `delta` panel and final FP32 `C`.
 Reverse applies `W^-T` and returns final-shaped cotangents for
 `h,u,gamma,C0`; it does not differentiate through a Python token loop. The
 ungated specialization removes FLA's otherwise mandatory zero vector-gate
-panel and reads strided target views directly.
+panel and reads strided target views directly. At the optimized `r=128`
+profile, reverse owns 32 predictor rows per CTA. Compared with the former
+64-row tile, this preserves identical arithmetic while doubling CTA
+parallelism and reducing the compiled register/shared-memory footprint.
 
 ## 4. Relative source owner
 
@@ -144,13 +147,19 @@ The source owner consumes normalized `u`, raw strided `q/k`, predictor update
 generates and discards `phi` in the same CTA:
 
 ```text
-phi = rho delta / sqrt(rho^2 + ||u||^2 ||delta||^2)
+phi = rho delta / sqrt(rho^2 + ||delta||^2)  # ||u||=1
 den = 1 + phi^T u
 d = k + u (phi^T k)
 e = b - phi (u^T b) / den
 chi = q - phi (u^T q) / den
 z = sigmoid(write_raw) * v.
 ```
+
+The shortened radial formula is not an approximation: the unique upstream
+L2Norm owner establishes `||u||=1` in the composed operator. Its omitted
+purely radial `bar_u` term lies in the null direction of that owner's strict
+transpose. This removes a repeated BF16-rounded norm and slightly improves the
+production-observable oracle/VJP error.
 
 Q/key norm reductions, frame actions, and erase/write sigmoid arithmetic are
 evaluated in FP32. The bounded frame gives a static range proof for the private
@@ -197,8 +206,12 @@ retaining RMSNorm's stable coordinate normalization. CUDA uses FLA
 `fused_kda_gate` and a specialization of FLA's fused RMSNorm-gate row owner.
 The owner reuses resident FP32 `rstd`; its strict transpose adds the exact
 radial `grad_o` and `grad_a` before the final output store. The CPU/FP64 model
-path evaluates the same formulas explicitly. No raw-output or norm panel is
-added to the HBM ABI.
+path evaluates the same formulas explicitly. The output projection follows
+FLA's norm-linear lifetime ownership: forward does not checkpoint the 2 MiB
+normalized output panel, and the existing norm transpose regenerates it for
+the ordinary Tensor Core weight-gradient GEMM. The GEMM is not fused into the
+Triton row owner. No raw-output or norm panel is added to the persistent HBM
+ABI.
 
 ## 5. Memory exterior
 
@@ -255,10 +268,16 @@ transpose, expanded sequence, or dense inverse-state cotangent exists.
 Contributions to shared `u` close only after their independent owners have
 produced final-shaped gradients.
 
+The pair transpose and source transpose each accumulate in FP32. Their
+single-consumer, final-shaped cotangent handoff is BF16, reducing this backward
+interface from 12 MiB to 6 MiB at the optimized profile. It is not a
+cross-owner partial reduction.
+
 ## 7. Precision map
 
 ```text
-BF16: public vector operands/output; decay-scaled DPLR, WY, and state multiplicands
+BF16: public vector operands/output; decay-scaled DPLR, WY, and state multiplicands;
+      final-shaped pair-to-source cotangent handoff
 FP16: statically bounded source-native d/e/chi panels, written directly from FP32
 FP32: C,S,erase/write gates,gamma,log_alpha,norm/radial and denominator reductions, divisions,
       Tensor Core accumulators, backward partials, continuation boundaries
@@ -275,7 +294,18 @@ casting is not promotion.
 
 Public fused-projection vector views may have arbitrary outer strides and
 require unit innermost vector stride. Native owners may pack private normalized
-or WY panels. Those layouts are not public ABI.
+or WY panels. The fused input projection pads its physical output row to a
+multiple of 64 and exposes only the logical prefix. At the optimized profile,
+`7432 -> 7488` improves the Tensor Core projection transpose while also
+satisfying causal-conv1d's multiple-of-eight stride requirement. Those layouts
+and padding rows are not public operator ABI.
+
+Fixed-shape Graph training may bind an optimizer-step BF16 shadow for every
+FP32 Linear master. The shadows are nonpersistent buffers and their strict
+Linear transpose returns FP32 master gradients. An optimizer post-step hook
+refreshes all shadows once, outside capture; replay rejects a stale shadow.
+This is selected only for gradient accumulation because factor-one refresh
+cost exceeds the saved casts.
 
 The only recurrent operator state is FP32 `(C,S)`. No `P^-T`, `J/D/m`,
 CG cache, or per-token dense matrix is saved. Forward caches are retained only
@@ -307,11 +337,11 @@ At `B1,T1024,H8,r=V=128`, BF16 public operands and FP32 state, the
 panel-native production composition measured:
 
 ```text
-eager forward median/p95  0.419 / 0.724 ms
-eager F+B median/p95      1.713 / 2.147 ms
-Graph forward median/p95  0.175 / 0.180 ms
-Graph F+B median/p95      0.636 / 0.671 ms
-eager allocator increment 79.5 MiB
+eager forward median/p95  0.412 / 0.538 ms
+eager F+B median/p95      1.476 / 1.663 ms
+Graph forward median/p95  0.172 / 0.178 ms
+Graph F+B median/p95      0.611 / 0.793 ms
+Graph allocated           58.1 MiB
 ```
 
 These are core-operator measurements on the development RTX 5070 Ti, not
@@ -319,9 +349,11 @@ complete mixer or causal-LM numbers. Benchmark reports must continue to state
 shape, dtype, device, scope, and execution mode.
 
 The complete projected mixer at the same shape, using FP32 master parameters
-and BF16 autocast, measured Graph forward `0.426/0.432 ms` median/p95 and F+B
-`1.500/1.882 ms`. The mixer has `8.94M` parameters versus `9.46M` before
-low-rank decay and output gating.
+and BF16 autocast, measured Graph forward `0.430/0.603 ms` median/p95 and F+B
+`1.435/1.623 ms`, with `245.8 MiB` Graph allocation. The synchronized p95
+samples in this run include the same roughly `0.17 ms` P-state tail observed
+for the matched GDN2 run. The mixer has `8.99M` parameters versus `9.46M`
+before low-rank decay and output gating.
 
 The matched FLA GDN2 comparison and exploratory model evidence are maintained
 in `docs/RESULTS.md`; they do not alter this implementation contract.

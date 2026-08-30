@@ -131,6 +131,9 @@ def test_gdn2_gates_and_low_rank_kda_decay_parameterization():
     assert mixer.projection_sizes == (
         32, 32, 32, 32, 32, 32, 32, 2, 16, 16
     )
+    assert mixer.projection_width == 258
+    assert mixer.projection_padding == 62
+    assert mixer.in_proj.out_features == 320
     assert mixer.decay_proj.weight.shape == (32, 16)
     assert mixer.output_gate_proj.weight.shape == (32, 16)
     assert mixer.output_gate_proj.bias.shape == (32,)
@@ -362,8 +365,87 @@ def test_causal_lm_cuda_graph_training_matches_eager():
 @pytest.mark.filterwarnings(
     "error:The AccumulateGrad node's stream does not match.*"
 )
+def test_cuda_graph_bf16_shadows_refresh_once_per_optimizer_step():
+    torch.manual_seed(19)
+    config = _tiny_config(
+        hidden_size=128,
+        num_heads=1,
+        head_k_dim=128,
+        head_v_dim=128,
+        num_hidden_layers=1,
+        vocab_size=256,
+        fuse_norm=True,
+        fuse_swiglu=True,
+        fuse_cross_entropy=True,
+    )
+    eager_model = SolveDeltaForCausalLM(config).cuda().train()
+    graphed_model = copy.deepcopy(eager_model).train()
+    optimizer = torch.optim.SGD(graphed_model.parameters(), lr=1e-3)
+    sample_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
+    graph_step = SolveDeltaGraphedTrainingStep(
+        graphed_model,
+        sample_ids,
+        sample_ids,
+        bf16_shadow_optimizer=optimizer,
+    )
+    assert graph_step.bf16_shadow_bytes > 0
+    assert not any(
+        "_bf16_shadow" in name for name in graphed_model.state_dict()
+    )
+
+    input_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
+    eager_model.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        eager_loss = eager_model(
+            input_ids=input_ids,
+            labels=input_ids,
+            use_cache=False,
+            return_dict=False,
+        )[0]
+    eager_loss.backward()
+
+    optimizer.zero_grad(set_to_none=True)
+    graphed_loss = graph_step(input_ids, input_ids)
+    graphed_loss.backward()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graphed_loss, eager_loss, rtol=0, atol=0)
+    for eager_parameter, graph_parameter in zip(
+        eager_model.parameters(), graphed_model.parameters()
+    ):
+        assert eager_parameter.grad is not None
+        assert graph_parameter.grad is not None
+        relative = (
+            (graph_parameter.grad.float() - eager_parameter.grad.float()).norm()
+            / eager_parameter.grad.float().norm().clamp_min(1e-20)
+        )
+        assert relative < 5e-3
+        assert graph_parameter.grad.dtype == torch.float32
+
+    optimizer.step()
+    in_proj = graphed_model.model.layers[0].mixer.mixer.in_proj
+    assert torch.equal(
+        in_proj._bf16_shadow_weight,
+        in_proj.weight.to(torch.bfloat16),
+    )
+
+    optimizer.zero_grad(set_to_none=True)
+    graph_step(input_ids, input_ids).backward()
+    with torch.no_grad():
+        in_proj.weight.add_(1e-3)
+    with pytest.raises(RuntimeError, match="shadow weights are stale"):
+        graph_step(input_ids, input_ids)
+    graph_step.refresh_bf16_shadow_weights()
+    graph_step(input_ids, input_ids).backward()
+
+
+@CUDA_ONLY
+@pytest.mark.filterwarnings(
+    "error:The AccumulateGrad node's stream does not match.*"
+)
+@pytest.mark.parametrize("use_bf16_shadows", (False, True))
 def test_causal_lm_cuda_graph_training_with_single_rank_ddp(
     tmp_path,
+    use_bf16_shadows,
 ):
     if not dist.is_nccl_available():
         pytest.skip("NCCL is required for distributed CUDA Graph training")
@@ -391,6 +473,7 @@ def test_causal_lm_cuda_graph_training_with_single_rank_ddp(
         )
         eager_model = SolveDeltaForCausalLM(config).cuda().train()
         graphed_model = copy.deepcopy(eager_model).train()
+        optimizer = torch.optim.SGD(graphed_model.parameters(), lr=1e-3)
         sample_ids = torch.randint(
             0, config.vocab_size, (1, 32), device="cuda"
         )
@@ -405,6 +488,7 @@ def test_causal_lm_cuda_graph_training_with_single_rank_ddp(
                 sample_ids,
                 sample_ids,
                 distributed=True,
+                bf16_shadow_optimizer=(optimizer if use_bf16_shadows else None),
             )
             assert graph_step.distributed
             with graph_step.no_sync():
@@ -438,12 +522,22 @@ def test_causal_lm_cuda_graph_training_with_single_rank_ddp(
                 ):
                     assert eager_parameter.grad is not None
                     assert graph_parameter.grad is not None
-                    torch.testing.assert_close(
-                        graph_parameter.grad,
-                        eager_parameter.grad,
-                        rtol=0,
-                        atol=0,
-                    )
+                    if use_bf16_shadows:
+                        relative = (
+                            (
+                                graph_parameter.grad.float()
+                                - eager_parameter.grad.float()
+                            ).norm()
+                            / eager_parameter.grad.float().norm().clamp_min(1e-20)
+                        )
+                        assert relative < 5e-3
+                    else:
+                        torch.testing.assert_close(
+                            graph_parameter.grad,
+                            eager_parameter.grad,
+                            rtol=0,
+                            atol=0,
+                        )
     finally:
         dist.destroy_process_group()
 

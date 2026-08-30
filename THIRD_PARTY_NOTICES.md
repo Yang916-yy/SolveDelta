@@ -15,8 +15,8 @@ Adapted production files:
 - `causallsso/model.py`: FLA GDN2/KDA-style low-rank coordinate decay,
   independent erase/write gates, and fused-projection ownership;
 - `causallsso/ops/radial_norm_gate.py`: FLA fused RMSNorm-gate row ownership,
-  FP32 reductions, autotuning surface, and strict transpose specialized with a
-  bounded per-head radial scale;
+  FP32 reductions, autotuning surface, strict transpose, and norm-linear
+  checkpoint ownership specialized with a bounded per-head radial scale;
 - `causallsso/ops/residual_frame/predictor.py`: FLA gated-Oja pair,
   triangular-WY, state, and ungated strict-transpose owners specialized to
   normalized LMS residual prediction without the unrelated query/output or

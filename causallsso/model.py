@@ -49,12 +49,10 @@ class SolveDelta(nn.Module):
             gate_rank,
         )
         self.projection_width = sum(self.projection_sizes)
-        # causal-conv1d's channel-last path requires the batch and token
-        # strides to be multiples of eight. Padding the packed projection row
-        # preserves a direct strided prefix view for conv4 and every consumer.
-        self.projection_padding = (
-            (-self.projection_width) % 8 if config.use_short_conv else 0
-        )
+        # Keep the physical Tensor Core GEMM row aligned while exposing only
+        # the logical projection prefix to downstream owners. This also
+        # satisfies causal-conv1d's weaker multiple-of-eight stride contract.
+        self.projection_padding = (-self.projection_width) % 64
         self.in_proj = nn.Linear(
             config.hidden_size,
             self.projection_width + self.projection_padding,
@@ -321,9 +319,18 @@ class SolveDelta(nn.Module):
         conv_state = initial_state.conv if initial_state is not None else None
         if self.config.use_short_conv:
             qkv_width = sum(self.projection_sizes[:3])
-            qkv_projection, remaining_projection = packed_projection[
-                ..., : self.projection_width
-            ].split((qkv_width, self.projection_width - qkv_width), dim=-1)
+            (
+                qkv_projection,
+                u_raw,
+                h_raw,
+                erase_raw,
+                write_raw,
+                geometry_raw,
+                decay_hidden,
+                output_gate_hidden,
+            ) = packed_projection[..., : self.projection_width].split(
+                (qkv_width, *self.projection_sizes[3:]), dim=-1
+            )
             qkv, final_conv = self._packed_conv(
                 qkv_projection,
                 conv_state,
@@ -333,15 +340,6 @@ class SolveDelta(nn.Module):
                 packed_segments,
             )
             q_raw, key_raw, value_raw = qkv.split(self.projection_sizes[:3], dim=-1)
-            (
-                u_raw,
-                h_raw,
-                erase_raw,
-                write_raw,
-                geometry_raw,
-                decay_hidden,
-                output_gate_hidden,
-            ) = remaining_projection.split(self.projection_sizes[3:], dim=-1)
         else:
             (
                 q_raw,
@@ -450,11 +448,10 @@ class SolveDelta(nn.Module):
             )
             if not return_final_state:
                 operator_state = None
-        output = self._gate_output(output, output_gate.to(output.dtype))
-        output = self.output_proj(
-            output.reshape(batch, length, heads * value_width).to(
-                hidden_states.dtype
-            )
+        output = self.output_norm.forward_linear(
+            output,
+            output_gate.to(output.dtype),
+            self.output_proj,
         )
         if not return_final_state:
             return output

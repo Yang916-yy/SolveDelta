@@ -12,6 +12,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from .bf16_shadow import BF16ShadowWeights
 from .modeling_solvedelta import SolveDeltaForCausalLM
 
 
@@ -115,6 +116,11 @@ class SolveDeltaGraphedTrainingStep:
     BF16 autocast. Build a separate instance for every batch/sequence shape.
     Run backward before replaying the same instance again because graph output
     storage is reused.
+
+    Passing ``bf16_shadow_optimizer`` installs nonpersistent BF16 shadows for
+    FP32 Linear parameters and refreshes them from that optimizer's post-step
+    hook. This is intended for gradient accumulation; factor-one training pays
+    the refresh without amortizing it.
     """
 
     def __init__(
@@ -127,6 +133,7 @@ class SolveDeltaGraphedTrainingStep:
         pool: Any | None = None,
         distributed: bool = False,
         process_group: Any | None = None,
+        bf16_shadow_optimizer: torch.optim.Optimizer | None = None,
     ) -> None:
         if not isinstance(model, SolveDeltaForCausalLM):
             raise TypeError("model must be a SolveDeltaForCausalLM")
@@ -181,6 +188,15 @@ class SolveDeltaGraphedTrainingStep:
         self.batch_size, self.sequence_length = sample_input_ids.shape
         self._input_dtype = sample_input_ids.dtype
         self._label_dtype = sample_labels.dtype
+        self._bf16_shadows = (
+            None
+            if bf16_shadow_optimizer is None
+            else BF16ShadowWeights(
+                model,
+                bf16_shadow_optimizer,
+                stream=self._replay_stream,
+            )
+        )
 
         # AccumulateGrad records the stream on which its node is first created.
         # Keep parameter edges owned by the caller's replay stream so the
@@ -219,6 +235,10 @@ class SolveDeltaGraphedTrainingStep:
             )
         else:
             self._graphed_loss = graphed_loss
+        if distributed and self._bf16_shadows is not None:
+            # DDP initialization may broadcast masters in place. Rebuild the
+            # shadows from the synchronized parameters before first replay.
+            self._bf16_shadows.refresh()
 
     @staticmethod
     def _validate_pair(
@@ -262,7 +282,20 @@ class SolveDeltaGraphedTrainingStep:
             )
         if not self.model.training:
             raise RuntimeError("the captured model must remain in training mode")
+        if self._bf16_shadows is not None:
+            self._bf16_shadows.assert_current()
         return self._graphed_loss(input_ids, labels)
+
+    def refresh_bf16_shadow_weights(self) -> None:
+        """Refresh shadows after parameter mutation outside the bound optimizer."""
+        if self._bf16_shadows is None:
+            raise RuntimeError("this helper does not use BF16 shadow weights")
+        self._bf16_shadows.refresh()
+
+    @property
+    def bf16_shadow_bytes(self) -> int:
+        """Persistent bytes used by optimizer-step BF16 Linear shadows."""
+        return 0 if self._bf16_shadows is None else self._bf16_shadows.nbytes
 
     def no_sync(self) -> Any:
         """Skip DDP gradient reduction for one or more graph replays."""

@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
@@ -118,6 +119,9 @@ def _radial_rms_norm_gated_fwd_kernel(
     )
 
 
+@triton.heuristics({
+    "RECOMPUTE_OUTPUT": lambda args: args["recomputed_y"] is not None,
+})
 @triton.autotune(
     configs=[
         triton.Config({"BT": bt}, num_warps=warps)
@@ -137,6 +141,7 @@ def _radial_rms_norm_gated_bwd_kernel(
     dy,
     dx,
     dgate,
+    recomputed_y,
     partial,
     T,
     BS,
@@ -145,6 +150,7 @@ def _radial_rms_norm_gated_bwd_kernel(
     BD: tl.constexpr,
     BH: tl.constexpr,
     PARTIAL_WIDTH: tl.constexpr,
+    RECOMPUTE_OUTPUT: tl.constexpr,
     BT: tl.constexpr,
     NB: tl.constexpr,
 ):
@@ -192,6 +198,14 @@ def _radial_rms_norm_gated_bwd_kernel(
         b_gate = tl.sigmoid(b_gate_raw)
         b_pre_gate = b_xhat * b_weight[None, :]
         b_base = b_pre_gate * b_gate
+        if RECOMPUTE_OUTPUT:
+            tl.store(
+                recomputed_y + offset,
+                (b_scale[:, None] * b_base).to(
+                    recomputed_y.dtype.element_ty
+                ),
+                mask=mask,
+            )
 
         b_dscale = tl.sum(b_dy * b_base, axis=1)
         b_dbase = b_dy * b_scale[:, None]
@@ -297,10 +311,19 @@ def _radial_rms_norm_gated_bwd(
     radial_strength: torch.Tensor,
     rstd: torch.Tensor,
     heads: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    recompute_output: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
     rows, width = x.shape
     dx = torch.empty_like(x)
     dgate = torch.empty_like(gate)
+    recomputed_y = torch.empty_like(x) if recompute_output else None
     block = min(65536 // x.element_size(), triton.next_power_of_2(width))
     if width > block or width > 512:
         raise RuntimeError("radial RMSNorm supports head widths up to 512")
@@ -324,6 +347,7 @@ def _radial_rms_norm_gated_bwd(
         dy,
         dx,
         dgate,
+        recomputed_y,
         partial,
         T=rows,
         BS=rows_per_program,
@@ -340,6 +364,7 @@ def _radial_rms_norm_gated_bwd(
         dgate,
         reduced[:width].to(weight.dtype),
         reduced[width:].to(radial_strength.dtype),
+        recomputed_y,
     )
 
 
@@ -380,7 +405,7 @@ class _RadialRMSNormGatedFunction(torch.autograd.Function):
     def backward(ctx, grad_y: torch.Tensor):
         x, gate, weight, radial_strength, rstd = ctx.saved_tensors
         grad_y = grad_y.contiguous().reshape_as(x)
-        dx, dgate, dweight, dstrength = _radial_rms_norm_gated_bwd(
+        dx, dgate, dweight, dstrength, _ = _radial_rms_norm_gated_bwd(
             grad_y,
             x,
             gate,
@@ -394,6 +419,131 @@ class _RadialRMSNormGatedFunction(torch.autograd.Function):
             dgate.reshape(ctx.shape),
             dweight,
             dstrength,
+            None,
+            None,
+        )
+
+
+class _RadialRMSNormGatedLinearFunction(torch.autograd.Function):
+    """FLA norm-linear lifetime ownership with SolveDelta's radial gate."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        radial_strength: torch.Tensor,
+        linear_weight: torch.Tensor,
+        linear_bias: torch.Tensor | None,
+        shadow_weight: torch.Tensor | None,
+        shadow_bias: torch.Tensor | None,
+        eps: float,
+        heads: int,
+    ) -> torch.Tensor:
+        if x.shape != gate.shape or x.ndim < 2:
+            raise ValueError("x and gate must have the same [...,H,D] shape")
+        if (
+            x.shape[-2] != heads
+            or not x.is_contiguous()
+            or not gate.is_contiguous()
+        ):
+            raise ValueError(
+                "CUDA radial norm-linear inputs must be contiguous [...,H,D]"
+            )
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        gate_2d = gate.reshape_as(x_2d)
+        y, rstd = _radial_rms_norm_gated_fwd(
+            x_2d,
+            gate_2d,
+            norm_weight,
+            radial_strength,
+            eps,
+            heads,
+        )
+        linear_dtype = (
+            torch.get_autocast_dtype("cuda")
+            if torch.is_autocast_enabled("cuda")
+            else y.dtype
+        )
+        packed_weight = (
+            linear_weight.to(linear_dtype)
+            if shadow_weight is None
+            else shadow_weight
+        )
+        packed_bias = (
+            None
+            if linear_bias is None
+            else (
+                linear_bias.to(linear_dtype)
+                if shadow_bias is None
+                else shadow_bias
+            )
+        )
+        output = F.linear(
+            y.reshape(*shape[:-2], -1).to(linear_dtype),
+            packed_weight,
+            packed_bias,
+        )
+        ctx.save_for_backward(
+            x_2d,
+            gate_2d,
+            norm_weight,
+            radial_strength,
+            packed_weight,
+            rstd,
+        )
+        ctx.shape = shape
+        ctx.heads = heads
+        ctx.linear_weight_dtype = linear_weight.dtype
+        ctx.linear_bias_dtype = None if linear_bias is None else linear_bias.dtype
+        ctx.set_materialize_grads(False)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (
+            x,
+            gate,
+            norm_weight,
+            radial_strength,
+            linear_weight,
+            rstd,
+        ) = ctx.saved_tensors
+        grad_output_2d = grad_output.contiguous().reshape(
+            -1, grad_output.shape[-1]
+        )
+        grad_y = F.linear(grad_output_2d, linear_weight.t()).reshape_as(x)
+        dx, dgate, dnorm_weight, dstrength, y = _radial_rms_norm_gated_bwd(
+            grad_y,
+            x,
+            gate,
+            norm_weight,
+            radial_strength,
+            rstd,
+            ctx.heads,
+            recompute_output=True,
+        )
+        if y is None:
+            raise RuntimeError("radial norm-linear reverse did not regenerate output")
+        grad_linear_weight = torch.mm(
+            grad_output_2d.t(), y.reshape(grad_output_2d.shape[0], -1)
+        ).to(ctx.linear_weight_dtype)
+        grad_linear_bias = (
+            None
+            if ctx.linear_bias_dtype is None
+            else grad_output_2d.sum(dim=0).to(ctx.linear_bias_dtype)
+        )
+        return (
+            dx.reshape(ctx.shape),
+            dgate.reshape(ctx.shape),
+            dnorm_weight,
+            dstrength,
+            grad_linear_weight,
+            grad_linear_bias,
+            None,
+            None,
             None,
             None,
         )
@@ -443,6 +593,35 @@ class RadialRMSNormGated(nn.Module):
             gate,
             self.weight,
             self.radial_strength.float(),
+            self.eps,
+            self.num_heads,
+        )
+
+    def forward_linear(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        linear: nn.Linear,
+    ) -> torch.Tensor:
+        """Apply the output projection without saving the normalized panel."""
+        if x.device.type != "cuda":
+            normalized = radial_rms_norm_gated_reference(
+                x,
+                gate,
+                self.weight,
+                self.radial_strength,
+                self.eps,
+            )
+            return linear(normalized.reshape(*x.shape[:-2], -1))
+        return _RadialRMSNormGatedLinearFunction.apply(
+            x,
+            gate,
+            self.weight,
+            self.radial_strength.float(),
+            linear.weight,
+            linear.bias,
+            getattr(linear, "_bf16_shadow_weight", None),
+            getattr(linear, "_bf16_shadow_bias", None),
             self.eps,
             self.num_heads,
         )

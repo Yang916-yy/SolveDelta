@@ -138,6 +138,15 @@ warmup, preventing `AccumulateGrad` and DDP reducer hooks from retaining the
 capture stream. This relies on PyTorch's stale-capture-stream override, which
 is scoped to graph construction and restored immediately afterward.
 
+For gradient accumulation, pass the already-constructed optimizer as
+`bf16_shadow_optimizer`. The helper keeps FP32 Linear parameters as optimizer
+and checkpoint owners, installs nonpersistent BF16 shadows, and refreshes them
+from an optimizer post-step hook. The hook and graph replay must use the
+construction stream. Parameter changes outside that optimizer deliberately
+raise on the next replay until `refresh_bf16_shadow_weights()` is called. This
+mode trades roughly two bytes per Linear parameter for avoiding the same cast
+on every microbatch; it is not recommended for accumulation factor one.
+
 ## Common failures
 
 - `No module named 'fla'`: install the repository again so the pinned FLA
@@ -154,3 +163,5 @@ is scoped to graph construction and restored immediately afterward.
 - CUDA Graph `AccumulateGrad` stream mismatch: use PyTorch 2.13 or newer,
   construct and replay the helper on one stream, and let `distributed=True`
   install DDP after capture rather than wrapping the model first.
+- stale BF16 shadow weights: update parameters through the optimizer bound to
+  the graph helper, or explicitly refresh after an out-of-band state load.

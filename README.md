@@ -158,6 +158,35 @@ Use ordinary fused cross entropy; FLA fused linear cross entropy currently
 performs a host-synchronizing label count and is rejected before capture.
 Construct and replay a helper on the same CUDA stream.
 
+When each optimizer update accumulates at least two fixed-shape
+microbatches, bind the optimizer to an optional BF16 Linear shadow:
+
+```python
+accumulation_steps = 4
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+graph_step = SolveDeltaGraphedTrainingStep(
+    model,
+    sample_input_ids=input_ids,
+    sample_labels=input_ids,
+    bf16_shadow_optimizer=optimizer,
+)
+
+optimizer.zero_grad(set_to_none=True)
+for batch_ids, batch_labels in microbatches:
+    loss = graph_step(batch_ids, batch_labels) / accumulation_steps
+    loss.backward()
+optimizer.step()  # refreshes every BF16 shadow exactly once
+```
+
+FP32 parameters remain the optimizer and checkpoint owners. Nonpersistent
+BF16 buffers remove repeated autocast conversions and the optimizer post-step
+hook refreshes them on the replay stream. This is a throughput-for-memory
+option, not the default: at the documented one-layer profile it adds about
+`43.6 MiB` after capture, is slightly slower without accumulation, and becomes
+useful from two or more microbatches. Direct parameter mutation is detected;
+call `graph_step.refresh_bf16_shadow_weights()` after loading or otherwise
+changing weights outside the bound optimizer.
+
 For DDP, initialize NCCL and select one CUDA device per process, then ask the
 helper to install DDP after local graph capture:
 
@@ -269,13 +298,13 @@ CUDA Graph replay. Both paths omit final continuation output in this table.
 
 | Scope | Path | Forward median/p95 | F+B median/p95 | Graph allocated |
 | --- | --- | ---: | ---: | ---: |
-| Core operator | SolveDelta | 0.175 / 0.182 ms | 0.635 / 0.645 ms | 61.1 MiB |
-| Core operator | FLA GDN2 | 0.108 / 0.124 ms | 0.464 / 0.476 ms | 46.0 MiB |
-| Projected mixer | SolveDelta | 0.425 / 0.434 ms | 1.493 / 1.861 ms | 247.7 MiB |
-| Projected mixer | FLA GDN2 | 0.366 / 0.380 ms | 1.272 / 1.450 ms | 233.2 MiB |
+| Core operator | SolveDelta | 0.172 / 0.178 ms | 0.611 / 0.793 ms | 58.1 MiB |
+| Core operator | FLA GDN2 | 0.107 / 0.112 ms | 0.467 / 0.643 ms | 46.0 MiB |
+| Projected mixer | SolveDelta | 0.430 / 0.603 ms | 1.435 / 1.623 ms | 245.8 MiB |
+| Projected mixer | FLA GDN2 | 0.364 / 0.534 ms | 1.276 / 1.468 ms | 233.2 MiB |
 
-At the projected-mixer boundary, SolveDelta currently pays about `16%` forward
-and `17%` F+B latency over GDN2, plus `14.5 MiB` active Graph allocation, for
+At the projected-mixer boundary, SolveDelta currently pays about `18%` forward
+and `12%` F+B latency over GDN2, plus `12.6 MiB` active Graph allocation, for
 the residual predictor and relative-frame actions. The mixer comparison adds
 projection, conv4, gates, normalization, and output projection, but excludes
 the MLP, LM head, optimizer, and distributed communication.

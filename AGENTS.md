@@ -159,6 +159,10 @@ the same continuation semantics.
 - `(C,S)`, erase/write gates, `gamma`, log-decays, normalization/radial
   reductions, relative-frame denominators, sensitive divisions, and backward
   partials are FP32.
+- A final-shaped owner-to-owner source cotangent may use BF16 after its owner
+  has completed FP32 accumulation and the composed VJP gate has passed. Such a
+  handoff is not a reduction partial; partials shared by multiple owners remain
+  FP32.
 - Eligible predictor-pair and DPLR WY/state/output contractions use BF16
   multiplicands and FP32 accumulation. The exact-unbounded direct-`e` pair
   owner uses FP32 scalar accumulation because its exponential factors cannot
@@ -168,6 +172,9 @@ the same continuation semantics.
   producer. Casting an already-rounded BF16 value to FP16 is not promotion.
 - Runtime dtype selection, magnitude thresholds, clipping, precision fallbacks,
   and data-dependent compensation are forbidden.
+- Fixed-shape gradient accumulation may use nonpersistent BF16 Linear shadows
+  with FP32 master Parameters. They must refresh exactly once from the bound
+  optimizer's post-step hook; a stale shadow must raise rather than replay.
 - FP64 defines the mathematics. Production acceptance is observed at BF16
   outputs, FP32 continuation states, and composed VJPs; private reduction order
   and panel bits are diagnostics only.
@@ -178,17 +185,19 @@ The selected dense CUDA path is:
 2. a C32 FLA gated-Oja pair/WY/state specialization for the residual predictor
    and its ungated strict transpose;
 3. source-owned q/key L2 normalization and fused generation of `d`, paired
-   `(e,chi)`, and `z` directly in C16 exterior panels;
+   `(e,chi)`, and `z` directly in C16 exterior panels, using the exact
+   normalized-`u` radial specialization;
 4. an exact unbounded Triton direct-`e` specialization of FLA generalized-DPLR
    pair formation plus FLA WY/state/output;
 5. matching output-owned reverse, pair transpose, source transpose, and
    predictor transpose;
-6. FLA KDA low-rank coordinate decay and an FLA norm-gate owner specialized
-   with the bounded radial scale and its strict transpose.
+6. FLA KDA low-rank coordinate decay and an FLA norm-gate/linear lifetime
+   owner specialized with the bounded radial scale and its strict transpose.
 
 Public fused-projection views may have arbitrary outer strides but require unit
-innermost vector stride. Packed private panels are implementation details, not
-public ABI.
+innermost vector stride. The physical fused projection row is padded to a
+multiple of 64 for its Tensor Core GEMM; consumers expose only the logical
+prefix. Packed private panels and padding rows are not public operator ABI.
 
 Dense CUDA BF16 is the optimized training surface. Masks and resets currently
 use the same Residual-Frame semantics through the model reference path; they

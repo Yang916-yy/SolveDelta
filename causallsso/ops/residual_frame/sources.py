@@ -9,22 +9,9 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.utils import autotune_cache_kwargs
-
 from ...reference import RELATIVE_FRAME_RADIUS
 
 
-_SOURCE_AUTOTUNE_CONFIGS = [
-    triton.Config({}, num_warps=num_warps)
-    for num_warps in (1, 2, 4)
-]
-
-
-@triton.autotune(
-    configs=_SOURCE_AUTOTUNE_CONFIGS,
-    key=["rows", "rank", "value_dim"],
-    **autotune_cache_kwargs,
-)
 @triton.jit
 def _source_fwd_kernel(
     u,
@@ -106,9 +93,8 @@ def _source_fwd_kernel(
     erase = tl.sigmoid(erase_x)
     erase_key = erase * key_r
 
-    u_norm_sq = tl.sum(u_r * u_r, axis=0)
     update_norm_sq = tl.sum(update_r * update_r, axis=0)
-    radial_denom = frame_radius * frame_radius + u_norm_sq * update_norm_sq
+    radial_denom = frame_radius * frame_radius + update_norm_sq
     frame_scale = frame_radius / tl.sqrt(radial_denom)
     frame_r = frame_scale * update_r
     den = 1.0 + tl.sum(u_r * frame_r, axis=0)
@@ -143,11 +129,6 @@ def _source_fwd_kernel(
     tl.store(injection + base_v, write * value_v, mask=mask_v)
 
 
-@triton.autotune(
-    configs=_SOURCE_AUTOTUNE_CONFIGS,
-    key=["rows", "rank", "value_dim"],
-    **autotune_cache_kwargs,
-)
 @triton.jit
 def _source_bwd_kernel(
     u,
@@ -243,9 +224,8 @@ def _source_bwd_kernel(
     ge = tl.load(grad_dual + dual_offset, mask=mask_r, other=0.0).to(tl.float32)
     gchi = tl.load(grad_query + query_offset, mask=mask_r, other=0.0).to(tl.float32)
 
-    u_norm_sq = tl.sum(u_r * u_r, axis=0)
     update_norm_sq = tl.sum(update_r * update_r, axis=0)
-    radial_denom = frame_radius * frame_radius + u_norm_sq * update_norm_sq
+    radial_denom = frame_radius * frame_radius + update_norm_sq
     frame_scale = frame_radius / tl.sqrt(radial_denom)
     frame_r = frame_scale * update_r
     den = 1.0 + tl.sum(u_r * frame_r, axis=0)
@@ -283,10 +263,9 @@ def _source_bwd_kernel(
 
     g_frame_scale = tl.sum(gframe * update_r, axis=0)
     radial_common = g_frame_scale * frame_scale / radial_denom
-    gu -= radial_common * update_norm_sq * u_r
     gupdate = (
         frame_scale * gframe
-        - radial_common * u_norm_sq * update_r
+        - radial_common * update_r
     )
 
     g_erase = gerase_key * key_r
@@ -388,6 +367,7 @@ def relative_sources_forward(
         key_stride_t=key.stride(1),
         key_stride_h=key.stride(2),
         frame_radius=RELATIVE_FRAME_RADIUS,
+        num_warps=1,
     )
     return direct, paired, injection
 
@@ -462,6 +442,7 @@ def relative_sources_backward(
         key_stride_t=key.stride(1),
         key_stride_h=key.stride(2),
         frame_radius=RELATIVE_FRAME_RADIUS,
+        num_warps=1,
     )
     return tuple(outputs)
 

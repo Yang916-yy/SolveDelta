@@ -730,9 +730,10 @@ def residual_state_backward(
         if initial_state_required
         else None
     )
-    _residual_state_bwd_kernel[(triton.cdiv(rank, 64), batch * heads)](
+    block_rank = min(32, triton.next_power_of_2(rank))
+    _residual_state_bwd_kernel[(triton.cdiv(rank, block_rank), batch * heads)](
         source, w, grad_final, grad_delta, grad_states, grad_initial, grad_update,
-        T=length, H=heads, R=rank, V=value_dim, C=chunk_size, BR=64, BV=64,
+        T=length, H=heads, R=rank, V=value_dim, C=chunk_size, BR=block_rank, BV=64,
         num_warps=4, num_stages=3,
     )
     return grad_states, grad_initial, grad_update

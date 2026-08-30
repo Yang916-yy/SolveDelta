@@ -639,6 +639,49 @@ def test_radial_output_gate_cuda_bf16_forward_and_vjp():
 
 
 @CUDA_ONLY
+def test_radial_output_gate_linear_lifetime_matches_separate_path():
+    torch.manual_seed(23)
+    batch, length, heads, width = 2, 5, 2, 16
+    module = RadialRMSNormGated(width, heads, eps=1e-6).cuda()
+    projection = torch.nn.Linear(heads * width, 24, bias=True).cuda()
+    x_separate = torch.randn(
+        batch,
+        length,
+        heads,
+        width,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    gate_separate = torch.randn_like(x_separate, requires_grad=True)
+    x_combined = x_separate.detach().clone().requires_grad_()
+    gate_combined = gate_separate.detach().clone().requires_grad_()
+    parameters = (
+        module.weight,
+        module.radial_strength,
+        projection.weight,
+        projection.bias,
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        separate = projection(
+            module(x_separate, gate_separate).reshape(batch, length, -1)
+        )
+        combined = module.forward_linear(x_combined, gate_combined, projection)
+    upstream = torch.randn_like(separate)
+    separate_gradients = torch.autograd.grad(
+        (separate * upstream).sum(),
+        (x_separate, gate_separate, *parameters),
+    )
+    combined_gradients = torch.autograd.grad(
+        (combined * upstream).sum(),
+        (x_combined, gate_combined, *parameters),
+    )
+    torch.testing.assert_close(combined, separate, rtol=0.0, atol=0.0)
+    for actual, expected in zip(combined_gradients, separate_gradients):
+        torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+
+
+@CUDA_ONLY
 def test_native_aligned_recurrent_split():
     args = _native_inputs(length=32)
     whole_output, whole_state = solvedelta_native(*args, return_final_state=True)

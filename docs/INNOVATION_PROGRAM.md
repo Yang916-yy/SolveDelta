@@ -137,7 +137,7 @@ average language-model loss must improve.
 The implementation cost is equally concrete: extra `u/h/gamma` projections,
 the predictor forward/transpose, and three relative frame actions. Current
 same-shape CUDA Graph measurements put the complete projected mixer about
-`16%` slower forward and `17%` slower F+B than FLA GDN2. See
+`18%` slower forward and `12%` slower F+B than FLA GDN2. See
 `docs/RESULTS.md` for the scoped numbers and exploratory training evidence.
 
 ## Why it maps to mature kernels
