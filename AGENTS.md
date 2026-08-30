@@ -17,6 +17,10 @@ Read these files before changing the operator:
    decisions.
 5. `THIRD_PARTY_NOTICES.md` records adapted code and runtime dependencies.
 
+Use `docs/ENVIRONMENT.md` for installation, supported hardware, validated
+package versions, and native-path constraints. Do not infer a supported
+environment merely from one contributor's local setup.
+
 Tests are evidence for this contract; they do not replace it. Do not change the
 reference recurrence to make an optimized implementation pass.
 
@@ -89,8 +93,10 @@ C_t = C_{t-1} + delta_t u_t^T.
 The token-local relative frame is
 
 ```text
-F_t = I + u_t delta_t^T
-den_t = 1 + delta_t^T u_t
+rho = 5/8
+phi_t = rho delta_t / sqrt(rho^2 + ||u_t||^2 ||delta_t||^2)
+F_t = I + u_t phi_t^T
+den_t = 1 + phi_t^T u_t
 d_t = F_t k_t
 e_t = F_t^-T (erase_t * k_t)
 chi_t = F_t^-T q_t.
@@ -99,12 +105,14 @@ chi_t = F_t^-T q_t.
 The implementation uses the exact rank-one inverse-transpose action
 
 ```text
-F_t^-T x = x - delta_t (u_t^T x) / den_t.
+F_t^-T x = x - phi_t (u_t^T x) / den_t.
 ```
 
 This preserves `e_t^T d_t = (erase_t*k_t)^T k_t` and makes the erase transition
-an exact local similarity transform. It does not claim that `F_t` is the
-accumulated absolute frame `I+X_t`.
+an exact local similarity transform. The static radial parameterization gives
+`3/8 < den_t < 13/8`, `||F_t^-1||_2 <= 8/3`, and
+`kappa_2(F_t) <= 13/3`; it is part of the model definition, not a runtime
+clamp. It does not claim that `F_t` is the accumulated absolute frame `I+X_t`.
 
 The memory is channel-decayed, updated by the conjugated Delta edit, and read
 through the same relative frame:
@@ -116,10 +124,25 @@ S_t = S'_t + d_t (z_t - S'_t^T e_t)^T
 o_t = S_t^T chi_t.
 ```
 
-Raw erase and write logits use `2 sigmoid(x)`. Query, geometry direction, and
-edit key are L2-normalized. The frontend applies independent depthwise causal
-conv4 plus SiLU to query, edit key, and edit value by default. The token-local
-write rate is `gamma_t = sigmoid(geometry_raw_t + geometry_write_bias)`.
+Raw erase and write logits use `sigmoid(x)` independently on the key and value
+axes, matching GDN2. Query, geometry direction, and edit key are L2-normalized.
+The frontend applies independent depthwise causal conv4 plus SiLU to query,
+edit key, and edit value by default. The token-local geometry rate is
+`gamma_t = sigmoid(geometry_raw_t + geometry_write_bias)`. The core output uses
+a bounded radial-aware sigmoid-gated RMSNorm before output projection. For
+per-head raw output `x` with width `V`, define
+
+```text
+r = sqrt(mean(x^2) + eps),  r0 = 1/sqrt(V)
+z = (r-r0)/(r+r0)
+alpha_h = sigmoid(2*a_h)-1/2
+y = (1+alpha_h*z) RMSNorm(x) sigmoid(output_gate).
+```
+
+The per-head `a_h` initializes to `1`. Since `|z|<1` and `|alpha_h|<1/2`,
+the extra scale is strictly between `1/2` and `3/2`. Its strict transpose,
+including the radial component of `grad_x` and `grad_a`, is part of the model
+contract; stop-gradient or a surrogate VJP is not permitted.
 
 At `gamma=0`, the memory path must reduce exactly at finite parameters to the
 ordinary gated Delta edit/read and `C` remains unchanged. The geometry write
@@ -133,10 +156,14 @@ the same continuation semantics.
 ## Precision and Native Ownership
 
 - Public/raw vector operands and native outputs are BF16.
-- `(C,S)`, `gamma`, log-decays, normalization reductions, relative-frame
-  denominators, sensitive divisions, and backward partials are FP32.
-- Tensor Core pair/WY/state contractions use BF16 multiplicands and FP32
-  accumulation.
+- `(C,S)`, erase/write gates, `gamma`, log-decays, normalization/radial
+  reductions, relative-frame denominators, sensitive divisions, and backward
+  partials are FP32.
+- Eligible predictor-pair and DPLR WY/state/output contractions use BF16
+  multiplicands and FP32 accumulation. The exact-unbounded direct-`e` pair
+  owner uses FP32 scalar accumulation because its exponential factors cannot
+  be centered into low-precision Tensor Core operands without a static range
+  bound.
 - A private FP16 panel requires a static range proof and a direct FP32-to-FP16
   producer. Casting an already-rounded BF16 value to FP16 is not promotion.
 - Runtime dtype selection, magnitude thresholds, clipping, precision fallbacks,
@@ -147,14 +174,17 @@ the same continuation semantics.
 
 The selected dense CUDA path is:
 
-1. stride-aware FLA L2 normalization;
+1. stride-aware FLA L2 normalization for `u`;
 2. a C32 FLA gated-Oja pair/WY/state specialization for the residual predictor
-   and its strict transpose;
-3. fused generation of `d`, paired `(e,chi)`, and `z` directly in C16 exterior
-   panels;
-4. a TileLang direct-`e` pair owner plus FLA generalized-DPLR WY/state/output;
+   and its ungated strict transpose;
+3. source-owned q/key L2 normalization and fused generation of `d`, paired
+   `(e,chi)`, and `z` directly in C16 exterior panels;
+4. an exact unbounded Triton direct-`e` specialization of FLA generalized-DPLR
+   pair formation plus FLA WY/state/output;
 5. matching output-owned reverse, pair transpose, source transpose, and
-   predictor transpose.
+   predictor transpose;
+6. FLA KDA low-rank coordinate decay and an FLA norm-gate owner specialized
+   with the bounded radial scale and its strict transpose.
 
 Public fused-projection views may have arbitrary outer strides but require unit
 innermost vector stride. Packed private panels are implementation details, not
@@ -181,14 +211,17 @@ unpacks a chain of private VJPs.
 The minimum suite covers:
 
 - FP64 residual predictor and relative-frame recurrence;
+- the analytic relative-frame denominator and condition bounds;
 - masks, resets, recurrent splits, and a non-128 width;
 - the finite-parameter GDN2 reduction at `gamma=0`;
 - the exact local similarity and inverse-transpose identities;
-- raw gate activation;
+- independent raw erase/write activation and gated-output formula;
 - native BF16 outputs and FP32 `(C,S)` against the FP64 oracle;
 - composed VJPs, including initial and final `(C,S)`;
 - the public model's dense native, mask/reset, cache, and loss paths;
-- fixed-shape CUDA Graph loss forward/backward against eager model gradients.
+- fixed-shape CUDA Graph loss forward/backward against eager model gradients;
+- single-rank NCCL DDP graph replay against eager parameter gradients, with no
+  `AccumulateGrad` stream-mismatch warning.
 
 Report performance as forward, backward, and F+B median/p95, with allocator
 peak and the exact shape/dtype/device. State whether a number covers the core

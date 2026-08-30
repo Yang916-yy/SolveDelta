@@ -1,393 +1,459 @@
 # Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026 SolveDelta contributors
 # SPDX-License-Identifier: MIT
-# Specialized from FLA's MIT-licensed TileLang generalized-DPLR chunk_A and
-# WY owners at commit 5e02dd3a7651f5f2797eb8b12bbec401826031e1.
-"""FLA TileLang A-owner specialized to the paired direct-e recurrence.
+# Adapted from FLA's MIT-licensed unbounded generalized-DPLR chunk_A owners.
+"""Exact unbounded direct-e pair owner for the Residual-Frame exterior.
 
-The generic DPLR owner forms ``A_qk/A_qb/A_ak/A_ab``.  Here ``b == k == d``
-exactly, so only ``A_qd`` and ``A_ed`` are physical.  The implementation keeps
-FLA's centered Tensor Core operands and FP32 accumulators while loading the
-frame-native panel layout directly.
+The generic DPLR owner forms four interaction matrices. Residual-Frame has
+``k == b == d`` and the effective source
+``a == -exp(log_decay) * e``, so only ``A_qd`` and ``A_ed`` are physical.
+The current decay factor is supplied by the inclusive prefix rather than a
+materialized ``a`` panel. The kernels retain FLA's exact causal scalar
+exponent differences while loading the producer-native rectangular panels
+directly. No centered Tensor-Core factorization is legal because coordinate
+decay is unbounded.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
-
-import tilelang
-import tilelang.language as T
 import torch
+import triton
+import triton.language as tl
+
+from fla.ops.utils.op import exp2, gather
+from fla.utils import IS_GATHER_SUPPORTED, autotune_cache_kwargs
 
 
-def _dtype_name(dtype: torch.dtype) -> str:
-    if dtype == torch.bfloat16:
-        return "bfloat16"
-    if dtype == torch.float16:
-        return "float16"
-    raise TypeError("direct-e TileLang panels must be BF16 or FP16")
+_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+    for num_warps in (2, 4, 8)
+    for num_stages in (2, 3)
+]
+
+_BWD_CONFIGS = [triton.Config({}, num_warps=4, num_stages=2)]
 
 
-@lru_cache(maxsize=None)
-def _pair_fwd_kernel(
-    batch: int,
-    heads: int,
-    rank: int,
-    edits: int,
-    frame_chunk: int,
-    frame_chunks: int,
-    logical_length: int,
-    chunk_size: int,
-    in_dtype: str,
+@triton.autotune(
+    configs=_AUTOTUNE_CONFIGS,
+    key=["K", "BT"],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
+def _direct_e_pair_fwd_kernel(
+    d,
+    paired,
+    gi,
+    qg,
+    dtail,
+    ag,
+    Aqd,
+    Aed,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    FC: tl.constexpr,
+    NP: tl.constexpr,
+    BK: tl.constexpr,
+    GATHER_SUPPORTED: tl.constexpr,
 ):
-    acc_dtype = "float32"
-    chunks = (logical_length + chunk_size - 1) // chunk_size
-    # Match FLA chunk_A's warp partition: a 16x16 output tile has one valid
-    # MMA warp partition, while C32 uses four warps.
-    threads = 32 if chunk_size < 32 else 128
+    i_t = tl.program_id(0).to(tl.int64)
+    i_b = tl.program_id(1).to(tl.int64)
+    i_h = tl.program_id(2).to(tl.int64)
 
-    @tilelang.jit(
-        pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: False,
-        },
+    o_i = tl.arange(0, BT)
+    o_t = i_t * BT + o_i
+    o_k = tl.arange(0, BK)
+    m_t = o_t < T
+    m_k = o_k < K
+    m_tk = m_t[:, None] & m_k[None, :]
+
+    panel = (i_b * H + i_h) * NP + o_t // FC
+    row = o_t % FC
+    p_d = d + panel[:, None] * (FC * K) + row[:, None] * K + o_k[None, :]
+    p_e = (
+        paired
+        + panel[:, None] * (2 * FC * K)
+        + row[:, None] * K
+        + o_k[None, :]
     )
-    def build():
-        @T.prim_func
-        def pair_fwd(
-            d: T.Tensor((batch * heads * frame_chunks, edits, frame_chunk, rank), in_dtype),
-            paired: T.Tensor((batch * heads * frame_chunks, edits + 1, frame_chunk, rank), in_dtype),
-            cumulative: T.Tensor((batch, logical_length, heads, rank), acc_dtype),
-            q_scaled: T.Tensor((batch, logical_length, heads, rank), in_dtype),
-            d_tail: T.Tensor((batch, logical_length, heads, rank), in_dtype),
-            e_scaled: T.Tensor((batch, logical_length, heads, rank), in_dtype),
-            A_qd: T.Tensor((batch, logical_length, heads, chunk_size), in_dtype),
-            A_ed: T.Tensor((batch, logical_length, heads, chunk_size), acc_dtype),
-        ):
-            with T.Kernel(chunks, batch, heads, threads=threads) as (i_c, i_b, i_h):
-                bos = i_c * chunk_size
-                eos = T.min(bos + chunk_size, logical_length)
-                valid_len = eos - bos
-                last = T.max(eos - 1, 0)
-                mid = valid_len // 2
+    p_q = p_e + FC * K
 
-                q_mat = T.alloc_shared((chunk_size, rank), in_dtype)
-                e_mat = T.alloc_shared((chunk_size, rank), in_dtype)
-                d_mat = T.alloc_shared((chunk_size, rank), in_dtype)
-                gate_offset = T.alloc_shared((rank,), acc_dtype)
-                gate_last = T.alloc_shared((rank,), acc_dtype)
+    token_base = (i_b * T + o_t) * (H * K) + i_h * K
+    p_gi = gi + token_base[:, None] + o_k[None, :]
 
-                for c in T.Parallel(rank):
-                    if bos < eos:
-                        gate_offset[c] = cumulative[i_b, bos + mid, i_h, c]
-                        gate_last[c] = cumulative[i_b, last, i_h, c]
-                    else:
-                        gate_offset[c] = 0.0
-                        gate_last[c] = 0.0
+    b_d = tl.load(p_d, mask=m_tk, other=0.0)
+    b_e = tl.load(p_e, mask=m_tk, other=0.0)
+    b_q = tl.load(p_q, mask=m_tk, other=0.0)
+    b_a = -b_e
+    b_gi = tl.load(p_gi, mask=m_tk, other=0.0).to(tl.float32)
 
-                for r, c in T.Parallel(chunk_size, rank):
-                    logical = bos + r
-                    if logical < eos:
-                        token = logical // edits
-                        edit = logical % edits
-                        panel = (i_b * heads + i_h) * frame_chunks + token // frame_chunk
-                        row = token % frame_chunk
-                        dv = T.Cast(acc_dtype, d[panel, edit, row, c])
-                        ev = T.Cast(acc_dtype, paired[panel, edit, row, c])
-                        qv = T.Cast(
-                            acc_dtype,
-                            T.if_then_else(
-                                edit == edits - 1,
-                                paired[panel, edits, row, c],
-                                0.0,
-                            ),
-                        )
-                        gv = cumulative[i_b, logical, i_h, c]
-                        centered = gv - gate_offset[c]
-                        q_mat[r, c] = T.Cast(in_dtype, qv * T.exp2(centered))
-                        e_mat[r, c] = T.Cast(in_dtype, -ev * T.exp2(centered))
-                        d_mat[r, c] = T.Cast(in_dtype, dv * T.exp2(-centered))
-                        q_scaled[i_b, logical, i_h, c] = T.Cast(in_dtype, qv * T.exp2(gv))
-                        e_scaled[i_b, logical, i_h, c] = T.Cast(in_dtype, -ev * T.exp2(gv))
-                        d_tail[i_b, logical, i_h, c] = T.Cast(
-                            in_dtype, dv * T.exp2(gate_last[c] - gv)
-                        )
-                    else:
-                        q_mat[r, c] = T.Cast(in_dtype, 0.0)
-                        e_mat[r, c] = T.Cast(in_dtype, 0.0)
-                        d_mat[r, c] = T.Cast(in_dtype, 0.0)
+    last = min((i_t + 1) * BT, T) - 1
+    p_last = gi + (i_b * T + last) * (H * K) + i_h * K + o_k
+    b_last = tl.load(p_last, mask=m_k, other=0.0).to(tl.float32)
 
-                A_qd_frag = T.alloc_fragment((chunk_size, chunk_size), acc_dtype)
-                A_ed_frag = T.alloc_fragment((chunk_size, chunk_size), acc_dtype)
-                T.gemm(q_mat, d_mat, A_qd_frag, transpose_B=True, clear_accum=True)
-                T.gemm(e_mat, d_mat, A_ed_frag, transpose_B=True, clear_accum=True)
+    p_qg = qg + token_base[:, None] + o_k[None, :]
+    p_ag = ag + token_base[:, None] + o_k[None, :]
+    p_dtail = dtail + token_base[:, None] + o_k[None, :]
+    tl.store(
+        p_qg,
+        (b_q * exp2(b_gi)).to(
+            p_qg.dtype.element_ty, fp_downcast_rounding="rtne"
+        ),
+        mask=m_tk,
+    )
+    tl.store(
+        p_ag,
+        (b_a * exp2(b_gi)).to(
+            p_ag.dtype.element_ty, fp_downcast_rounding="rtne"
+        ),
+        mask=m_tk,
+    )
+    tl.store(
+        p_dtail,
+        (b_d * exp2(b_last[None, :] - b_gi)).to(
+            p_dtail.dtype.element_ty, fp_downcast_rounding="rtne"
+        ),
+        mask=m_tk,
+    )
 
-                for r, c in T.Parallel(chunk_size, chunk_size):
-                    logical = bos + r
-                    if logical < eos:
-                        A_qd[i_b, logical, i_h, c] = T.Cast(
-                            in_dtype,
-                            T.if_then_else(
-                                (c < valid_len) and (r >= c), A_qd_frag[r, c], 0.0
-                            ),
-                        )
-                        A_ed[i_b, logical, i_h, c] = T.Cast(
-                            acc_dtype,
-                            T.if_then_else(
-                                (c < valid_len) and (r > c), A_ed_frag[r, c], 0.0
-                            ),
-                        )
+    out_base = (i_b * T + o_t) * (H * BT) + i_h * BT
+    valid_len = min(T - i_t * BT, BT)
+    for j in range(0, BT):
+        if GATHER_SUPPORTED:
+            row_index = tl.full((1, BK), j, tl.int16)
+            b_dj = gather(b_d, row_index, axis=0)
+            b_gij = gather(b_gi, row_index, axis=0)
+        else:
+            row_mask = o_i == j
+            b_dj = tl.sum(tl.where(row_mask[:, None], b_d, 0.0), 0)[None, :]
+            b_gij = tl.sum(tl.where(row_mask[:, None], b_gi, 0.0), 0)[None, :]
 
-        return pair_fwd
+        inclusive = (o_i[:, None] >= j) & (j < valid_len)
+        strict = (o_i[:, None] > j) & (j < valid_len)
+        q_exp = exp2(tl.where(inclusive, b_gi - b_gij, float("-inf")))
+        e_exp = exp2(tl.where(strict, b_gi - b_gij, float("-inf")))
+        b_Aqd = tl.sum(b_q * b_dj * q_exp, 1)
+        b_Aed = tl.sum(b_a * b_dj * e_exp, 1)
 
-    return build()
+        p_Aqd = Aqd + out_base + j
+        p_Aed = Aed + out_base + j
+        tl.store(
+            p_Aqd,
+            b_Aqd.to(p_Aqd.dtype.element_ty, fp_downcast_rounding="rtne"),
+            mask=m_t,
+        )
+        tl.store(p_Aed, b_Aed, mask=m_t)
 
 
-@lru_cache(maxsize=None)
-def _pair_bwd_kernel(
-    batch: int,
-    heads: int,
-    rank: int,
-    edits: int,
-    frame_chunk: int,
-    frame_chunks: int,
-    logical_length: int,
-    chunk_size: int,
-    in_dtype: str,
+@triton.autotune(
+    configs=_BWD_CONFIGS,
+    key=["K", "BT"],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
+def _direct_e_pair_bwd_kernel(
+    d,
+    paired,
+    gi,
+    dAqd0,
+    dAqd1,
+    dAed0,
+    dAed1,
+    dqg,
+    ddtail0,
+    ddtail1,
+    dag,
+    dg_tail,
+    dd,
+    dpaired,
+    dg,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    FC: tl.constexpr,
+    NP: tl.constexpr,
+    BK: tl.constexpr,
+    GATHER_SUPPORTED: tl.constexpr,
 ):
-    acc_dtype = "float32"
-    chunks = (logical_length + chunk_size - 1) // chunk_size
-    threads = 32 if chunk_size < 32 else 128
+    i_k = tl.program_id(0)
+    i_t = tl.program_id(1).to(tl.int64)
+    i_bh = tl.program_id(2).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
 
-    @tilelang.jit(
-        pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: False,
-        },
+    o_i = tl.arange(0, BT)
+    o_t = i_t * BT + o_i
+    o_k = i_k * BK + tl.arange(0, BK)
+    m_t = o_t < T
+    m_k = o_k < K
+    m_tk = m_t[:, None] & m_k[None, :]
+
+    panel = i_bh * NP + o_t // FC
+    row = o_t % FC
+    p_d = d + panel[:, None] * (FC * K) + row[:, None] * K + o_k[None, :]
+    p_e = (
+        paired
+        + panel[:, None] * (2 * FC * K)
+        + row[:, None] * K
+        + o_k[None, :]
     )
-    def build():
-        @T.prim_func
-        def pair_bwd(
-            d: T.Tensor((batch * heads * frame_chunks, edits, frame_chunk, rank), in_dtype),
-            paired: T.Tensor((batch * heads * frame_chunks, edits + 1, frame_chunk, rank), in_dtype),
-            cumulative: T.Tensor((batch, logical_length, heads, rank), acc_dtype),
-            dA_qd: T.Tensor((batch, logical_length, heads, chunk_size), acc_dtype),
-            dA_ed_0: T.Tensor((batch, logical_length, heads, chunk_size), acc_dtype),
-            dA_ed_1: T.Tensor((batch, logical_length, heads, chunk_size), acc_dtype),
-            dq_scaled: T.Tensor((batch, logical_length, heads, rank), in_dtype),
-            dd_tail: T.Tensor((batch, logical_length, heads, rank), in_dtype),
-            de_scaled: T.Tensor((batch, logical_length, heads, rank), in_dtype),
-            dg_tail: T.Tensor((batch, chunks, heads, rank), acc_dtype),
-            dd: T.Tensor((batch * heads * frame_chunks, edits, frame_chunk, rank), in_dtype),
-            dpaired: T.Tensor((batch * heads * frame_chunks, edits + 1, frame_chunk, rank), in_dtype),
-            dg: T.Tensor((batch, logical_length // edits, heads, rank), acc_dtype),
-        ):
-            with T.Kernel(chunks, batch, heads, threads=threads) as (i_c, i_b, i_h):
-                bos = i_c * chunk_size
-                eos = T.min(bos + chunk_size, logical_length)
-                valid_len = eos - bos
-                mid = valid_len // 2
-                gate_offset = T.alloc_shared((rank,), acc_dtype)
-                for c in T.Parallel(rank):
-                    if bos < eos:
-                        gate_offset[c] = cumulative[i_b, bos + mid, i_h, c]
-                    else:
-                        gate_offset[c] = 0.0
+    p_q = p_e + FC * K
+    token_base = (i_b * T + o_t) * (H * K) + i_h * K
+    p_gi = gi + token_base[:, None] + o_k[None, :]
 
-                q_mat = T.alloc_shared((chunk_size, rank), in_dtype)
-                e_mat = T.alloc_shared((chunk_size, rank), in_dtype)
-                d_mat = T.alloc_shared((chunk_size, rank), in_dtype)
-                dA_qd_mat = T.alloc_shared((chunk_size, chunk_size), in_dtype)
-                dA_ed_mat = T.alloc_shared((chunk_size, chunk_size), in_dtype)
+    b_d = tl.load(p_d, mask=m_tk, other=0.0)
+    b_e = tl.load(p_e, mask=m_tk, other=0.0)
+    b_q = tl.load(p_q, mask=m_tk, other=0.0)
+    b_a = -b_e
+    b_gi = tl.load(p_gi, mask=m_tk, other=0.0).to(tl.float32)
 
-                for r, c in T.Parallel(chunk_size, rank):
-                    logical = bos + r
-                    if logical < eos:
-                        token = logical // edits
-                        edit = logical % edits
-                        panel = (i_b * heads + i_h) * frame_chunks + token // frame_chunk
-                        row = token % frame_chunk
-                        dv = T.Cast(acc_dtype, d[panel, edit, row, c])
-                        ev = T.Cast(acc_dtype, paired[panel, edit, row, c])
-                        qv = T.Cast(
-                            acc_dtype,
-                            T.if_then_else(
-                                edit == edits - 1,
-                                paired[panel, edits, row, c],
-                                0.0,
-                            ),
-                        )
-                        gv = cumulative[i_b, logical, i_h, c]
-                        centered = gv - gate_offset[c]
-                        q_mat[r, c] = T.Cast(in_dtype, qv * T.exp2(centered))
-                        e_mat[r, c] = T.Cast(in_dtype, -ev * T.exp2(centered))
-                        d_mat[r, c] = T.Cast(in_dtype, dv * T.exp2(-centered))
-                    else:
-                        q_mat[r, c] = T.Cast(in_dtype, 0.0)
-                        e_mat[r, c] = T.Cast(in_dtype, 0.0)
-                        d_mat[r, c] = T.Cast(in_dtype, 0.0)
+    o_j = tl.arange(0, BT)
+    valid_len = min(T - i_t * BT, BT)
+    m_A = m_t[:, None] & (o_j[None, :] < valid_len)
+    A_base = (i_b * T + o_t) * (H * BT) + i_h * BT
+    p_dAqd0 = dAqd0 + A_base[:, None] + o_j[None, :]
+    p_dAqd1 = dAqd1 + A_base[:, None] + o_j[None, :]
+    p_dAed0 = dAed0 + A_base[:, None] + o_j[None, :]
+    p_dAed1 = dAed1 + A_base[:, None] + o_j[None, :]
+    b_dAqd = (
+        tl.load(p_dAqd0, mask=m_A, other=0.0).to(tl.float32)
+        + tl.load(p_dAqd1, mask=m_A, other=0.0).to(tl.float32)
+    )
+    b_dAed = (
+        tl.load(p_dAed0, mask=m_A, other=0.0).to(tl.float32)
+        + tl.load(p_dAed1, mask=m_A, other=0.0).to(tl.float32)
+    )
 
-                for r, c in T.Parallel(chunk_size, chunk_size):
-                    logical = bos + r
-                    if logical < eos:
-                        dA_qd_mat[r, c] = T.Cast(
-                            in_dtype,
-                            T.if_then_else(
-                                (c < valid_len) and (r >= c),
-                                T.Cast(acc_dtype, dA_qd[i_b, logical, i_h, c]),
-                                0.0,
-                            ),
-                        )
-                        dA_ed_mat[r, c] = T.Cast(
-                            in_dtype,
-                            T.if_then_else(
-                                (c < valid_len) and (r > c),
-                                T.Cast(acc_dtype, dA_ed_0[i_b, logical, i_h, c])
-                                + T.Cast(acc_dtype, dA_ed_1[i_b, logical, i_h, c]),
-                                0.0,
-                            ),
-                        )
-                    else:
-                        dA_qd_mat[r, c] = T.Cast(in_dtype, 0.0)
-                        dA_ed_mat[r, c] = T.Cast(in_dtype, 0.0)
+    b_dq = tl.zeros((BT, BK), tl.float32)
+    b_da = tl.zeros((BT, BK), tl.float32)
+    b_dd = tl.zeros((BT, BK), tl.float32)
+    for j in range(0, BT):
+        if GATHER_SUPPORTED:
+            row_index_k = tl.full((1, BK), j, tl.int16)
+            col_index = tl.full((BT, 1), j, tl.int16)
+            row_index_A = tl.full((1, BT), j, tl.int16)
+            b_dj = gather(b_d, row_index_k, axis=0)
+            b_gij = gather(b_gi, row_index_k, axis=0)
+            b_qj = gather(b_q, row_index_k, axis=0)
+            b_aj = gather(b_a, row_index_k, axis=0)
+            b_dAqd_col = gather(b_dAqd, col_index, axis=1)
+            b_dAed_col = gather(b_dAed, col_index, axis=1)
+            b_dAqd_row = tl.sum(
+                gather(b_dAqd, row_index_A, axis=0), 0
+            )[:, None]
+            b_dAed_row = tl.sum(
+                gather(b_dAed, row_index_A, axis=0), 0
+            )[:, None]
+        else:
+            row_mask = o_i == j
+            b_dj = tl.sum(tl.where(row_mask[:, None], b_d, 0.0), 0)[None, :]
+            b_gij = tl.sum(tl.where(row_mask[:, None], b_gi, 0.0), 0)[None, :]
+            b_qj = tl.sum(tl.where(row_mask[:, None], b_q, 0.0), 0)[None, :]
+            b_aj = tl.sum(tl.where(row_mask[:, None], b_a, 0.0), 0)[None, :]
+            b_dAqd_col = tl.sum(
+                tl.where(row_mask[None, :], b_dAqd, 0.0), 1
+            )[:, None]
+            b_dAed_col = tl.sum(
+                tl.where(row_mask[None, :], b_dAed, 0.0), 1
+            )[:, None]
+            b_dAqd_row = tl.sum(
+                tl.where(row_mask[:, None], b_dAqd, 0.0), 0
+            )[:, None]
+            b_dAed_row = tl.sum(
+                tl.where(row_mask[:, None], b_dAed, 0.0), 0
+            )[:, None]
 
-                dchi_frag = T.alloc_fragment((chunk_size, rank), acc_dtype)
-                de_frag = T.alloc_fragment((chunk_size, rank), acc_dtype)
-                dd_frag = T.alloc_fragment((chunk_size, rank), acc_dtype)
-                T.gemm(dA_qd_mat, d_mat, dchi_frag, clear_accum=True)
-                T.gemm(dA_ed_mat, d_mat, de_frag, clear_accum=True)
-                T.gemm(dA_qd_mat, q_mat, dd_frag, transpose_A=True, clear_accum=True)
-                T.gemm(dA_ed_mat, e_mat, dd_frag, transpose_A=True)
+        inclusive_col = (o_i[:, None] >= j) & (j < valid_len)
+        strict_col = (o_i[:, None] > j) & (j < valid_len)
+        b_dq += b_dAqd_col * b_dj * exp2(
+            tl.where(inclusive_col, b_gi - b_gij, float("-inf"))
+        )
+        b_da += b_dAed_col * b_dj * exp2(
+            tl.where(strict_col, b_gi - b_gij, float("-inf"))
+        )
 
-                dG = T.alloc_shared((chunk_size, rank), acc_dtype)
-                for r, c in T.Parallel(chunk_size, rank):
-                    logical = bos + r
-                    if logical < eos:
-                        token = logical // edits
-                        edit = logical % edits
-                        panel = (i_b * heads + i_h) * frame_chunks + token // frame_chunk
-                        row = token % frame_chunk
-                        dv = T.Cast(acc_dtype, d[panel, edit, row, c])
-                        ev = T.Cast(acc_dtype, paired[panel, edit, row, c])
-                        qv = T.Cast(
-                            acc_dtype,
-                            T.if_then_else(
-                                edit == edits - 1,
-                                paired[panel, edits, row, c],
-                                0.0,
-                            ),
-                        )
-                        gv = cumulative[i_b, logical, i_h, c]
-                        centered = gv - gate_offset[c]
-                        exp_center = T.exp2(centered)
-                        exp_g = T.exp2(gv)
-                        q_center = qv * exp_center
-                        e_center = -ev * exp_center
-                        d_center = dv * T.exp2(-centered)
+        inclusive_row = (o_i[:, None] <= j) & (j < valid_len)
+        strict_row = (o_i[:, None] < j) & (j < valid_len)
+        b_dd += b_dAqd_row * b_qj * exp2(
+            tl.where(inclusive_row, b_gij - b_gi, float("-inf"))
+        )
+        b_dd += b_dAed_row * b_aj * exp2(
+            tl.where(strict_row, b_gij - b_gi, float("-inf"))
+        )
 
-                        q_saved = T.Cast(acc_dtype, dq_scaled[i_b, logical, i_h, c])
-                        e_saved = T.Cast(acc_dtype, de_scaled[i_b, logical, i_h, c])
-                        d_saved = T.Cast(acc_dtype, dd_tail[i_b, logical, i_h, c])
-                        last = T.max(eos - 1, 0)
-                        tail_scale = T.exp2(cumulative[i_b, last, i_h, c] - gv)
-                        gchi = dchi_frag[r, c] * exp_center + q_saved * exp_g
-                        ge = -de_frag[r, c] * exp_center - e_saved * exp_g
-                        gd = (
-                            dd_frag[r, c] * T.exp2(-centered)
-                            + d_saved * tail_scale
-                        )
+    p_dqg = dqg + token_base[:, None] + o_k[None, :]
+    p_dag = dag + token_base[:, None] + o_k[None, :]
+    p_ddtail0 = ddtail0 + token_base[:, None] + o_k[None, :]
+    p_ddtail1 = ddtail1 + token_base[:, None] + o_k[None, :]
+    last = min((i_t + 1) * BT, T) - 1
+    p_last = gi + (i_b * T + last) * (H * K) + i_h * K + o_k
+    b_last = tl.load(p_last, mask=m_k, other=0.0).to(tl.float32)
 
-                        dd[panel, edit, row, c] = T.Cast(in_dtype, gd)
-                        dpaired[panel, edit, row, c] = T.Cast(in_dtype, ge)
-                        if edit == edits - 1:
-                            dpaired[panel, edits, row, c] = T.Cast(in_dtype, gchi)
+    b_dq += (
+        tl.load(p_dqg, mask=m_tk, other=0.0).to(tl.float32) * exp2(b_gi)
+    )
+    b_da += (
+        tl.load(p_dag, mask=m_tk, other=0.0).to(tl.float32) * exp2(b_gi)
+    )
+    b_dd += (
+        tl.load(p_ddtail0, mask=m_tk, other=0.0).to(tl.float32)
+        + tl.load(p_ddtail1, mask=m_tk, other=0.0).to(tl.float32)
+    ) * exp2(b_last[None, :] - b_gi)
 
-                        dG[r, c] = (
-                            dchi_frag[r, c] * q_center
-                            + de_frag[r, c] * e_center
-                            - dd_frag[r, c] * d_center
-                            + q_saved * (qv * exp_g)
-                            + e_saved * (-ev * exp_g)
-                            - d_saved * (dv * tail_scale)
-                        )
-                    else:
-                        dG[r, c] = 0.0
+    p_dd = dd + panel[:, None] * (FC * K) + row[:, None] * K + o_k[None, :]
+    p_de = (
+        dpaired
+        + panel[:, None] * (2 * FC * K)
+        + row[:, None] * K
+        + o_k[None, :]
+    )
+    p_dq = p_de + FC * K
+    tl.store(
+        p_dd,
+        b_dd.to(p_dd.dtype.element_ty, fp_downcast_rounding="rtne"),
+        mask=m_tk,
+    )
+    tl.store(
+        p_de,
+        (-b_da).to(p_de.dtype.element_ty, fp_downcast_rounding="rtne"),
+        mask=m_tk,
+    )
+    tl.store(
+        p_dq,
+        b_dq.to(p_dq.dtype.element_ty, fp_downcast_rounding="rtne"),
+        mask=m_tk,
+    )
 
-                T.sync_threads()
-                gate_acc = T.alloc_fragment((rank,), acc_dtype)
-                for c in T.Parallel(rank):
-                    gate_acc[c] = dg_tail[i_b, i_c, i_h, c]
-                for reverse_row in T.serial(chunk_size):
-                    r = chunk_size - 1 - reverse_row
-                    logical = bos + r
-                    for c in T.Parallel(rank):
-                        gate_acc[c] += dG[r, c]
-                        if logical < eos:
-                            edit = logical % edits
-                            if edit == 0:
-                                token = logical // edits
-                                dg[i_b, token, i_h, c] = gate_acc[c]
+    # The erase action consumes the already-decayed state, so its effective
+    # DPLR source is ``-e * exp(log_decay)``. Using the inclusive prefix here
+    # closes that current-token decay dependency in the same reverse cumsum.
+    b_dprefix = b_dq * b_q + b_da * b_a - b_dd * b_d
+    NT = tl.cdiv(T, BT)
+    p_tail = dg_tail + ((i_b * NT + i_t) * H + i_h) * K + o_k
+    b_tail = tl.load(p_tail, mask=m_k, other=0.0).to(tl.float32)
+    b_dg = tl.cumsum(b_dprefix, axis=0, reverse=True)
+    b_dg += b_tail[None, :]
+    p_dg = dg + token_base[:, None] + o_k[None, :]
+    tl.store(p_dg, b_dg, mask=m_tk)
 
-        return pair_bwd
 
-    return build()
+def _validate_panels(
+    d: torch.Tensor,
+    paired: torch.Tensor,
+    inclusive: torch.Tensor,
+) -> tuple[int, int, int, int, int, int]:
+    panels, edits, frame_chunk, rank = d.shape
+    batch, length, heads, gate_rank = inclusive.shape
+    if edits != 1 or paired.shape != (panels, 2, frame_chunk, rank):
+        raise ValueError(
+            "direct-e production panels require one edit and two paired routes"
+        )
+    if gate_rank != rank or length % frame_chunk != 0:
+        raise ValueError("decay and panel layouts do not describe the same token grid")
+    frame_chunks = length // frame_chunk
+    if panels != batch * heads * frame_chunks:
+        raise ValueError("frame panel count does not match rectangular layout")
+    return batch, length, heads, rank, frame_chunk, frame_chunks
 
 
 def direct_e_pair_forward(
     d: torch.Tensor,
     paired: torch.Tensor,
-    cumulative: torch.Tensor,
+    inclusive: torch.Tensor,
     *,
     chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    panels, edits, frame_chunk, rank = d.shape
-    batch, logical_length, heads, _ = cumulative.shape
-    source_length = logical_length // edits
-    frame_chunks = (source_length + frame_chunk - 1) // frame_chunk
-    if panels != batch * heads * frame_chunks:
-        raise ValueError("frame panel count does not match rectangular layout")
-    dtype_name = _dtype_name(d.dtype)
-    q_scaled = torch.empty_like(cumulative, dtype=d.dtype)
+    batch, length, heads, rank, frame_chunk, frame_chunks = _validate_panels(
+        d, paired, inclusive
+    )
+    # The source-native panels are bounded FP16, but multiplying them by the
+    # exact unbounded decay factors requires BF16 exponent range downstream.
+    q_scaled = torch.empty_like(inclusive, dtype=torch.bfloat16)
     d_tail = torch.empty_like(q_scaled)
     e_scaled = torch.empty_like(q_scaled)
-    A_qd = torch.empty(batch, logical_length, heads, chunk_size, dtype=d.dtype, device=d.device)
-    A_ed = torch.empty(batch, logical_length, heads, chunk_size, dtype=torch.float32, device=d.device)
-    kernel = _pair_fwd_kernel(
-        batch, heads, rank, edits, frame_chunk, frame_chunks,
-        logical_length, chunk_size, dtype_name,
+    A_qd = torch.empty(
+        batch, length, heads, chunk_size, dtype=torch.bfloat16, device=d.device
     )
-    kernel(d, paired, cumulative, q_scaled, d_tail, e_scaled, A_qd, A_ed)
+    A_ed = torch.empty(
+        batch, length, heads, chunk_size, dtype=torch.float32, device=d.device
+    )
+    grid = (triton.cdiv(length, chunk_size), batch, heads)
+    _direct_e_pair_fwd_kernel[grid](
+        d,
+        paired,
+        inclusive,
+        q_scaled,
+        d_tail,
+        e_scaled,
+        A_qd,
+        A_ed,
+        T=length,
+        H=heads,
+        K=rank,
+        BT=chunk_size,
+        FC=frame_chunk,
+        NP=frame_chunks,
+        BK=triton.next_power_of_2(rank),
+        GATHER_SUPPORTED=IS_GATHER_SUPPORTED,
+    )
     return A_qd, A_ed, q_scaled, d_tail, e_scaled
 
 
 def direct_e_pair_backward(
     d: torch.Tensor,
     paired: torch.Tensor,
-    cumulative: torch.Tensor,
-    dA_qd: torch.Tensor,
+    inclusive: torch.Tensor,
+    dA_qd_0: torch.Tensor,
+    dA_qd_1: torch.Tensor,
     dA_ed_0: torch.Tensor,
     dA_ed_1: torch.Tensor,
     dq_scaled: torch.Tensor,
-    dd_tail: torch.Tensor,
+    dd_tail_0: torch.Tensor,
+    dd_tail_1: torch.Tensor,
     de_scaled: torch.Tensor,
     dg_tail: torch.Tensor,
     *,
     chunk_size: int,
+    gradient_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    panels, edits, frame_chunk, rank = d.shape
-    batch, logical_length, heads, _ = cumulative.shape
-    source_length = logical_length // edits
-    frame_chunks = (source_length + frame_chunk - 1) // frame_chunk
-    dd = torch.empty_like(d)
-    dpaired = torch.empty_like(paired)
-    dg = torch.empty(batch, source_length, heads, rank, dtype=torch.float32, device=d.device)
-    kernel = _pair_bwd_kernel(
-        batch, heads, rank, edits, frame_chunk, frame_chunks,
-        logical_length, chunk_size, _dtype_name(d.dtype),
+    batch, length, heads, rank, frame_chunk, frame_chunks = _validate_panels(
+        d, paired, inclusive
     )
-    kernel(
-        d, paired, cumulative, dA_qd, dA_ed_0, dA_ed_1,
-        dq_scaled, dd_tail, de_scaled, dg_tail, dd, dpaired, dg,
+    gradient_dtype = d.dtype if gradient_dtype is None else gradient_dtype
+    dd = torch.empty_like(d, dtype=gradient_dtype)
+    dpaired = torch.empty_like(paired, dtype=gradient_dtype)
+    dg = torch.empty_like(inclusive, dtype=torch.float32)
+    block_rank = min(64, triton.next_power_of_2(rank))
+    grid = (
+        triton.cdiv(rank, block_rank),
+        triton.cdiv(length, chunk_size),
+        batch * heads,
+    )
+    _direct_e_pair_bwd_kernel[grid](
+        d,
+        paired,
+        inclusive,
+        dA_qd_0,
+        dA_qd_1,
+        dA_ed_0,
+        dA_ed_1,
+        dq_scaled,
+        dd_tail_0,
+        dd_tail_1,
+        de_scaled,
+        dg_tail,
+        dd,
+        dpaired,
+        dg,
+        T=length,
+        H=heads,
+        K=rank,
+        BT=chunk_size,
+        FC=frame_chunk,
+        NP=frame_chunks,
+        BK=block_rank,
+        GATHER_SUPPORTED=IS_GATHER_SUPPORTED,
     )
     return dd, dpaired, dg
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import copy
+import subprocess
+import sys
+import warnings
 
 import pytest
 import torch
+import torch.distributed as dist
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 pytest.importorskip("fla")
@@ -40,6 +44,22 @@ def _tiny_config(**overrides) -> SolveDeltaConfig:
     )
     values.update(overrides)
     return SolveDeltaConfig(**values)
+
+
+def test_public_import_is_deprecation_clean():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::DeprecationWarning",
+            "-c",
+            "import causallsso",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_huggingface_auto_registration_and_config_roundtrip():
@@ -91,6 +111,40 @@ def test_huggingface_checkpoint_roundtrip(tmp_path):
     assert isinstance(restored, SolveDeltaForCausalLM)
     for name, value in model.state_dict().items():
         assert torch.equal(restored.state_dict()[name], value)
+
+    restored_bf16 = AutoModelForCausalLM.from_pretrained(
+        tmp_path, dtype=torch.bfloat16
+    )
+    restored_mixer = restored_bf16.model.layers[0].mixer.mixer
+    assert restored_mixer.in_proj.weight.dtype == torch.bfloat16
+    for parameter in (
+        restored_mixer.geometry_write_bias,
+        restored_mixer.associative_log_rate,
+        restored_mixer.associative_decay_bias,
+        restored_mixer.output_norm.radial_strength,
+    ):
+        assert parameter.dtype == torch.float32
+
+
+def test_gdn2_gates_and_low_rank_kda_decay_parameterization():
+    mixer = SolveDelta(_tiny_config(num_hidden_layers=1))
+    assert mixer.projection_sizes == (
+        32, 32, 32, 32, 32, 32, 32, 2, 16, 16
+    )
+    assert mixer.decay_proj.weight.shape == (32, 16)
+    assert mixer.output_gate_proj.weight.shape == (32, 16)
+    assert mixer.output_gate_proj.bias.shape == (32,)
+    assert mixer.associative_log_rate.shape == (2,)
+    assert mixer.associative_decay_bias.shape == (2, 16)
+    assert mixer.output_norm.weight.shape == (16,)
+    assert mixer.output_norm.radial_strength.shape == (2,)
+    assert mixer.output_norm.radial_strength.dtype == torch.float32
+    assert torch.equal(
+        mixer.output_norm.radial_strength,
+        torch.ones_like(mixer.output_norm.radial_strength),
+    )
+    assert mixer.output_norm.radial_strength._no_weight_decay
+    assert mixer.output_norm.activation == "sigmoid"
 
 
 def test_causal_lm_cpu_loss_backward_and_packed_segments():
@@ -206,6 +260,9 @@ def test_causal_lm_cuda_bf16_native_forward_backward(monkeypatch):
 
 
 @CUDA_ONLY
+@pytest.mark.filterwarnings(
+    "error:The AccumulateGrad node's stream does not match.*"
+)
 def test_causal_lm_cuda_graph_training_matches_eager():
     torch.manual_seed(11)
     config = _tiny_config(
@@ -222,11 +279,17 @@ def test_causal_lm_cuda_graph_training_matches_eager():
     eager_model = SolveDeltaForCausalLM(config).cuda().train()
     graphed_model = copy.deepcopy(eager_model).train()
     sample_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
-    graph_step = SolveDeltaGraphedTrainingStep(
-        graphed_model,
-        sample_ids,
-        sample_ids,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "error",
+            message="The AccumulateGrad node's stream does not match.*",
+            category=UserWarning,
+        )
+        graph_step = SolveDeltaGraphedTrainingStep(
+            graphed_model,
+            sample_ids,
+            sample_ids,
+        )
 
     input_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
     eager_model.zero_grad(set_to_none=True)
@@ -293,3 +356,116 @@ def test_causal_lm_cuda_graph_training_matches_eager():
 
     with pytest.raises(ValueError, match="requires input shape"):
         graph_step(next_ids[:, :16], next_ids[:, :16])
+
+
+@CUDA_ONLY
+@pytest.mark.filterwarnings(
+    "error:The AccumulateGrad node's stream does not match.*"
+)
+def test_causal_lm_cuda_graph_training_with_single_rank_ddp(
+    tmp_path,
+):
+    if not dist.is_nccl_available():
+        pytest.skip("NCCL is required for distributed CUDA Graph training")
+    if dist.is_initialized():
+        pytest.skip("test requires ownership of the default process group")
+
+    dist.init_process_group(
+        "nccl",
+        init_method=f"file://{tmp_path / 'ddp-init'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        torch.manual_seed(17)
+        config = _tiny_config(
+            hidden_size=128,
+            num_heads=1,
+            head_k_dim=128,
+            head_v_dim=128,
+            num_hidden_layers=1,
+            vocab_size=256,
+            fuse_norm=True,
+            fuse_swiglu=True,
+            fuse_cross_entropy=True,
+        )
+        eager_model = SolveDeltaForCausalLM(config).cuda().train()
+        graphed_model = copy.deepcopy(eager_model).train()
+        sample_ids = torch.randint(
+            0, config.vocab_size, (1, 32), device="cuda"
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "error",
+                message="The AccumulateGrad node's stream does not match.*",
+                category=UserWarning,
+            )
+            graph_step = SolveDeltaGraphedTrainingStep(
+                graphed_model,
+                sample_ids,
+                sample_ids,
+                distributed=True,
+            )
+            assert graph_step.distributed
+            with graph_step.no_sync():
+                assert not graph_step._graphed_loss.require_backward_grad_sync
+            assert graph_step._graphed_loss.require_backward_grad_sync
+
+            for _ in range(2):
+                input_ids = torch.randint(
+                    0, config.vocab_size, (1, 32), device="cuda"
+                )
+                eager_model.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    "cuda", dtype=torch.bfloat16, cache_enabled=False
+                ):
+                    eager_loss = eager_model(
+                        input_ids=input_ids,
+                        labels=input_ids,
+                        use_cache=False,
+                        return_dict=False,
+                    )[0]
+                eager_loss.backward()
+
+                graphed_model.zero_grad(set_to_none=True)
+                graphed_loss = graph_step(input_ids, input_ids)
+                graphed_loss.backward()
+                torch.cuda.synchronize()
+
+                torch.testing.assert_close(graphed_loss, eager_loss, rtol=0, atol=0)
+                for eager_parameter, graph_parameter in zip(
+                    eager_model.parameters(), graphed_model.parameters()
+                ):
+                    assert eager_parameter.grad is not None
+                    assert graph_parameter.grad is not None
+                    torch.testing.assert_close(
+                        graph_parameter.grad,
+                        eager_parameter.grad,
+                        rtol=0,
+                        atol=0,
+                    )
+    finally:
+        dist.destroy_process_group()
+
+
+@CUDA_ONLY
+def test_causal_lm_cuda_graph_training_rejects_replay_on_another_stream():
+    config = _tiny_config(
+        hidden_size=128,
+        num_heads=1,
+        head_k_dim=128,
+        head_v_dim=128,
+        num_hidden_layers=1,
+        vocab_size=256,
+        fuse_norm=True,
+        fuse_swiglu=True,
+        fuse_cross_entropy=True,
+    )
+    model = SolveDeltaForCausalLM(config).cuda().train()
+    sample_ids = torch.randint(0, config.vocab_size, (1, 32), device="cuda")
+    graph_step = SolveDeltaGraphedTrainingStep(model, sample_ids, sample_ids)
+
+    replay_stream = torch.cuda.Stream()
+    with torch.cuda.stream(replay_stream):
+        with pytest.raises(RuntimeError, match="stream that constructed"):
+            graph_step(sample_ids, sample_ids)

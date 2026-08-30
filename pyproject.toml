@@ -5,16 +5,39 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "causallsso"
 version = "0.1.0"
-description = "Geometry-conditioned Delta memory for causal language models"
+description = "CUDA-native residual-frame Delta memory for causal language models"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.7", "transformers>=4.53.3"]
+keywords = [
+    "causal-language-modeling",
+    "cuda",
+    "delta-rule",
+    "flash-linear-attention",
+    "linear-attention",
+    "pytorch",
+    "recurrent-memory",
+    "triton",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.7,<3",
+    "transformers>=4.53.3,<6",
+    # Production imports private FLA kernel modules. Keep this exact until a
+    # newer release passes the full oracle, VJP, model, and graph suite.
+    "flash-linear-attention==0.6.0",
+]
 
 [project.optional-dependencies]
 native = [
-    "causal-conv1d>=1.7.0",
-    "flash-linear-attention>=0.6.0",
-    "tilelang>=0.1.13",
+    "causal-conv1d>=1.7.0,<2",
 ]
 test = ["pytest>=8"]
 
@@ -22,6 +45,8 @@ test = ["pytest>=8"]
 include = ["causallsso*"]
 
 [project.urls]
+Documentation = "https://github.com/Yang916-yy/SolveDelta/tree/main/docs"
+Issues = "https://github.com/Yang916-yy/SolveDelta/issues"
 Repository = "https://github.com/Yang916-yy/SolveDelta"
 
 [tool.pytest.ini_options]

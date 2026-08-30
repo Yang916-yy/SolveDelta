@@ -9,6 +9,7 @@ from torch import nn
 
 from .config import SolveDeltaConfig
 from .ops.operator import solvedelta_native
+from .ops.radial_norm_gate import RadialRMSNormGated
 from .ops.packing import (
     PackedSegments,
     build_packed_segments,
@@ -33,6 +34,7 @@ class SolveDelta(nn.Module):
         width = config.resolved_head_k_dim
         value_width = config.resolved_head_v_dim
         edits = config.num_edits
+        gate_rank = value_width
 
         self.projection_sizes = (
             heads * width,
@@ -43,7 +45,8 @@ class SolveDelta(nn.Module):
             heads * edits * width,
             heads * edits * value_width,
             heads,
-            heads * width,
+            gate_rank,
+            gate_rank,
         )
         self.projection_width = sum(self.projection_sizes)
         # causal-conv1d's channel-last path requires the batch and token
@@ -60,6 +63,15 @@ class SolveDelta(nn.Module):
         self.output_proj = nn.Linear(
             heads * value_width, config.hidden_size, bias=config.bias
         )
+        self.decay_proj = nn.Linear(gate_rank, heads * width, bias=False)
+        self.output_gate_proj = nn.Linear(
+            gate_rank, heads * value_width, bias=True
+        )
+        self.output_norm = RadialRMSNormGated(
+            value_width,
+            heads,
+            eps=config.norm_eps,
+        )
         if config.use_short_conv:
             conv_width = sum(self.projection_sizes[:3])
             self.conv_weight = nn.Parameter(torch.empty(conv_width, 4))
@@ -72,9 +84,9 @@ class SolveDelta(nn.Module):
 
         # Match the mature GDN2/Mamba decay initialization: a positive rate
         # and log-uniform step size, evaluated in FP32 by the gate owner.
-        associative_rate = torch.empty(heads, 1, dtype=torch.float32).uniform_(1, 16)
+        associative_rate = torch.empty(heads, dtype=torch.float32).uniform_(1, 16)
         self.associative_log_rate = nn.Parameter(
-            associative_rate.log().expand(heads, width).clone()
+            associative_rate.log()
         )
         associative_step = torch.exp(
             torch.rand(heads, width, dtype=torch.float32)
@@ -90,6 +102,13 @@ class SolveDelta(nn.Module):
             self.associative_decay_bias,
         ):
             parameter._no_weight_decay = True
+
+    def _gate_output(
+        self,
+        output: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.output_norm(output, gate)
 
     def _packed_conv(
         self,
@@ -320,7 +339,8 @@ class SolveDelta(nn.Module):
                 erase_raw,
                 write_raw,
                 geometry_raw,
-                associative_raw,
+                decay_hidden,
+                output_gate_hidden,
             ) = remaining_projection.split(self.projection_sizes[3:], dim=-1)
         else:
             (
@@ -332,7 +352,8 @@ class SolveDelta(nn.Module):
                 erase_raw,
                 write_raw,
                 geometry_raw,
-                associative_raw,
+                decay_hidden,
+                output_gate_hidden,
             ) = packed_projection[..., : self.projection_width].split(
                 self.projection_sizes, dim=-1
             )
@@ -347,20 +368,27 @@ class SolveDelta(nn.Module):
         q = heads_view(q_raw, width)
         keys = key_raw.view(batch, length, heads, edits, width)
         values = value_raw.view(batch, length, heads, edits, value_width)
+        associative_raw = self.decay_proj(decay_hidden).view(
+            batch, length, heads, width
+        )
+        output_gate = self.output_gate_proj(output_gate_hidden).view(
+            batch, length, heads, value_width
+        )
         if native_inputs:
-            from .ops.gates import fused_decay_gate
+            from fla.ops.kda.gate import fused_kda_gate
 
-            associative_log_decay = fused_decay_gate(
+            associative_log_decay = fused_kda_gate(
                 associative_raw,
-                self.associative_log_rate.float().flatten(),
+                self.associative_log_rate.float(),
                 self.associative_decay_bias.float().flatten(),
-            ).view(batch, length, heads, width)
+                output_dtype=torch.float32,
+            )
         else:
             associative_log_decay = -torch.exp(
                 self.associative_log_rate.float()
-            ).view(1, 1, heads, width)
+            ).view(1, 1, heads, 1)
             associative_log_decay = associative_log_decay * F.softplus(
-                associative_raw.float().view(batch, length, heads, width)
+                associative_raw.float()
                 + self.associative_decay_bias.float().view(1, 1, heads, width)
             )
         geometry_write = torch.sigmoid(
@@ -393,10 +421,10 @@ class SolveDelta(nn.Module):
                 if hidden_states.dtype == torch.float64
                 else torch.float32
             )
-            erase = 2.0 * torch.sigmoid(
+            erase = torch.sigmoid(
                 erase_raw.float().view(batch, length, heads, edits, width)
             )
-            write = 2.0 * torch.sigmoid(
+            write = torch.sigmoid(
                 write_raw.float().view(batch, length, heads, edits, value_width)
             )
             reference_initial = (
@@ -422,6 +450,7 @@ class SolveDelta(nn.Module):
             )
             if not return_final_state:
                 operator_state = None
+        output = self._gate_output(output, output_gate.to(output.dtype))
         output = self.output_proj(
             output.reshape(batch, length, heads * value_width).to(
                 hidden_states.dtype

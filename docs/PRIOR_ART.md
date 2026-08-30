@@ -27,6 +27,11 @@ Repository: <https://github.com/fla-org/flash-linear-attention>
 License: MIT. The license text is preserved in `LICENSES/MIT.txt`; adapted
 production code is also listed in `THIRD_PARTY_NOTICES.md`.
 
+The selected runtime and source-compatibility baseline is FLA `0.6.0`.
+SolveDelta imports private kernel modules, so this version is pinned until a
+new release passes the full oracle, VJP, model, and CUDA Graph suite. Runtime
+installation details are maintained in `docs/ENVIRONMENT.md`.
+
 ### Gated Oja predictor
 
 Principal source areas:
@@ -57,14 +62,16 @@ The production specialization retains FLA's:
 - WY and pair transposes.
 
 It deletes the unrelated Oja query/output branch and does not expose FLA's
-public ABI. Current code still supplies a private zero vector-decay panel to
-two generic donor reverse helpers; deleting that panel is an implementation
-optimization, not a mathematical change.
+public ABI. The strict transpose copies FLA's chunk/head output ownership and
+removes the constant-zero vector-decay loads, exponentials, cotangent, and HBM
+panel. Its WY target loads accept the model's strided projection view directly.
 
 ### Generalized DPLR memory exterior
 
 Principal source areas:
 
+- `fla/ops/generalized_delta_rule/dplr/chunk_A_fwd.py`;
+- `fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py`;
 - `fla/ops/generalized_delta_rule/dplr/chunk_h_fwd.py`;
 - `fla/ops/generalized_delta_rule/dplr/chunk_h_bwd.py`;
 - `fla/ops/generalized_delta_rule/dplr/chunk_o_fwd.py`;
@@ -75,27 +82,73 @@ Principal source areas:
 The memory recurrence maps to generalized DPLR as
 
 ```text
-q=chi, k=d, a=e, b=-d, v=z, scale=1.
+q=chi, k=d, a=-exp(log_alpha)e, b=d, v=z, scale=1.
 ```
 
-Production reuses FLA's fast-WY, FP32 state-boundary, chunk-parallel output,
-output-owned reverse, state reverse, and triangular transpose. SolveDelta
-adapts the source interface to direct `e` and emits panel-native operands;
-it does not retain an upstream `e=b*k` public boundary.
+FLA's low-rank action consumes the pre-decay state, whereas SolveDelta erases
+from `S_decay`. The current decay factor in `a` is therefore part of the exact
+mapping. The direct-`e` specialization folds it into the inclusive decay
+prefix instead of materializing a scaled source panel.
 
-### L2 normalization and decay scan
+Production adapts FLA's exact unbounded scalar pair forward/transpose to load
+the source-native rectangular panels. It forms only the two distinct pair
+matrices, merges the duplicated source cotangents in-register, and closes
+decay with the same vector reverse-cumsum ownership. FLA's fast-WY, FP32
+state-boundary, chunk-parallel output, output-owned reverse, state reverse,
+and triangular transpose remain connected. The generic token-major ABI and
+its four pair matrices are not retained.
+
+### L2 normalization, decay, and output gate
 
 Principal source areas:
 
 - `fla/modules/l2norm.py`;
+- `fla/layers/kda.py`;
+- `fla/ops/kda/gate.py`;
+- `fla/modules/fused_norm_gate.py`;
 - `fla/ops/rwkv6/chunk.py`;
 - `fla/ops/utils/`.
 
-The native L2Norm keeps FLA's row ownership and strict transpose while
-accepting fused-projection views with arbitrary outer strides. The exterior
-uses FLA's chunk cumsum convention for channel decay and its transpose through
-the direct-e pair owner. Norms, cumsums, and sensitive scalar reductions remain
-FP32.
+The standalone native L2Norm keeps FLA's row ownership and strict transpose for
+`u`. The relative source owner applies the same FP32 reduction and transpose to
+strided q/key views before generating the exterior panels, eliminating two
+normalized HBM panels. Its bounded frame actions have a static range proof, so
+their private `d/e/chi` panels are written directly from the FP32 producer to
+FP16; operands multiplied by unbounded decay factors remain BF16. The model
+uses KDA's low-rank coordinate-decay
+parameterization and upstream fused gate/transpose. The output readout adapts
+FLA's sigmoid-gated RMSNorm row owner and strict transpose, adding a per-head
+bounded radial scale while its FP32 `rstd` is resident. The exterior retains
+FLA's chunk cumsum convention and its transpose
+through the direct-e pair owner. Norms, cumsums, and sensitive scalar
+reductions remain FP32. The source owner also specializes scaled-L2Norm
+arithmetic for the bounded frame covector without writing a separate radial
+panel.
+
+The radial modulation is mathematically related to feature-wise modulation
+and channel recalibration, not copied implementation code:
+
+- FiLM: <https://arxiv.org/abs/1709.07871>;
+- Squeeze-and-Excitation: <https://arxiv.org/abs/1709.01507>.
+
+Unlike a free FiLM scale, SolveDelta maps the per-head strength and observed
+RMS through bounded coordinates, so the multiplier remains in `(1/2,3/2)`.
+
+## Rank-one invertibility precedents
+
+Rezende and Mohamed's planar normalizing flow identifies the determinant
+condition for identity-plus-rank-one maps and reparameterizes the parallel
+component to preserve invertibility. Behrmann et al.'s invertible residual
+networks use a strict residual norm bound to obtain global invertibility.
+SolveDelta uses the stronger norm-bounded option because a merely positive
+determinant may still approach zero or permit a large shear:
+
+- <https://proceedings.mlr.press/v37/rezende15.html>;
+- <https://proceedings.mlr.press/v97/behrmann19a.html>.
+
+No source code from either project is copied. Their mathematical conditions
+motivate the static `||u|| ||phi|| < 5/8` contract; the concrete GPU arithmetic
+continues to use the FLA-derived source-owner and L2Norm schedules above.
 
 ### Model shell
 
@@ -120,26 +173,6 @@ inversion, CG, and their transposes from model semantics. MESA remains useful
 comparative prior art, but no MESA geometry kernel is part of the selected
 operator.
 
-## TileLang
-
-Repository: <https://github.com/tile-ai/tilelang>
-
-License: MIT, with separately licensed bundled components as documented by the
-upstream distribution.
-
-The C16 direct-`e` pair forward and transpose use TileLang and specialize
-FLA's generalized-DPLR/KDA scheduling style:
-
-- one chunk/head owner;
-- low-precision source tiles;
-- Tensor Core pair GEMMs with FP32 accumulation;
-- causal triangular masking in the pair epilogue;
-- final source ownership in reverse.
-
-The pair owner consumes the source owner's rectangular panels directly.
-Changing the upstream ABI and tensor names is deliberate: retaining a generic
-interface would reintroduce token-major copies and duplicated source work.
-
 ## GDN2 and KDA
 
 FLA GDN2 and KDA provide the principal comparison and reverse-ownership
@@ -151,7 +184,10 @@ Retained design influence:
 - chunk/rank/value CTA parallelism rather than one sequence/head CTA;
 - direct-`e` specialization when erase is already a covector;
 - selective splitting of state and output reverse;
-- gate and source epilogues fused only when their lifetimes coincide.
+- gate and source epilogues fused only when their lifetimes coincide;
+- independent GDN2 channel-wise erase/write gates;
+- KDA low-rank coordinate decay and output-gate projections;
+- KDA sigmoid-gate projection and FLA gated-RMSNorm row ownership.
 
 SolveDelta reduces exactly to the ordinary GDN2 edit/read at `gamma=0`, but
 the predictor remains a SolveDelta-specific model component.
@@ -177,7 +213,8 @@ License: BSD-3-Clause.
 
 The frontend uses the runtime package for independent depthwise causal conv4,
 SiLU, recurrent final conv state, and its complete VJP. SolveDelta does not
-maintain a handwritten convolution fallback.
+maintain a handwritten convolution fallback. The selected compatibility
+baseline is causal-conv1d `1.7.x`.
 
 ## PyTorch and Hugging Face Transformers
 
@@ -187,19 +224,36 @@ accounting, and module/runtime primitives. Hugging Face Transformers supplies
 causal-LM result types. Their runtime licenses and dependency metadata remain
 owned by those packages.
 
+The fixed-shape training helper uses PyTorch's
+`set_override_stale_capture_stream` behavior introduced by PR 180090:
+<https://github.com/pytorch/pytorch/pull/180090>. It retains parameter gradient
+edges on the caller's replay stream, captures local loss forward/backward, and
+installs DDP afterward. DDP reducer hooks and NCCL collectives remain outside
+the graph. This is a runtime composition decision; no PyTorch implementation
+source is copied.
+
+PyTorch PR 189914 removes eager TorchScript compilation from the Inductor
+import path: <https://github.com/pytorch/pytorch/pull/189914>. Stable PyTorch
+2.13.0 predates that change, so package initialization scopes only its exact
+MKLDNN `script_method` deprecation while importing FLA. No warning category is
+disabled globally and no PyTorch source is vendored.
+
 ## Selected implementation decisions
 
 | Decision | Selected form | Reason |
 | --- | --- | --- |
 | Geometry state | FP32 residual predictor `C` | Direct solution-coordinate history; no covariance inversion |
-| Frame | Token-local `F=I+u delta^T` | Exact rank-one inverse transpose and local similarity |
+| Frame | Token-local `F=I+u phi^T`, `||u|| ||phi||<5/8` | Exact similarity with `den>3/8` and bounded conditioning |
 | Predictor schedule | FLA gated-Oja C32 specialization | Exact recurrence and mature forward/transpose |
-| Memory schedule | TileLang direct-e pair + FLA DPLR C16 | Mature pair/WY/state/output ownership |
+| Memory schedule | Exact unbounded Triton direct-e pair + FLA DPLR C16 | Exact decay semantics with mature pair/WY/state/output ownership |
+| Delta gates | Independent channel-wise `sigmoid(erase_raw/write_raw)` | Preserves the full GDN2 update surface and separate source cotangents |
+| Decay/readout | KDA low-rank coordinate gate + bounded radial gated RMSNorm | Preserves coordinate decay/output gating and a controlled geometry-magnitude signal |
 | Source ABI | Panel-native direct and paired sources | Deletes token-major `d/e/chi` copy boundary |
 | Fusion | Selective | Preserves useful CTA parallelism and short lifetimes |
 | Public state | `(C,S)` only | No redundant inverse or diagnostic state |
-| Precision | BF16 multiplicands, FP32 accumulation/state/scalars | Matches Tensor Core and recurrence requirements |
+| Precision | bounded FP16 source panels, BF16 decay-scaled operands, FP32 accumulation/state/scalars | Uses extra mantissa only where a static range proof permits it |
 | Dense masks/resets | Reference recurrence | Same semantics until a mature packed native owner is connected |
+| Distributed CUDA Graph | Local graph first, DDP reducer outside capture | Stable `AccumulateGrad` ownership without coupling graphs to NCCL buckets |
 
 ## Rejected or removed alternatives
 
@@ -211,9 +265,12 @@ owned by those packages.
 | Runtime RLS/Residual selector | Creates two public contracts and prevents one authoritative oracle |
 | Flat expanded token axis | Exposes private edits as a synthetic sequence and inflates checkpoints |
 | Sequence/head resident mega-kernel | Measured loss of chunk/rank/value CTA parallelism |
+| Centered Tensor-Core direct-e pair | Requires a static decay lower bound; long-run unbounded decay overflowed despite finite model inputs |
+| TileLang runtime pair path | Removed with the centered owner; the selected exact-unbounded specialization uses Triton already provided by FLA |
+| FLA fused DPLR `chunk_ho` at C16 | Saved state/output HBM but regressed the target shape because too few CTAs serially advanced all chunks |
 | Public canonicalization copies | Fused projection views can be consumed by stride-aware owners |
 | BF16-to-FP16 pseudo-promotion | Cannot recover discarded mantissa bits |
-| Denominator clamp/fallback | Silently changes the model instead of testing frame stability |
+| Denominator clamp/fallback | Replaced by a smooth analytic radial parameterization with no data-dependent branch |
 
 ## Provenance maintenance
 

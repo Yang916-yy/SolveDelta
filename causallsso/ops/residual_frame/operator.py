@@ -4,15 +4,131 @@ from __future__ import annotations
 
 import torch
 
-from ...reference import SolveDeltaState, solvedelta_zero_state
-from .exterior import direct_e_residual
+from ...reference import SolveDeltaState
+from .exterior import _backward as exterior_backward
+from .exterior import _forward as exterior_forward
 from .l2norm import strided_l2norm
 from .predictor import oja_residual
-from .sources import relative_sources
+from .sources import relative_sources_backward, relative_sources_forward
 
 
 PREDICTOR_CHUNK_SIZE = 32
 EXTERIOR_CHUNK_SIZE = 16
+
+
+class _RelativeExterior(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        u,
+        update,
+        q,
+        key,
+        value,
+        erase_raw,
+        write_raw,
+        log_decay,
+        initial_state,
+        chunk_size,
+        output_final_state,
+    ):
+        direct, paired, injection = relative_sources_forward(
+            u,
+            update,
+            q,
+            key,
+            value,
+            erase_raw,
+            write_raw,
+            chunk_size=chunk_size,
+        )
+        output, state_out, _ = exterior_forward(
+            direct,
+            paired,
+            injection,
+            log_decay,
+            initial_state,
+            chunk_size,
+            final_state=output_final_state,
+        )
+        ctx.chunk_size = chunk_size
+        ctx.has_initial_state = initial_state is not None
+        ctx.set_materialize_grads(False)
+        saved_initial = u.new_empty(0) if initial_state is None else initial_state
+        ctx.save_for_backward(
+            u,
+            update,
+            q,
+            key,
+            value,
+            erase_raw,
+            write_raw,
+            log_decay,
+            saved_initial,
+        )
+        return output, state_out
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_final_state):
+        (
+            u,
+            update,
+            q,
+            key,
+            value,
+            erase_raw,
+            write_raw,
+            log_decay,
+            saved_initial,
+        ) = ctx.saved_tensors
+        initial_state = saved_initial if ctx.has_initial_state else None
+        direct, paired, injection = relative_sources_forward(
+            u,
+            update,
+            q,
+            key,
+            value,
+            erase_raw,
+            write_raw,
+            chunk_size=ctx.chunk_size,
+        )
+        (
+            grad_direct,
+            grad_paired,
+            grad_injection,
+            grad_decay,
+            grad_initial,
+        ) = exterior_backward(
+            direct,
+            paired,
+            injection,
+            log_decay,
+            initial_state,
+            grad_output,
+            grad_final_state,
+            ctx.chunk_size,
+            panel_gradient_dtype=torch.float32,
+        )
+        source_gradients = relative_sources_backward(
+            u,
+            update,
+            q,
+            key,
+            value,
+            erase_raw,
+            write_raw,
+            grad_direct,
+            grad_paired,
+            grad_injection,
+            chunk_size=ctx.chunk_size,
+        )
+        return (
+            *source_gradients,
+            grad_decay,
+            grad_initial,
+            None,
+            None,
+        )
 
 
 def solvedelta_residual_frame_native(
@@ -61,56 +177,49 @@ def solvedelta_residual_frame_native(
     if length % EXTERIOR_CHUNK_SIZE:
         raise ValueError("the first native Residual-Frame path requires T divisible by 16")
 
-    neutral = solvedelta_zero_state(
-        batch,
-        heads,
-        rank,
-        value_dim,
-        dtype=torch.float32,
-        device=u.device,
-    )
-    state = neutral if initial_state is None else initial_state
-    if any(value.shape != expected.shape for value, expected in zip(state, neutral)):
-        raise ValueError("initial_state shapes do not match the input geometry")
-    if any(value.dtype != torch.float32 for value in state):
-        raise TypeError("all continuation states must be FP32")
+    if initial_state is None:
+        predictor_initial = None
+        memory_initial = None
+    else:
+        expected_shapes = (
+            (batch, heads, rank, rank),
+            (batch, heads, rank, value_dim),
+        )
+        if any(
+            value.shape != expected
+            for value, expected in zip(initial_state, expected_shapes)
+        ):
+            raise ValueError("initial_state shapes do not match the input geometry")
+        if any(value.dtype != torch.float32 for value in initial_state):
+            raise TypeError("all continuation states must be FP32")
+        predictor_initial, memory_initial = initial_state
 
     u_panel = strided_l2norm(u)
-    q_panel = strided_l2norm(q)
-    key_panel = strided_l2norm(keys.squeeze(-2))
     if geometry_write.shape != (batch, length, heads):
         geometry_write = geometry_write.reshape(1, 1, heads).expand(
             batch, length, heads
         )
 
-    # FLA's current Oja WY helper assumes a packed target. This temporary
-    # boundary is removed by the stride-aware donor specialization below.
     update, final_predictor = oja_residual(
-        h.contiguous(),
+        h,
         u_panel,
         geometry_write,
-        state.predictor,
+        predictor_initial,
         chunk_size=PREDICTOR_CHUNK_SIZE,
         output_final_state=return_final_state,
     )
-    direct, paired, injection = relative_sources(
+    output, final_memory = _RelativeExterior.apply(
         u_panel,
         update,
-        q_panel,
-        key_panel,
+        q,
+        keys.squeeze(-2),
         values.squeeze(-2),
         erase_raw.squeeze(-2),
         write_raw.squeeze(-2),
-        chunk_size=EXTERIOR_CHUNK_SIZE,
-    )
-    output, final_memory = direct_e_residual(
-        direct,
-        paired,
-        injection,
         associative_log_decay,
-        state.S,
-        chunk_size=EXTERIOR_CHUNK_SIZE,
-        output_final_state=return_final_state,
+        memory_initial,
+        EXTERIOR_CHUNK_SIZE,
+        return_final_state,
     )
     output = output.to(torch.bfloat16)
     if not return_final_state:

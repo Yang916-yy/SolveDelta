@@ -212,6 +212,12 @@ class SolveDeltaPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["SolveDeltaBlock"]
     _supports_cache_class = True
+    _keep_in_fp32_modules_strict = [
+        "geometry_write_bias",
+        "associative_log_rate",
+        "associative_decay_bias",
+        "radial_strength",
+    ]
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):

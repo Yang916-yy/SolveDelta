@@ -8,6 +8,9 @@ import torch
 import torch.nn.functional as F
 
 
+RELATIVE_FRAME_RADIUS = 5.0 / 8.0
+
+
 class SolveDeltaState(NamedTuple):
     predictor: torch.Tensor
     S: torch.Tensor
@@ -161,18 +164,33 @@ def solvedelta_reference(
         residual = h[:, token] - (
             predictor @ u_t.unsqueeze(-1)
         ).squeeze(-1)
-        delta = geometry_write[:, token, :, None] * residual
-        predictor_new = predictor + delta[..., :, None] * u_t[..., None, :]
+        predictor_update = geometry_write[:, token, :, None] * residual
+        predictor_new = (
+            predictor
+            + predictor_update[..., :, None] * u_t[..., None, :]
+        )
 
-        denominator = 1.0 + (delta * u_t).sum(dim=-1)
+        direction_norm_sq = (u_t * u_t).sum(dim=-1, keepdim=True)
+        update_norm_sq = (
+            predictor_update * predictor_update
+        ).sum(dim=-1, keepdim=True)
+        frame_scale = RELATIVE_FRAME_RADIUS / torch.sqrt(
+            RELATIVE_FRAME_RADIUS**2
+            + direction_norm_sq * update_norm_sq
+        )
+        frame_covector = frame_scale * predictor_update
+
+        denominator = 1.0 + (frame_covector * u_t).sum(dim=-1)
         key = keys[:, token, :, 0]
         erase_key = erase[:, token, :, 0] * key
-        direct = key + u_t * (delta * key).sum(dim=-1, keepdim=True)
-        dual = erase_key - delta * (
+        direct = key + u_t * (
+            frame_covector * key
+        ).sum(dim=-1, keepdim=True)
+        dual = erase_key - frame_covector * (
             (u_t * erase_key).sum(dim=-1, keepdim=True)
             / denominator[..., None]
         )
-        query = q[:, token] - delta * (
+        query = q[:, token] - frame_covector * (
             (u_t * q[:, token]).sum(dim=-1, keepdim=True)
             / denominator[..., None]
         )
@@ -207,6 +225,7 @@ def solvedelta_reference(
 
 
 __all__ = [
+    "RELATIVE_FRAME_RADIUS",
     "SolveDeltaState",
     "solvedelta_reference",
     "solvedelta_zero_state",

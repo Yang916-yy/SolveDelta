@@ -20,7 +20,12 @@ compile_commands.json
 *.ncu-rep
 data/
 runs/
+
+# Exploratory kernels, downloaded data, checkpoints, and benchmark artifacts
+# belong outside the production repository. Git history owns archived designs.
+/experiments/
 *.pt
 *.pth
 *.ckpt
+*.safetensors
 *.so

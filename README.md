@@ -1,23 +1,31 @@
 # SolveDelta
 
-**History-conditioned Delta memory for causal language models.**
+**A CUDA-native recurrent memory layer that learns how to edit in a coordinate
+system formed by the prefix.**
 
-SolveDelta learns a full matrix predictor from the observed prefix. Each new
-prediction residual generates an exact rank-one coordinate frame for the
-current Delta edit and query:
+SolveDelta combines online residual learning, the Delta rule, and linear
+attention-style chunking. A full matrix predictor learns relationships in the
+observed prefix; each new residual produces a bounded rank-one frame that
+transforms the current memory edit and query:
 
 ```text
 prefix -> residual predictor -> relative frame
        -> channel-decayed Delta edit -> query read
 ```
 
-The operator remains causal and recurrent. Its fixed-size FP32 continuation is
-only the predictor and memory state `(C,S)`; it carries no covariance,
-inverse, or token history.
+The result is causal, recurrent, and streamable. Its fixed-size FP32
+continuation is only `(C,S)`: a residual predictor and the Delta memory. It
+carries no covariance, inverse, attention matrix, or token history. At finite
+`gamma=0`, its memory path is exactly GDN2; enabling geometry adds
+history-conditioned coordinates without changing the ordinary Delta edit.
 
-The repository includes an FP64 oracle, a BF16/FP32 CUDA training path built
-from mature FLA/TileLang blocks, and a complete Hugging Face causal LM with
-recurrent cache and CUDA Graph training support.
+This repository includes the FP64 mathematical oracle, a BF16/FP32 CUDA path
+specialized from mature Flash Linear Attention primitives, and a complete
+Hugging Face causal LM with recurrent cache and CUDA Graph training.
+
+Keywords: **recurrent memory**, **Delta rule**, **linear attention**,
+**causal language modeling**, **online residual learning**, **PyTorch**,
+**Triton**, and **CUDA**.
 
 ## Highlights
 
@@ -26,11 +34,15 @@ recurrent cache and CUDA Graph training support.
   History accumulates in solution coordinates without covariance inversion,
   CG, an SPD prior, or global forgetting of unobserved directions.
 - **Exact local primal/dual frame.** The factor
-  `F=I+u delta^T` maps the edit key with `F` and erase/query covectors with
-  `F^-T`. The resulting Delta transition is an exact similarity transform,
+  `F=I+u phi^T` uses a statically bounded radial covector, maps the edit key
+  with `F`, and maps erase/query covectors with `F^-T`. The resulting Delta
+  transition is an exact, analytically well-conditioned similarity transform,
   not an approximate inverse action.
 - **GDN2 is structurally contained.** At finite `gamma=0`, `F=I` and the
-  memory path reduces exactly to the ordinary gated Delta edit/read.
+  independent channel-wise erase/write gates give the GDN2 edit/read exactly.
+  The model retains GDN2's low-rank coordinate decay and output gate, while a
+  bounded radial-aware RMSNorm keeps output-magnitude evidence from the learned
+  geometry instead of projecting all of it away.
 - **Full matrix history, rank-one work.** The predictor has `r^2` recurrent
   capacity while each token contributes one rank-one residual write that maps
   to mature pair/WY/state kernels.
@@ -43,13 +55,29 @@ recurrent cache and CUDA Graph training support.
 - **One mathematical owner.** `causallsso/reference.py` is the sole
   executable FP64 operator definition.
 
-## Quick Start
+## Installation
 
-Install the native dependencies and tests:
+The optimized path targets Linux on an NVIDIA CUDA GPU with native BF16
+support. Python `3.10+` is supported; install a CUDA-enabled PyTorch build for
+your driver first, then install SolveDelta:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+# Install the appropriate CUDA-enabled torch build from pytorch.org first.
 python -m pip install -e ".[native,test]"
+python -m pytest -q -s
 ```
+
+The current validated stack is Python `3.12`, PyTorch `2.13.0+cu130`, Triton
+`3.7.1`, Transformers `5.15.0`, FLA `0.6.0`, and causal-conv1d `1.7.0` on an
+RTX 5070 Ti. These are validated versions, not a claim that older supported
+versions have identical performance. See [Environment and Installation](docs/ENVIRONMENT.md)
+for the dependency matrix, source-build requirements, verification commands,
+and native-path constraints.
+
+## Quick Start
 
 Construct a causal LM through the Hugging Face auto classes:
 
@@ -128,6 +156,35 @@ distributed reduction remain outside capture. Masks, resets, recurrent cache,
 gradient checkpointing, and module hooks are outside this dense graph surface.
 Use ordinary fused cross entropy; FLA fused linear cross entropy currently
 performs a host-synchronizing label count and is rejected before capture.
+Construct and replay a helper on the same CUDA stream.
+
+For DDP, initialize NCCL and select one CUDA device per process, then ask the
+helper to install DDP after local graph capture:
+
+```python
+import os
+import torch.distributed as dist
+
+dist.init_process_group("nccl")
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+model = model.cuda().train()
+
+graph_step = SolveDeltaGraphedTrainingStep(
+    model,
+    sample_input_ids=input_ids,
+    sample_labels=input_ids,
+    distributed=True,
+)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+```
+
+Do not wrap `model` in DDP before constructing the helper. The captured graph
+owns fixed-shape local compute; DDP parameter hooks and NCCL reductions execute
+after graph replay. This avoids coupling CUDA Graph capture to reducer buckets
+or collective capture support while preserving ordinary DDP gradient
+accumulation semantics. For accumulation without a reduction on every
+microbatch, wrap both replay and backward in `with graph_step.no_sync():`, just
+as with ordinary DDP.
 
 ## How It Works
 
@@ -143,11 +200,16 @@ C_t = C_{t-1} + delta_t u_t^T.
 The relative frame is
 
 ```text
-F_t = I + u_t delta_t^T
-F_t^-T x = x - delta_t (u_t^T x) / (1 + delta_t^T u_t).
+rho = 5/8
+phi_t = rho delta_t / sqrt(rho^2 + ||u_t||^2 ||delta_t||^2)
+F_t = I + u_t phi_t^T
+F_t^-T x = x - phi_t (u_t^T x) / (1 + phi_t^T u_t).
 ```
 
-With normalized edit key `k_t`, erase covector `b_t), and query `q_t`:
+The radial map is identity to first order and gives
+`3/8 < 1+phi_t^T u_t < 13/8`, while leaving the predictor update unchanged.
+
+With normalized edit key `k_t`, erase covector `b_t`, and query `q_t`:
 
 ```text
 d_t   = F_t k_t
@@ -162,8 +224,9 @@ e_t^T d_t = b_t^T k_t
 I-d_t e_t^T = F_t (I-k_t b_t^T) F_t^-1.
 ```
 
-The channel-decayed memory then performs one ordinary Delta write in that
-relative frame and reads with `chi_t`. See
+The channel-decayed memory applies GDN2's independent channel-wise write and
+erase gates in that relative frame and reads with `chi_t`. The core output then
+passes through a low-rank sigmoid gate and bounded radial-aware RMSNorm. See
 `docs/INNOVATION_PROGRAM.md` for the derivation and
 `docs/FROM_SCRATCH_REBUILD.md` for exact execution ownership.
 
@@ -172,12 +235,16 @@ relative frame and reads with `chi_t`. See
 The CUDA path specializes concrete mature primitives instead of retaining
 their upstream public ABIs:
 
-- stride-aware FLA L2Norm;
-- FLA gated-Oja pair, triangular WY, matrix-state forward, and transpose for
-  the residual predictor;
-- a fused source owner that writes direct/dual/query exterior panels;
-- TileLang direct-`e` pair forward/transpose;
-- FLA generalized-DPLR WY, state/output, and output-owned reverse.
+- stride-aware FLA L2Norm for the predictor source;
+- FLA gated-Oja pair, triangular WY, matrix-state forward, and an ungated
+  transpose specialization for the residual predictor;
+- a fused source owner that normalizes strided query/key views and writes
+  direct/dual/query exterior panels while closing erase/write transposes;
+- an exact unbounded Triton specialization of FLA's direct-`e` pair
+  forward/transpose;
+- FLA generalized-DPLR WY, state/output, and output-owned reverse;
+- FLA KDA coordinate-decay and output-gate projections plus a specialized FLA
+  RMSNorm owner that preserves a bounded radial signal and its exact VJP.
 
 The producer writes the consumer's panel layout directly, so no token-major
 `d/e/chi` ABI or panelization copy remains. State and output stay selectively
@@ -194,27 +261,39 @@ training may provide `cu_seqlens`; explicit resets may provide
 `solvedelta_reset_mask`. Dense batches without padding should omit an
 all-ones `attention_mask` so they stay on the optimized native path.
 
-## Measured Core Performance
+## Performance Snapshot
 
 Development measurements use an RTX 5070 Ti at
-`B=1,T=1024,H=8,r=V=128`, BF16 public operands and FP32 state:
+`B=1,T=1024,H=8,r=V=128`, BF16 autocast, FP32 master parameters/state, and
+CUDA Graph replay. Both paths omit final continuation output in this table.
 
-| Execution | Forward median/p95 | F+B median/p95 | Peak allocated |
-| --- | ---: | ---: | ---: |
-| Eager core | 0.498 / 0.644 ms | 1.861 / 2.056 ms | 105.1 MiB incremental |
-| CUDA Graph core | 0.187 / 0.193 ms | 0.717 / 0.918 ms | capture-owned |
-| CUDA Graph projected mixer | 0.406 / 0.518 ms | 1.428 / 1.639 ms | 120.0 MiB capture increment |
+| Scope | Path | Forward median/p95 | F+B median/p95 | Graph allocated |
+| --- | --- | ---: | ---: | ---: |
+| Core operator | SolveDelta | 0.175 / 0.182 ms | 0.635 / 0.645 ms | 61.1 MiB |
+| Core operator | FLA GDN2 | 0.108 / 0.124 ms | 0.464 / 0.476 ms | 46.0 MiB |
+| Projected mixer | SolveDelta | 0.425 / 0.434 ms | 1.493 / 1.861 ms | 247.7 MiB |
+| Projected mixer | FLA GDN2 | 0.366 / 0.380 ms | 1.272 / 1.450 ms | 233.2 MiB |
 
-The core F+B number includes output plus both final-state cotangents. The
-projected mixer adds projection, conv4, source gates, and output projection but
-excludes MLP, LM head, loss, and optimizer. Benchmarks describe this
-implementation; they do not define model semantics.
+At the projected-mixer boundary, SolveDelta currently pays about `16%` forward
+and `17%` F+B latency over GDN2, plus `14.5 MiB` active Graph allocation, for
+the residual predictor and relative-frame actions. The mixer comparison adds
+projection, conv4, gates, normalization, and output projection, but excludes
+the MLP, LM head, optimizer, and distributed communication.
+
+The core rows expose different mathematical contracts: SolveDelta includes its
+predictor and initial `(C,S)` cotangents, while GDN2 has no predictor. The
+projected-mixer rows are the primary hidden-to-hidden comparison.
+
+This is a development snapshot, not a hardware-independent claim. Scope,
+numerical quality, the exploratory 200M-token comparison, and measurement
+caveats are recorded in [Evaluation and Performance](docs/RESULTS.md).
 
 ## Correctness
 
 The acceptance suite covers:
 
 - FP64 residual prediction and exact relative-frame identities;
+- the analytic `3/8` denominator lower bound under adversarial residuals;
 - finite-parameter GDN2 reduction at `gamma=0`;
 - masks, resets, recurrent splits, and a non-128 width;
 - BF16 native output and FP32 final `(C,S)`;
@@ -230,9 +309,6 @@ python -m pytest -q -s
 
 ## Current Limits
 
-- The scalar `1+delta_t^T u_t` has no structural positive lower bound.
-  Training should monitor its distribution; production does not clamp or
-  silently fall back.
 - Dense native execution currently requires sequence lengths divisible by 16.
 - Masks and resets use the same reference operator rather than a packed native
   kernel.
@@ -250,6 +326,10 @@ requirements, test gates, and benchmark reporting rules. Material upstream
 reuse is documented in `docs/PRIOR_ART.md` and
 `THIRD_PARTY_NOTICES.md`.
 
+SolveDelta is research software under active development. No repository-wide
+license has yet been selected for original code; review
+`THIRD_PARTY_NOTICES.md` before redistribution.
+
 ## Repository Map
 
 - `causallsso/reference.py`: sole FP64 mathematical oracle;
@@ -258,5 +338,7 @@ reuse is documented in `docs/PRIOR_ART.md` and
 - `causallsso/ops/residual_frame/`: selected native forward and transpose;
 - `docs/FROM_SCRATCH_REBUILD.md`: native implementation blueprint;
 - `docs/INNOVATION_PROGRAM.md`: derivation and interpretation;
+- `docs/ENVIRONMENT.md`: supported environment, installation, and diagnosis;
+- `docs/RESULTS.md`: scoped performance and exploratory model evidence;
 - `docs/PRIOR_ART.md`: upstream provenance and production decisions;
 - `THIRD_PARTY_NOTICES.md`: adapted-source attribution.

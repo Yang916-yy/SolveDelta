@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+import threading
+import warnings
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from .modeling_solvedelta import SolveDeltaForCausalLM
 
 
+_CAPTURE_LOCK = threading.Lock()
+_ACCUMULATE_GRAD_WARNING = (
+    "The AccumulateGrad node's stream does not match the stream of the node "
+    "that produced the incoming gradient.*"
+)
+
+
 class _CausalLMLoss(nn.Module):
-    def __init__(self, model: SolveDeltaForCausalLM) -> None:
+    def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
 
@@ -34,6 +46,56 @@ class _CausalLMLoss(nn.Module):
         return loss
 
 
+def _capture_loss(
+    loss_module: _CausalLMLoss,
+    static_input_ids: torch.Tensor,
+    static_labels: torch.Tensor,
+    *,
+    num_warmup_iters: int,
+    pool: Any | None,
+) -> nn.Module:
+    set_override = getattr(
+        torch.autograd.graph, "set_override_stale_capture_stream", None
+    )
+    get_override = getattr(torch._C, "_override_stale_capture_stream", None)
+    if set_override is None or get_override is None:
+        raise RuntimeError(
+            "CUDA Graph training requires a PyTorch build with stale capture "
+            "stream override support (validated with PyTorch 2.13+)"
+        )
+
+    # make_graphed_callables warms up on a private side stream. Parameters or
+    # DDP hooks may retain an AccumulateGrad node created on another stream.
+    # PyTorch's scoped override redirects only stale nodes encountered while a
+    # producer is actively capturing; ordinary eager stream semantics remain
+    # unchanged after this block.
+    with _CAPTURE_LOCK:
+        previous_override = bool(get_override())
+        set_override(True)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=_ACCUMULATE_GRAD_WARNING,
+                    category=UserWarning,
+                    module=r"torch\.autograd\.graph",
+                )
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.bfloat16,
+                    cache_enabled=False,
+                ):
+                    return torch.cuda.make_graphed_callables(
+                        loss_module,
+                        (static_input_ids, static_labels),
+                        num_warmup_iters=num_warmup_iters,
+                        allow_unused_input=False,
+                        pool=pool,
+                    )
+        finally:
+            set_override(previous_override)
+
+
 class SolveDeltaGraphedTrainingStep:
     """Capture fixed-shape CausalLM loss forward and backward as CUDA Graphs.
 
@@ -42,6 +104,11 @@ class SolveDeltaGraphedTrainingStep:
     optimizer intentionally remains outside the graph so its implementation,
     gradient accumulation, clipping, and distributed ownership stay under the
     training loop's control.
+
+    With ``distributed=True``, the local loss callable is captured first and
+    then wrapped in DistributedDataParallel. DDP's collectives remain outside
+    capture, avoiding stale AccumulateGrad streams and keeping communication
+    ownership independent of the fixed-shape compute graph.
 
     Capture is limited to the optimized dense training surface: CUDA token IDs
     and labels with one fixed shape, no masks/resets, no recurrent cache, and
@@ -58,6 +125,8 @@ class SolveDeltaGraphedTrainingStep:
         *,
         num_warmup_iters: int = 3,
         pool: Any | None = None,
+        distributed: bool = False,
+        process_group: Any | None = None,
     ) -> None:
         if not isinstance(model, SolveDeltaForCausalLM):
             raise TypeError("model must be a SolveDeltaForCausalLM")
@@ -69,6 +138,20 @@ class SolveDeltaGraphedTrainingStep:
             raise TypeError("num_warmup_iters must be an int")
         if num_warmup_iters < 1:
             raise ValueError("num_warmup_iters must be positive")
+        if not isinstance(distributed, bool):
+            raise TypeError("distributed must be a bool")
+        if process_group is not None and not distributed:
+            raise ValueError("process_group requires distributed=True")
+        if distributed and not dist.is_initialized():
+            raise RuntimeError(
+                "initialize torch.distributed before distributed graph capture"
+            )
+        if distributed:
+            backend = str(dist.get_backend(process_group)).lower()
+            if backend != "nccl":
+                raise RuntimeError(
+                    "distributed CUDA Graph training requires an NCCL process group"
+                )
         if getattr(model.model, "gradient_checkpointing", False):
             raise ValueError("disable gradient checkpointing before CUDA Graph capture")
         if model.config.fuse_linear_cross_entropy:
@@ -94,26 +177,48 @@ class SolveDeltaGraphedTrainingStep:
 
         self.model = model
         self.device = sample_input_ids.device
+        self._replay_stream = torch.cuda.current_stream(self.device)
         self.batch_size, self.sequence_length = sample_input_ids.shape
         self._input_dtype = sample_input_ids.dtype
         self._label_dtype = sample_labels.dtype
+
+        # AccumulateGrad records the stream on which its node is first created.
+        # Keep parameter edges owned by the caller's replay stream so the
+        # graphed backward and post-capture DDP hooks do not inherit the private
+        # warmup/capture stream used by make_graphed_callables.
+        self._gradient_edges = tuple(
+            torch.autograd.graph.get_gradient_edge(parameter)
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
 
         # Own the sample storage used as the graph's static input surface.
         static_input_ids = sample_input_ids.detach().contiguous().clone()
         static_labels = sample_labels.detach().contiguous().clone()
         loss_module = _CausalLMLoss(model).train()
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.bfloat16,
-            cache_enabled=False,
-        ):
-            self._graphed_loss = torch.cuda.make_graphed_callables(
-                loss_module,
-                (static_input_ids, static_labels),
-                num_warmup_iters=num_warmup_iters,
-                allow_unused_input=False,
-                pool=pool,
+        graphed_loss = _capture_loss(
+            loss_module,
+            static_input_ids,
+            static_labels,
+            num_warmup_iters=num_warmup_iters,
+            pool=pool,
+        )
+        self.distributed = distributed
+        if distributed:
+            device_index = sample_input_ids.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            self._graphed_loss = DistributedDataParallel(
+                graphed_loss,
+                device_ids=[device_index],
+                output_device=device_index,
+                forward_sync_buffers=False,
+                process_group=process_group,
+                gradient_as_bucket_view=True,
+                static_graph=True,
             )
+        else:
+            self._graphed_loss = graphed_loss
 
     @staticmethod
     def _validate_pair(
@@ -148,9 +253,22 @@ class SolveDeltaGraphedTrainingStep:
             raise TypeError("input dtypes must match the captured sample dtypes")
         if input_ids.device != self.device:
             raise ValueError("input device must match the captured CUDA device")
+        if (
+            torch.cuda.current_stream(self.device).cuda_stream
+            != self._replay_stream.cuda_stream
+        ):
+            raise RuntimeError(
+                "CUDA Graph replay must use the stream that constructed this helper"
+            )
         if not self.model.training:
             raise RuntimeError("the captured model must remain in training mode")
         return self._graphed_loss(input_ids, labels)
+
+    def no_sync(self) -> Any:
+        """Skip DDP gradient reduction for one or more graph replays."""
+        if isinstance(self._graphed_loss, DistributedDataParallel):
+            return self._graphed_loss.no_sync()
+        return nullcontext()
 
 
 __all__ = ["SolveDeltaGraphedTrainingStep"]
