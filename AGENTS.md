@@ -79,10 +79,11 @@ ordinary Delta edit per token (`K=1`). The zero state is
 C_0 = 0,  S_0 = 0.
 ```
 
-The FP32 continuation state is `(C,S)`. `C` is the residual predictor in the
-orientation `prediction = C u`; it is not an inverse, covariance, or
-accumulated absolute frame. For normalized geometry direction `u_t`, the
-predictor update is
+The FP32 continuation state is `(C,S)`. Prefix observations conceptually
+define `J=sum(u u^T)`, `G=sum(h u^T)`, and the normal equation `C J = G`.
+Production carries the online solution `C` in the orientation
+`prediction = C u` and advances it directly with normalized LMS. For
+normalized geometry direction `u_t`, the update is
 
 ```text
 r_t = h_t - C_{t-1} u_t

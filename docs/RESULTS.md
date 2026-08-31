@@ -1,8 +1,16 @@
 # Evaluation and Performance
 
-This page records scoped development evidence for the current Residual-Frame
-operator. It is not a leaderboard claim. Benchmarks measure one implementation
-on one device; the language-model comparison uses one exploratory seed.
+This page answers three practical questions about the current Residual-Frame
+operator: what the geometry solver costs, which implementation choices earned
+their place, and what the first language-model runs suggest.
+
+The short version:
+
+- at the projected-mixer boundary, SolveDelta adds about `18%` forward and
+  `12%` F+B latency over same-shape FLA GDN2;
+- paired 50M-token runs selected `gamma=0.90` with plain gated RMSNorm;
+- an earlier 200M-token run was competitive on average NLL and produced a
+  positive paired LAMBADA NLL signal.
 
 ## CUDA Graph operator and mixer
 
@@ -19,24 +27,21 @@ paths.
 | Projected mixer | SolveDelta | 0.428 / 0.614 | 1.437 / 1.632 | 245.8 MiB |
 | Projected mixer | FLA GDN2 | 0.364 / 0.534 | 1.276 / 1.468 | 233.2 MiB |
 
-The core comparison exposes all predictor and relative-source work, so its
-percentage gap is larger. Common projection, conv4, normalization, gating, and
-output work reduce the projected-mixer gap to about `18%` forward and `12%`
-F+B. The mixer boundary excludes the MLP, LM head, optimizer, gradient clipping,
-and distributed communication.
+The core rows isolate SolveDelta's predictor, relative-source actions, and
+initial `(C,S)` cotangents. The projected mixer adds the common projection,
+conv4, normalization, gates, and output projection; it is the primary
+hidden-to-hidden comparison. At that boundary the gap is about `18%` forward
+and `12%` F+B. MLP, LM head, optimizer, clipping, and distributed communication
+sit outside the measurement.
 
-Core is a cost decomposition rather than identical semantics: SolveDelta owns
-the predictor and initial `(C,S)` cotangents, while GDN2 has no predictor. The
-projected-mixer rows are the primary hidden-to-hidden comparison.
+Graph allocated bytes were stable and are reported above. Reserved bytes vary
+with capture pools and allocator buckets, so they are omitted. The projected
+mixers contain `8.99M` SolveDelta parameters and `6.83M` GDN2 parameters at
+this width.
 
-Graph reserved memory is intentionally omitted: independent capture pools and
-allocator buckets changed it across otherwise identical runs. Allocated bytes
-were stable. The projected mixers contain `8.99M` SolveDelta parameters and
-`6.83M` GDN2 parameters at this width.
-
-The synchronized per-replay p95 samples above include a roughly `0.17 ms`
-device P-state tail in both F+B paths and in both mixer forwards. Medians and
-minimums remained stable; the tail is reported rather than filtered.
+The synchronized p95 samples include a roughly `0.17 ms` device P-state tail
+shared by both paths. The table reports the observed tail; medians and minima
+were stable.
 
 ## Projection and accumulation A/B
 
@@ -48,10 +53,9 @@ relative from the low-precision GEMM reduction order. The 56 unused FP32 rows
 cost `0.219 MiB` per layer before optimizer state.
 
 Grouping the two `[1024,128] -> [1024,1024]` decay and output-gate projections
-did not recover their launch bound. Complete two-projection F+B measured
-`172.9 us` for independent `F.linear` calls and `210.0 us` for
-`grouped_mm`, including the required strided-input and weight packing plus the
-separate bias epilogue. The grouped candidate was rejected.
+measured `210.0 us` F+B versus `172.9 us` for two independent `F.linear`
+calls. Strided-input/weight packing and a separate bias epilogue outweighed the
+saved launch, so the independent GEMMs remain selected.
 
 For a one-layer `D=1024,H=8,T=1024,vocab=4096` CausalLM Graph, an
 optimizer-bound BF16 Linear shadow produced the following complete
@@ -65,10 +69,10 @@ microbatch-accumulation step times. Each shadow row includes one refresh:
 | 8 | 26.668 ms | 25.574 ms | -4.1% |
 
 Loss was bitwise identical and the maximum parameter-gradient relative error
-was `7.4e-8`. The shadow added `41.63 MiB` of buffers and about `43.63 MiB`
-to post-capture allocation; measured capture peak increased by `27.5 MiB`.
-It is therefore an explicit accumulation throughput option, not a default or
-a memory optimization.
+was `7.4e-8`. The shadow added `41.63 MiB` of buffers, about `43.63 MiB` after
+capture, and `27.5 MiB` to measured capture peak. It is useful when two or more
+microbatches amortize each refresh; the ordinary FP32-master path remains the
+single-microbatch default.
 
 ## Geometry initialization and readout A/B
 
@@ -88,26 +92,24 @@ into 32 paired samples with 50,000 bootstrap draws:
 | WikiText-103 | 5.67065 | 5.65833 | 0.01233 | [0.00427, 0.02087] |
 | PG19 | 5.15784 | 5.14661 | 0.01123 | [0.00244, 0.01904] |
 
-A separate matched high-gamma run isolated the readout: plain gated RMSNorm
-beat the radial-aware form by `0.01624` NLL on WikiText-103 and `0.01672` on
-PG19, with both confidence intervals above zero. This is small-scale,
-single-seed evidence, but it directly supports the selected initialization and
-removal of the extra radial output channel.
+A separate matched high-gamma run isolated the readout. Plain gated RMSNorm
+improved NLL by `0.01624` on WikiText-103 and `0.01672` on PG19, with both
+confidence intervals above zero. Together these small-scale runs support the
+current high-relaxation, plain-readout default.
 
 A follow-up paired 50M-token run compared plain gated RMSNorm at `gamma=0.90`
 and `gamma=0.95`. The fixed validation slice favored `0.90` by `0.00056` NLL.
-External effects were corpus-dependent: `0.95` improved FineWeb-Edu by
+The effect was corpus-dependent: `0.95` improved FineWeb-Edu by
 `0.00305` (95% CI `[0.00006,0.00623]`) and WikiText-103 by `0.03674`
 (`[0.03040,0.04333]`), but regressed PG19 by `0.01550`
-(`[-0.01892,-0.01196]`). Because the direction reverses on PG19 and the fixed
-validation does not improve, `0.90` remains the general default rather than
-adding a public initialization variant.
+(`[-0.01892,-0.01196]`). The reversal on PG19 and the fixed-validation result
+favor `0.90` as the general default.
 
 ## Exploratory 200M-token comparison
 
-The run below predates the selected high-relaxation initialization and plain
-gated RMSNorm readout. It remains useful historical model evidence but does
-not measure the current defaults.
+This run predates the high-relaxation initialization and plain gated RMSNorm
+readout. It measures an earlier Residual-Frame configuration and is retained
+as the longest paired training evidence available.
 
 One paired run trained three-layer causal LMs from fresh initialization on
 FineWeb-Edu `sample-10BT`:
@@ -127,20 +129,19 @@ GDN2, a `0.00575` SolveDelta advantage. Independent FineWeb-Edu, WikiText-103,
 and PG19 estimates were statistical ties.
 
 On 5,153 paired LAMBADA test items, item NLL was `6.73632` versus `6.77104`,
-with a paired SolveDelta advantage of `0.03471` and 95% confidence interval
-`[0.01722,0.05249]`. Accuracy differences included zero. A 4096-token
-continuation evaluation was not uniformly better: WikiText-103 favored GDN2,
-and both models had trained only at length 512.
+a SolveDelta advantage of `0.03471` with 95% confidence interval
+`[0.01722,0.05249]`. Accuracy was tied within uncertainty. In a 4096-token
+continuation evaluation WikiText-103 favored GDN2; both models had trained at
+length 512.
 
-The responsible conclusion is narrow: this run establishes competitive small-
-scale language modeling and one positive LAMBADA NLL signal. It does not
-establish universal quality, long-context superiority, scaling behavior, or
-multi-seed significance. Raw datasets, checkpoints, and benchmark artifacts
-remain outside Git as required by `AGENTS.md`.
+The evidence supports a narrow conclusion: competitive small-scale language
+modeling and one positive LAMBADA NLL signal. Scaling, long-context behavior,
+and multi-seed significance remain open. Raw datasets, checkpoints, and
+benchmark artifacts live outside Git as required by `AGENTS.md`.
 
-## Reproducing reports
+## Reporting a comparable result
 
-Every future report must state:
+A comparable report states:
 
 - exact shape, dtype, device, package versions, and execution mode;
 - whether the scope is core operator, projected mixer, model block, or complete
@@ -149,5 +150,4 @@ Every future report must state:
 - allocator peak or stable Graph allocation;
 - the same oracle and composed-VJP gates for every compared candidate.
 
-CUDA Graph and eager measurements are different execution modes and must not be
-mixed in one speedup ratio.
+CUDA Graph and eager measurements use separate comparison rows.

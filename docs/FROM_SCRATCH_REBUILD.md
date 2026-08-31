@@ -1,9 +1,9 @@
-# SolveDelta Native Blueprint
+# SolveDelta Native Execution Blueprint
 
-This document defines the sole current native implementation. Executable
-mathematics belongs to `causallsso/reference.py`. The production operator is
-relative Residual-Frame SolveDelta; the former bounded-LDU and RLS operators
-are Git history, not fallbacks or compatibility targets.
+This document maps the Residual-Frame recurrence in
+`causallsso/reference.py` onto its production forward and reverse owners. It is
+an implementation guide: tensor contracts, schedules, precision, and
+lifetimes live here; the executable mathematics remains in the FP64 oracle.
 
 ## 1. Public surface
 
@@ -21,18 +21,18 @@ output                [B,T,H,V]
 ```
 
 The native vector operands and output are BF16. `log_alpha`, `gamma`, and
-both continuation states are FP32. `K=1`; predictor chunks use C32 and the
-memory exterior uses C16. These chunk sizes are selected schedules, not model
-semantics or public layout.
+both continuation states are FP32. `K=1`; the selected schedules use C32 for
+the predictor and C16 for the memory exterior. Chunk size and private packing
+remain internal tuning choices.
 
-The predictor is stored in the orientation
+The geometry solution is stored in the orientation
 
 ```text
 prediction = C u.
 ```
 
-It is neither a covariance nor an inverse state. The zero continuation is
-`C0=0,S0=0`.
+`C` is the online solution of the prefix fitting problem. The zero
+continuation is `C0=0,S0=0`.
 
 ## 2. Token recurrence
 
@@ -53,8 +53,8 @@ C = C_prev + delta u^T.
 ```
 
 Because `u` is normalized, the just-observed residual becomes
-`(1-gamma)r`. Orthogonal source directions are unchanged. No full-state
-forgetting factor, covariance, ridge, or linear solve is part of this model.
+`(1-gamma)r`, while orthogonal source directions keep their previous value.
+The recurrence advances the least-squares solution directly in `C`.
 The per-head geometry bias initializes to `logit(0.9)=log(9)`, so the
 predictor begins as a high-relaxation normalized-LMS solver while the
 token-local projection remains free to learn smaller or larger rates.
@@ -79,7 +79,7 @@ is radialized. Since `||u|| ||phi|| < rho`, the model has the static bounds
 kappa_2(F) <= 13/3.
 ```
 
-This is a smooth model parameterization, not clipping or a numerical fallback.
+These bounds follow from the smooth model parameterization itself.
 
 The three public source actions are
 
@@ -96,9 +96,8 @@ e^T d = b^T k
 I - d e^T = F (I - k b^T) F^-1.
 ```
 
-This is an exact local similarity transform. `F_t` is a relative factor
-generated from the current residual; it is not the accumulated absolute frame
-`I+X_t`.
+This is an exact local similarity transform. `F_t` is the relative factor for
+the current solve residual; prefix history remains in `C_t`.
 
 The memory recurrence is
 
@@ -133,15 +132,12 @@ FLA state  <- C.
 ```
 
 Its pair GEMM, unit-lower triangular WY solve, state GEMM, chunk boundaries,
-and reverse schedule are retained. The unrelated Oja query/output branch is
-absent. Forward emits the token-local `delta` panel and final FP32 `C`.
-Reverse applies `W^-T` and returns final-shaped cotangents for
-`h,u,gamma,C0`; it does not differentiate through a Python token loop. The
-ungated specialization removes FLA's otherwise mandatory zero vector-gate
-panel and reads strided target views directly. At the optimized `r=128`
-profile, reverse owns 32 predictor rows per CTA. Compared with the former
-64-row tile, this preserves identical arithmetic while doubling CTA
-parallelism and reducing the compiled register/shared-memory footprint.
+and reverse schedule are retained. Forward emits the token-local `delta` panel
+and final FP32 `C`; reverse applies `W^-T` and returns final-shaped cotangents
+for `h,u,gamma,C0`. The specialization drops FLA's constant-zero vector-gate
+panel and reads strided target views directly. At `r=128`, reverse owns 32
+predictor rows per CTA, doubling CTA parallelism relative to the 64-row donor
+schedule and lowering register/shared-memory pressure.
 
 ## 4. Relative source owner
 
@@ -158,17 +154,17 @@ chi = q - phi (u^T q) / den
 z = sigmoid(write_raw) * v.
 ```
 
-The shortened radial formula is not an approximation: the unique upstream
-L2Norm owner establishes `||u||=1` in the composed operator. Its omitted
-purely radial `bar_u` term lies in the null direction of that owner's strict
-transpose. This removes a repeated BF16-rounded norm and slightly improves the
+The upstream L2Norm owner establishes `||u||=1`, making the shortened radial
+formula algebraically exact in the composed operator. Its purely radial
+`bar_u` term lies in the null direction of the same owner's strict transpose.
+This identity avoids a repeated BF16-rounded norm and slightly improves the
 production-observable oracle/VJP error.
 
 Q/key norm reductions, frame actions, and erase/write sigmoid arithmetic are
 evaluated in FP32. The bounded frame gives a static range proof for the private
-`d/e/chi` panels, so the source owner writes them directly from FP32 registers
-to FP16. This is not BF16-to-FP16 pseudo-promotion. Products with the unbounded
-decay exponent are materialized later in BF16 to retain exponent range:
+`d/e/chi` panels, so the source owner writes FP16 directly from FP32 registers.
+Products with the unbounded decay exponent are materialized later in BF16 to
+retain exponent range:
 
 ```text
 d           [panels,1,C16,r] FP16
@@ -176,11 +172,11 @@ paired e,q  [panels,2,C16,r] FP16
 z           [B,T,H,V]        BF16.
 ```
 
-There is no token-major `d/e/chi` HBM ABI followed by
-`cat/permute/contiguous`. The source transpose consumes the same panel
-cotangents, closes the shared denominator once, applies the scaled-L2Norm
-transpose for `phi`, and returns independent erase/write cotangents. No radial
-panel, gate panel, or scale is written to HBM.
+The panel layout is produced in consumer order, eliminating a token-major
+`cat/permute/contiguous` handoff. The source transpose consumes the matching
+panel cotangents, closes the shared denominator once, applies the
+scaled-L2Norm transpose for `phi`, and returns independent erase/write
+cotangents. Radial and gate scalars stay resident.
 
 The model frontend uses KDA's low-rank coordinate-decay parameterization:
 
@@ -201,12 +197,11 @@ y = RMSNorm(o) sigmoid(gate_raw).
 ```
 
 CUDA uses FLA `fused_kda_gate` and FLA's fused sigmoid RMSNorm-gate row owner
-with its strict transpose. The CPU/FP64 model path evaluates the same formula
-explicitly. The output projection follows FLA's norm-linear lifetime
-ownership: forward does not checkpoint the 2 MiB normalized output panel, and
-the existing norm transpose regenerates it for the ordinary Tensor Core
-weight-gradient GEMM. The GEMM is not fused into the Triton row owner. No
-raw-output or norm panel is added to the persistent HBM ABI.
+with its strict transpose. The CPU/FP64 path evaluates the same formula
+directly. FLA's norm-linear lifetime policy regenerates the normalized output
+during reverse for the ordinary Tensor Core weight-gradient GEMM, saving a
+2 MiB checkpoint panel. The row owner and GEMM remain separate to preserve
+their natural parallelism.
 
 ## 5. Memory exterior
 
@@ -216,10 +211,10 @@ The exterior maps directly to FLA generalized DPLR with
 q = chi,  k = d,  a = -exp(log_alpha) e,  b = d,  v = z,  scale = 1.
 ```
 
-FLA applies its low-rank term to the pre-decay state. The current
-`exp(log_alpha)` in `a` is therefore required to erase from `S_decay`; omitting
-it changes the recurrence. Production does not materialize this scaled source:
-the pair owner obtains it from `-e` and the inclusive decay prefix.
+FLA applies its low-rank term to the pre-decay state. Multiplying `e` by
+`exp(log_alpha)` aligns the erase with `S_decay`. The pair owner forms this
+scaled source from `-e` and the inclusive decay prefix while the tile is
+resident.
 
 Production ownership is:
 
@@ -232,16 +227,14 @@ Production ownership is:
 
 The state owner advances FP32 chunk-boundary `S`; eligible predictor-pair and
 DPLR WY/state/output contractions use low-precision multiplicands with FP32
-accumulation. The exact-unbounded direct-`e` pair keeps its causal exponent
-products and reductions in FP32 rather than licensing a centered low-precision
-factorization without a static decay bound. Output is written BF16 and
-requested final `S` is FP32.
+accumulation. The direct-`e` pair evaluates its unbounded causal exponent
+products and reductions in FP32. Output is written BF16 and a requested final
+`S` is FP32.
 
-This is selective fusion. Source generation and panelization are fused because
-they share ownership and delete a real HBM boundary. Predictor, pair/WY, state,
-and output remain separate where chunk/rank/value CTA parallelism is more
-valuable than eliminating a small handoff. Do not replace them with a
-sequence/head mega-kernel.
+Fusion follows ownership. Source generation and panelization share one CTA and
+remove a full HBM boundary. Predictor, pair/WY, state, and output retain
+separate kernels where chunk/rank/value CTA parallelism is worth more than a
+small handoff.
 
 ## 6. Reverse graph
 
@@ -258,15 +251,13 @@ Backward is the strict transpose of the composed forward blocks:
 6. the source transpose applies q/key L2Norm transposes, while the standalone
    u L2Norm transpose returns the remaining gradient to its strided view.
 
-No descriptor bundle, coordinate VJP, covariance replay, CG implicit
-transpose, expanded sequence, or dense inverse-state cotangent exists.
-Contributions to shared `u` close only after their independent owners have
-produced final-shaped gradients.
+Each reverse owner mirrors one forward block and emits final-shaped
+cotangents. Contributions to shared `u` close after the source and predictor
+owners have both completed.
 
-The pair transpose and source transpose each accumulate in FP32. Their
-single-consumer, final-shaped cotangent handoff is BF16, reducing this backward
-interface from 12 MiB to 6 MiB at the optimized profile. It is not a
-cross-owner partial reduction.
+The pair and source transposes accumulate locally in FP32. Their
+single-consumer, final-shaped BF16 handoff reduces this backward interface from
+12 MiB to 6 MiB at the optimized profile.
 
 ## 7. Precision map
 
@@ -279,21 +270,18 @@ FP32: C,S,erase/write gates,gamma,log_alpha,norm/radial and denominator reductio
 FP64: token oracle only
 ```
 
-The relative denominator has no artificial clamp, threshold, fallback, or
-data-dependent compensation. Its `3/8` lower bound follows from the static
-radial model parameterization and FP32 norm reduction. Private FP16 panels
-still require a static range proof and a direct FP32 producer; BF16-to-FP16
-casting is not promotion.
+The relative denominator uses its analytic `3/8` lower bound and an FP32 norm
+reduction. Private FP16 panels are admitted with a static range proof and a
+direct FP32 producer.
 
 ## 8. Layout and lifecycle
 
 Public fused-projection vector views may have arbitrary outer strides and
-require unit innermost vector stride. Native owners may pack private normalized
-or WY panels. The fused input projection pads its physical output row to a
-multiple of 64 and exposes only the logical prefix. At the optimized profile,
-`7432 -> 7488` improves the Tensor Core projection transpose while also
-satisfying causal-conv1d's multiple-of-eight stride requirement. Those layouts
-and padding rows are not public operator ABI.
+require unit innermost vector stride. Native owners pack normalized or WY
+panels privately. The fused input projection pads its physical output row to a
+multiple of 64 while exposing the logical prefix. At the optimized profile,
+`7432 -> 7488` improves the Tensor Core projection transpose and satisfies
+causal-conv1d's multiple-of-eight stride requirement.
 
 Fixed-shape Graph training may bind an optimizer-step BF16 shadow for every
 FP32 Linear master. The shadows are nonpersistent buffers and their strict
@@ -302,13 +290,12 @@ refreshes all shadows once, outside capture; replay rejects a stale shadow.
 This is selected only for gradient accumulation because factor-one refresh
 cost exceeds the saved casts.
 
-The only recurrent operator state is FP32 `(C,S)`. No `P^-T`, `J/D/m`,
-CG cache, or per-token dense matrix is saved. Forward caches are retained only
-when a complete F+B A/B beats local recomputation under the same VJP gate.
+The recurrent operator state is FP32 `(C,S)`. Forward caches follow a simple
+rule: keep a panel when complete F+B beats local recomputation under the same
+VJP gate.
 
-Dense native currently requires lengths aligned to C16. Masks and resets use
-the same FP64/PyTorch recurrence through the model reference path. This is a
-performance limit, not a second operator.
+Dense native currently requires lengths aligned to C16. Masks and resets run
+the same recurrence through the model reference path.
 
 ## 9. Acceptance and benchmark
 

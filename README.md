@@ -1,63 +1,53 @@
 # SolveDelta
 
-**A CUDA-native recurrent memory layer that solves prefix geometry online and
-uses the solution as coordinates for Delta edits.**
+**A CUDA-native recurrent memory layer that learns the geometry of its prefix
+before deciding how to edit memory.**
 
-Each prefix supplies directional observations `u -> h`. Their second moment
-`J=sum(u u^T)` and cross moment `G=sum(h u^T)` define the least-squares normal
-equation `C J = G`. SolveDelta does not materialize or invert those moment
-matrices. It advances the full matrix solution `C` directly with an online
-normalized-LMS residual step, then turns each new solve residual into a
-bounded rank-one frame that transforms the current memory edit and query:
+Most Delta-rule layers write in a fixed coordinate system. SolveDelta adds an
+online matrix solver. Directional observations `u -> h` define second and
+cross moments whose least-squares equation is `C J = G`; a normalized-LMS
+step advances the solution `C` directly. The current solve residual then
+creates a bounded relative frame for the token's write, erase, and read:
 
 ```text
-prefix moments -> online residual solve -> relative frame
-       -> channel-decayed Delta edit -> query read
+prefix observations -> online geometry solve -> relative frame
+                    -> Delta edit -> memory read
 ```
 
-The result is causal, recurrent, and streamable. Its fixed-size FP32
-continuation is only `(C,S)`: the current geometry solution and the Delta
-memory. Second-order prefix information is retained in solution coordinates;
-no explicit covariance, inverse, attention matrix, or token history is
-carried. At finite `gamma=0`, its memory path is exactly GDN2; enabling the
-solver adds history-conditioned coordinates without changing the ordinary
-Delta edit.
+The recurrent state is two fixed-size FP32 matrices: `C`, the geometry
+solution, and `S`, the Delta memory. This solution-coordinate form captures
+the useful history of a second-order fit while keeping recurrence causal and
+streamable. Setting the geometry rate to zero recovers the ordinary GDN2
+edit/read path exactly.
 
 This repository includes the FP64 mathematical oracle, a BF16/FP32 CUDA path
 specialized from mature Flash Linear Attention primitives, and a complete
 Hugging Face causal LM with recurrent cache and CUDA Graph training.
 
-Keywords: **recurrent memory**, **Delta rule**, **linear attention**,
-**online least squares**, **second-order statistics**, **causal language
+Keywords: **recurrent memory**, **Delta rule**, **online least squares**,
+**second-order statistics**, **linear attention**, **causal language
 modeling**, **PyTorch**, **Triton**, and **CUDA**.
 
 ## Highlights
 
-- **Online second-order solve.** Prefix moments define `C J = G`, while a
-  normalized-LMS/Oja residual step updates the full `r x r` solution directly.
-  The operator captures the geometry of covariance and cross-moment fitting
-  without storing or inverting a covariance, running CG, requiring an SPD
-  prior, or globally forgetting unobserved directions.
-- **Exact local primal/dual frame.** The factor
-  `F=I+u phi^T` uses a statically bounded radial covector, maps the edit key
-  with `F`, and maps erase/query covectors with `F^-T`. The resulting Delta
-  transition is an exact, analytically well-conditioned similarity transform,
-  not an approximate inverse action.
-- **GDN2 is structurally contained.** At finite `gamma=0`, `F=I` and the
-  independent channel-wise erase/write gates give the GDN2 edit/read exactly.
-  The model retains GDN2's low-rank coordinate decay and standard
-  sigmoid-gated RMSNorm readout.
-- **Full matrix solution, rank-one work.** The solver has `r^2` recurrent
-  capacity while each token contributes one rank-one normal-equation residual
-  that maps to mature pair/WY/state kernels.
-- **Mixed-precision native path.** Tensor Core contractions use BF16 operands
-  and FP32 accumulation; predictor, memory, gates, denominators, reductions,
-  and backward partials stay FP32.
-- **Standard model surface.** `AutoModelForCausalLM`, fused loss, FLA
-  RMSNorm/GatedMLP, hybrid attention, conv4, checkpoint save/load, recurrent
-  generation, and fixed-shape CUDA Graph training are connected.
-- **One mathematical owner.** `causallsso/reference.py` is the sole
-  executable FP64 operator definition.
+- **Second-order geometry in solution coordinates.** Prefix covariance and
+  cross-moment fitting supply the problem; normalized-LMS supplies a fast
+  rank-one iteration. The full `r x r` solution evolves without carrying a
+  covariance inverse through the sequence.
+- **Exact coordinate transport.** A bounded factor `F=I+u phi^T` maps the edit
+  key with `F` and erase/query covectors with `F^-T`. Every realized Delta
+  transition is an exact, analytically conditioned similarity transform.
+- **A strict GDN2 reduction.** At finite `gamma=0`, `F=I` and the memory path
+  becomes GDN2's channel-wise Delta edit/read. Geometry is an added capability,
+  not a replacement memory rule.
+- **Full matrix history from rank-one work.** Each token contributes one
+  normal-equation residual, while chunked pair/WY/state kernels expose enough
+  parallelism for training.
+- **Production model integration.** The repository includes a BF16/FP32 native
+  path, complete transpose, recurrent cache, Hugging Face CausalLM, conv4,
+  fused loss, CUDA Graph training, and DDP integration.
+- **An executable oracle.** `causallsso/reference.py` defines the FP64
+  recurrence used to verify native outputs, continuation states, and VJPs.
 
 ## Installation
 
@@ -158,66 +148,14 @@ One helper instance owns one `[B,T]` shape and CUDA device. Backward must run
 before its next replay. The optimizer, clipping, gradient accumulation, and
 distributed reduction remain outside capture. Masks, resets, recurrent cache,
 gradient checkpointing, and module hooks are outside this dense graph surface.
-Use ordinary fused cross entropy; FLA fused linear cross entropy currently
-performs a host-synchronizing label count and is rejected before capture.
-Construct and replay a helper on the same CUDA stream.
+Use ordinary fused cross entropy and construct/replay the helper on one CUDA
+stream.
 
-When each optimizer update accumulates at least two fixed-shape
-microbatches, bind the optimizer to an optional BF16 Linear shadow:
-
-```python
-accumulation_steps = 4
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-graph_step = SolveDeltaGraphedTrainingStep(
-    model,
-    sample_input_ids=input_ids,
-    sample_labels=input_ids,
-    bf16_shadow_optimizer=optimizer,
-)
-
-optimizer.zero_grad(set_to_none=True)
-for batch_ids, batch_labels in microbatches:
-    loss = graph_step(batch_ids, batch_labels) / accumulation_steps
-    loss.backward()
-optimizer.step()  # refreshes every BF16 shadow exactly once
-```
-
-FP32 parameters remain the optimizer and checkpoint owners. Nonpersistent
-BF16 buffers remove repeated autocast conversions and the optimizer post-step
-hook refreshes them on the replay stream. This is a throughput-for-memory
-option, not the default: at the documented one-layer profile it adds about
-`43.6 MiB` after capture, is slightly slower without accumulation, and becomes
-useful from two or more microbatches. Direct parameter mutation is detected;
-call `graph_step.refresh_bf16_shadow_weights()` after loading or otherwise
-changing weights outside the bound optimizer.
-
-For DDP, initialize NCCL and select one CUDA device per process, then ask the
-helper to install DDP after local graph capture:
-
-```python
-import os
-import torch.distributed as dist
-
-dist.init_process_group("nccl")
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-model = model.cuda().train()
-
-graph_step = SolveDeltaGraphedTrainingStep(
-    model,
-    sample_input_ids=input_ids,
-    sample_labels=input_ids,
-    distributed=True,
-)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-```
-
-Do not wrap `model` in DDP before constructing the helper. The captured graph
-owns fixed-shape local compute; DDP parameter hooks and NCCL reductions execute
-after graph replay. This avoids coupling CUDA Graph capture to reducer buckets
-or collective capture support while preserving ordinary DDP gradient
-accumulation semantics. For accumulation without a reduction on every
-microbatch, wrap both replay and backward in `with graph_step.no_sync():`, just
-as with ordinary DDP.
+Two optional training modes are available: optimizer-bound BF16 Linear shadows
+amortize weight casts across gradient-accumulation microbatches, and
+`distributed=True` installs DDP after local graph capture so NCCL reduction
+stays outside the graph. Their memory tradeoffs, stream rules, and complete
+examples live in [Environment and Installation](docs/ENVIRONMENT.md).
 
 ## How It Works
 
@@ -229,9 +167,9 @@ G_t = sum_{s<=t} h_s u_s^T.
 ```
 
 The stationary equation of `1/2 sum ||h_s-C u_s||^2` is `C J_t = G_t`.
-Instead of forming `J_t`, `G_t`, or `J_t^-1`, SolveDelta performs one online
-residual solve step for each normalized direction `u_t`, target `h_t`, and
-learned relaxation `gamma_t in (0,1)`:
+SolveDelta advances `C` with one online residual step for each normalized
+direction `u_t`, target `h_t`, and learned relaxation
+`gamma_t in (0,1)`:
 
 ```text
 r_t = h_t - C_{t-1} u_t
@@ -240,9 +178,8 @@ C_t = C_{t-1} + delta_t u_t^T.
 ```
 
 This is the negative instantaneous least-squares gradient in solution
-coordinates. It is not a claim that every intermediate `C_t` equals the batch
-closed-form solution; ordering and learned relaxation are part of the
-recurrent model.
+coordinates. Ordering and learned relaxation make `C_t` a recurrent online
+solution rather than a batch closed form.
 
 The relative frame is
 
@@ -280,8 +217,8 @@ initializes to `logit(0.9)`, treating `gamma` as normalized-LMS relaxation. See
 
 ## Native Implementation
 
-The CUDA path specializes concrete mature primitives instead of retaining
-their upstream public ABIs:
+The CUDA path specializes concrete mature primitives around SolveDelta's
+private panel ownership:
 
 - stride-aware FLA L2Norm for the predictor source;
 - FLA gated-Oja pair, triangular WY, matrix-state forward, and an ungated
@@ -294,9 +231,8 @@ their upstream public ABIs:
 - FLA KDA coordinate-decay and output-gate projections plus FLA's
   sigmoid-gated RMSNorm owner and exact transpose.
 
-The producer writes the consumer's panel layout directly, so no token-major
-`d/e/chi` ABI or panelization copy remains. State and output stay selectively
-split to preserve chunk/rank/value CTA parallelism.
+Each producer writes its consumer's panel layout directly. State and output
+stay selectively split to preserve chunk/rank/value CTA parallelism.
 
 ## Model and Cache
 
@@ -332,9 +268,9 @@ The core rows expose different mathematical contracts: SolveDelta includes its
 predictor and initial `(C,S)` cotangents, while GDN2 has no predictor. The
 projected-mixer rows are the primary hidden-to-hidden comparison.
 
-This is a development snapshot, not a hardware-independent claim. Scope,
-numerical quality, the exploratory 200M-token comparison, and measurement
-caveats are recorded in [Evaluation and Performance](docs/RESULTS.md).
+Scope, numerical quality, the exploratory 200M-token comparison, and complete
+measurement conditions are recorded in
+[Evaluation and Performance](docs/RESULTS.md).
 
 ## Correctness
 
@@ -358,13 +294,11 @@ python -m pytest -q -s
 ## Current Limits
 
 - Dense native execution currently requires sequence lengths divisible by 16.
-- Masks and resets use the same reference operator rather than a packed native
-  kernel.
-- Recurrent cache semantics are connected, but a dedicated optimized decode
-  kernel is not yet claimed.
-- Residual-Frame is less instantaneously expressive than the archived
-  bounded-LDU chart. Its quality/latency trade must be established by matched
-  training.
+- Masks and resets currently run through the reference implementation.
+- Recurrent cache semantics are connected; optimized single-token decode is an
+  open performance target.
+- Broader multi-seed and history-conditioned retrieval evaluation remains the
+  main model-quality target.
 
 ## Contributing
 
