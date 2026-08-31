@@ -1,38 +1,43 @@
 # SolveDelta
 
-**A CUDA-native recurrent memory layer that learns how to edit in a coordinate
-system formed by the prefix.**
+**A CUDA-native recurrent memory layer that solves prefix geometry online and
+uses the solution as coordinates for Delta edits.**
 
-SolveDelta combines online residual learning, the Delta rule, and linear
-attention-style chunking. A full matrix predictor learns relationships in the
-observed prefix; each new residual produces a bounded rank-one frame that
-transforms the current memory edit and query:
+Each prefix supplies directional observations `u -> h`. Their second moment
+`J=sum(u u^T)` and cross moment `G=sum(h u^T)` define the least-squares normal
+equation `C J = G`. SolveDelta does not materialize or invert those moment
+matrices. It advances the full matrix solution `C` directly with an online
+normalized-LMS residual step, then turns each new solve residual into a
+bounded rank-one frame that transforms the current memory edit and query:
 
 ```text
-prefix -> residual predictor -> relative frame
+prefix moments -> online residual solve -> relative frame
        -> channel-decayed Delta edit -> query read
 ```
 
 The result is causal, recurrent, and streamable. Its fixed-size FP32
-continuation is only `(C,S)`: a residual predictor and the Delta memory. It
-carries no covariance, inverse, attention matrix, or token history. At finite
-`gamma=0`, its memory path is exactly GDN2; enabling geometry adds
-history-conditioned coordinates without changing the ordinary Delta edit.
+continuation is only `(C,S)`: the current geometry solution and the Delta
+memory. Second-order prefix information is retained in solution coordinates;
+no explicit covariance, inverse, attention matrix, or token history is
+carried. At finite `gamma=0`, its memory path is exactly GDN2; enabling the
+solver adds history-conditioned coordinates without changing the ordinary
+Delta edit.
 
 This repository includes the FP64 mathematical oracle, a BF16/FP32 CUDA path
 specialized from mature Flash Linear Attention primitives, and a complete
 Hugging Face causal LM with recurrent cache and CUDA Graph training.
 
 Keywords: **recurrent memory**, **Delta rule**, **linear attention**,
-**causal language modeling**, **online residual learning**, **PyTorch**,
-**Triton**, and **CUDA**.
+**online least squares**, **second-order statistics**, **causal language
+modeling**, **PyTorch**, **Triton**, and **CUDA**.
 
 ## Highlights
 
-- **Residual geometry learning.** A normalized-LMS/Oja update writes each
-  observed `u -> h` residual directly into a full `r x r` predictor.
-  History accumulates in solution coordinates without covariance inversion,
-  CG, an SPD prior, or global forgetting of unobserved directions.
+- **Online second-order solve.** Prefix moments define `C J = G`, while a
+  normalized-LMS/Oja residual step updates the full `r x r` solution directly.
+  The operator captures the geometry of covariance and cross-moment fitting
+  without storing or inverting a covariance, running CG, requiring an SPD
+  prior, or globally forgetting unobserved directions.
 - **Exact local primal/dual frame.** The factor
   `F=I+u phi^T` uses a statically bounded radial covector, maps the edit key
   with `F`, and maps erase/query covectors with `F^-T`. The resulting Delta
@@ -40,12 +45,11 @@ Keywords: **recurrent memory**, **Delta rule**, **linear attention**,
   not an approximate inverse action.
 - **GDN2 is structurally contained.** At finite `gamma=0`, `F=I` and the
   independent channel-wise erase/write gates give the GDN2 edit/read exactly.
-  The model retains GDN2's low-rank coordinate decay and output gate, while a
-  bounded radial-aware RMSNorm keeps output-magnitude evidence from the learned
-  geometry instead of projecting all of it away.
-- **Full matrix history, rank-one work.** The predictor has `r^2` recurrent
-  capacity while each token contributes one rank-one residual write that maps
-  to mature pair/WY/state kernels.
+  The model retains GDN2's low-rank coordinate decay and standard
+  sigmoid-gated RMSNorm readout.
+- **Full matrix solution, rank-one work.** The solver has `r^2` recurrent
+  capacity while each token contributes one rank-one normal-equation residual
+  that maps to mature pair/WY/state kernels.
 - **Mixed-precision native path.** Tensor Core contractions use BF16 operands
   and FP32 accumulation; predictor, memory, gates, denominators, reductions,
   and backward partials stay FP32.
@@ -217,14 +221,28 @@ as with ordinary DDP.
 
 ## How It Works
 
-For normalized geometry direction `u_t`, target `h_t`, and token-local
-`gamma_t in (0,1)`:
+For a prefix of directional observations, define
+
+```text
+J_t = sum_{s<=t} u_s u_s^T
+G_t = sum_{s<=t} h_s u_s^T.
+```
+
+The stationary equation of `1/2 sum ||h_s-C u_s||^2` is `C J_t = G_t`.
+Instead of forming `J_t`, `G_t`, or `J_t^-1`, SolveDelta performs one online
+residual solve step for each normalized direction `u_t`, target `h_t`, and
+learned relaxation `gamma_t in (0,1)`:
 
 ```text
 r_t = h_t - C_{t-1} u_t
 delta_t = gamma_t r_t
 C_t = C_{t-1} + delta_t u_t^T.
 ```
+
+This is the negative instantaneous least-squares gradient in solution
+coordinates. It is not a claim that every intermediate `C_t` equals the batch
+closed-form solution; ordering and learned relaxation are part of the
+recurrent model.
 
 The relative frame is
 
@@ -255,7 +273,8 @@ I-d_t e_t^T = F_t (I-k_t b_t^T) F_t^-1.
 
 The channel-decayed memory applies GDN2's independent channel-wise write and
 erase gates in that relative frame and reads with `chi_t`. The core output then
-passes through a low-rank sigmoid gate and bounded radial-aware RMSNorm. See
+passes through a low-rank sigmoid gate and standard RMSNorm. The geometry bias
+initializes to `logit(0.9)`, treating `gamma` as normalized-LMS relaxation. See
 `docs/INNOVATION_PROGRAM.md` for the derivation and
 `docs/FROM_SCRATCH_REBUILD.md` for exact execution ownership.
 
@@ -272,8 +291,8 @@ their upstream public ABIs:
 - an exact unbounded Triton specialization of FLA's direct-`e` pair
   forward/transpose;
 - FLA generalized-DPLR WY, state/output, and output-owned reverse;
-- FLA KDA coordinate-decay and output-gate projections plus a specialized FLA
-  RMSNorm owner that preserves a bounded radial signal and its exact VJP.
+- FLA KDA coordinate-decay and output-gate projections plus FLA's
+  sigmoid-gated RMSNorm owner and exact transpose.
 
 The producer writes the consumer's panel layout directly, so no token-major
 `d/e/chi` ABI or panelization copy remains. State and output stay selectively
@@ -298,9 +317,9 @@ CUDA Graph replay. Both paths omit final continuation output in this table.
 
 | Scope | Path | Forward median/p95 | F+B median/p95 | Graph allocated |
 | --- | --- | ---: | ---: | ---: |
-| Core operator | SolveDelta | 0.172 / 0.178 ms | 0.611 / 0.793 ms | 58.1 MiB |
+| Core operator | SolveDelta | 0.173 / 0.178 ms | 0.610 / 0.785 ms | 58.1 MiB |
 | Core operator | FLA GDN2 | 0.107 / 0.112 ms | 0.467 / 0.643 ms | 46.0 MiB |
-| Projected mixer | SolveDelta | 0.430 / 0.603 ms | 1.435 / 1.623 ms | 245.8 MiB |
+| Projected mixer | SolveDelta | 0.428 / 0.614 ms | 1.437 / 1.632 ms | 245.8 MiB |
 | Projected mixer | FLA GDN2 | 0.364 / 0.534 ms | 1.276 / 1.468 ms | 233.2 MiB |
 
 At the projected-mixer boundary, SolveDelta currently pays about `18%` forward

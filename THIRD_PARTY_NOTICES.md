@@ -14,9 +14,8 @@ Adapted production files:
   SolveDelta mixer and `(C,S)` state;
 - `causallsso/model.py`: FLA GDN2/KDA-style low-rank coordinate decay,
   independent erase/write gates, and fused-projection ownership;
-- `causallsso/ops/radial_norm_gate.py`: FLA fused RMSNorm-gate row ownership,
-  FP32 reductions, autotuning surface, strict transpose, and norm-linear
-  checkpoint ownership specialized with a bounded per-head radial scale;
+- `causallsso/ops/norm_gate.py`: FLA fused sigmoid RMSNorm-gate row ownership,
+  FP32 reductions, strict transpose, and norm-linear checkpoint ownership;
 - `causallsso/ops/residual_frame/predictor.py`: FLA gated-Oja pair,
   triangular-WY, state, and ungated strict-transpose owners specialized to
   normalized LMS residual prediction without the unrelated query/output or

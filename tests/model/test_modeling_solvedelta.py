@@ -80,7 +80,7 @@ def test_huggingface_checkpoint_roundtrip(tmp_path):
     mixer = model.model.layers[0].mixer.mixer
     initial_geometry_write = torch.sigmoid(mixer.geometry_write_bias)
     expected_geometry_write = torch.full_like(
-        initial_geometry_write, torch.sigmoid(torch.tensor(-2.0))
+        initial_geometry_write, 0.9
     )
     torch.testing.assert_close(
         initial_geometry_write,
@@ -101,7 +101,7 @@ def test_huggingface_checkpoint_roundtrip(tmp_path):
     single_head_write = torch.sigmoid(single_head.geometry_write_bias)
     torch.testing.assert_close(
         single_head_write,
-        torch.full_like(single_head_write, torch.sigmoid(torch.tensor(-2.0))),
+        torch.full_like(single_head_write, 0.9),
         rtol=1e-6,
         atol=1e-6,
     )
@@ -121,7 +121,6 @@ def test_huggingface_checkpoint_roundtrip(tmp_path):
         restored_mixer.geometry_write_bias,
         restored_mixer.associative_log_rate,
         restored_mixer.associative_decay_bias,
-        restored_mixer.output_norm.radial_strength,
     ):
         assert parameter.dtype == torch.float32
 
@@ -140,13 +139,7 @@ def test_gdn2_gates_and_low_rank_kda_decay_parameterization():
     assert mixer.associative_log_rate.shape == (2,)
     assert mixer.associative_decay_bias.shape == (2, 16)
     assert mixer.output_norm.weight.shape == (16,)
-    assert mixer.output_norm.radial_strength.shape == (2,)
-    assert mixer.output_norm.radial_strength.dtype == torch.float32
-    assert torch.equal(
-        mixer.output_norm.radial_strength,
-        torch.ones_like(mixer.output_norm.radial_strength),
-    )
-    assert mixer.output_norm.radial_strength._no_weight_decay
+    assert not hasattr(mixer.output_norm, "radial_strength")
     assert mixer.output_norm.activation == "sigmoid"
 
 

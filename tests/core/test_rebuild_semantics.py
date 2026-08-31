@@ -14,9 +14,9 @@ from causallsso import (
 from causallsso.ops.operator import solvedelta_native
 from causallsso.ops.residual_frame.exterior import direct_e_residual
 from causallsso.ops.residual_frame.predictor import oja_residual
-from causallsso.ops.radial_norm_gate import (
-    RadialRMSNormGated,
-    radial_rms_norm_gated_reference,
+from causallsso.ops.norm_gate import (
+    RMSNormGated,
+    rms_norm_gated_reference,
 )
 from causallsso.reference import RELATIVE_FRAME_RADIUS
 
@@ -168,7 +168,7 @@ def test_frame_radius_bounds_adversarial_residual():
             assert denominator > 1.0 + radius - 1.0e-6
 
 
-def test_radial_output_gate_matches_explicit_formula_and_bounds():
+def test_output_gate_matches_plain_rms_formula():
     layer = SolveDelta(
         SolveDeltaConfig(
             hidden_size=24,
@@ -183,39 +183,29 @@ def test_radial_output_gate_matches_explicit_formula_and_bounds():
     gate = torch.randn_like(output)
     with torch.no_grad():
         layer.output_norm.weight.copy_(torch.linspace(0.5, 1.5, 12))
-        layer.output_norm.radial_strength.copy_(torch.tensor([0.8, 1.2]))
     rstd = torch.rsqrt(
         output.square().mean(dim=-1, keepdim=True) + layer.output_norm.eps
     )
-    reference_rms = 1.0 / 12**0.5
-    radial_coordinate = (1.0 - reference_rms * rstd) / (
-        1.0 + reference_rms * rstd
-    )
-    alpha = torch.sigmoid(2.0 * layer.output_norm.radial_strength) - 0.5
-    scale = 1.0 + alpha.view(1, 1, 2, 1) * radial_coordinate
     expected = (
-        scale
-        * output
+        output
         * rstd
         * layer.output_norm.weight
         * torch.sigmoid(gate)
     )
     actual = layer._gate_output(output, gate)
     torch.testing.assert_close(actual, expected, rtol=2e-12, atol=2e-12)
-    assert torch.all(scale > 0.5)
-    assert torch.all(scale < 1.5)
 
 
-def test_radial_output_gate_has_strict_composed_vjp():
+def test_output_gate_has_strict_composed_vjp():
     torch.manual_seed(17)
-    module = RadialRMSNormGated(5, 2, eps=1e-6).double()
+    module = RMSNormGated(5, eps=1e-6).double()
     x = torch.randn(2, 3, 2, 5, dtype=torch.float64, requires_grad=True)
     gate = torch.randn_like(x, requires_grad=True)
     assert torch.autograd.gradcheck(
-        lambda x_, gate_, weight_, strength_: radial_rms_norm_gated_reference(
-            x_, gate_, weight_, strength_, module.eps
+        lambda x_, gate_, weight_: rms_norm_gated_reference(
+            x_, gate_, weight_, module.eps
         ),
-        (x, gate, module.weight, module.radial_strength),
+        (x, gate, module.weight),
         eps=1e-6,
         atol=1e-5,
         rtol=1e-4,
@@ -583,13 +573,12 @@ def test_native_predictor_multitile_source_transpose_matches_fp64():
 
 
 @CUDA_ONLY
-def test_radial_output_gate_cuda_bf16_forward_and_vjp():
+def test_output_gate_cuda_bf16_forward_and_vjp():
     torch.manual_seed(19)
     heads, width = 2, 16
-    module = RadialRMSNormGated(width, heads, eps=1e-6).cuda()
+    module = RMSNormGated(width, eps=1e-6).cuda()
     with torch.no_grad():
         module.weight.copy_(torch.linspace(0.5, 1.5, width, device="cuda"))
-        module.radial_strength.copy_(torch.tensor([0.8, 1.1], device="cuda"))
     x = torch.randn(
         2,
         5,
@@ -604,20 +593,16 @@ def test_radial_output_gate_cuda_bf16_forward_and_vjp():
     upstream = torch.randn_like(output.float())
     actual_gradients = torch.autograd.grad(
         (output.float() * upstream).sum(),
-        (x, gate, module.weight, module.radial_strength),
+        (x, gate, module.weight),
     )
 
     reference_x = x.detach().float().requires_grad_()
     reference_gate = gate.detach().float().requires_grad_()
     reference_weight = module.weight.detach().clone().requires_grad_()
-    reference_strength = (
-        module.radial_strength.detach().clone().requires_grad_()
-    )
-    reference_output = radial_rms_norm_gated_reference(
+    reference_output = rms_norm_gated_reference(
         reference_x,
         reference_gate,
         reference_weight,
-        reference_strength,
         module.eps,
     )
     reference_gradients = torch.autograd.grad(
@@ -626,7 +611,6 @@ def test_radial_output_gate_cuda_bf16_forward_and_vjp():
             reference_x,
             reference_gate,
             reference_weight,
-            reference_strength,
         ),
     )
     torch.testing.assert_close(
@@ -639,10 +623,10 @@ def test_radial_output_gate_cuda_bf16_forward_and_vjp():
 
 
 @CUDA_ONLY
-def test_radial_output_gate_linear_lifetime_matches_separate_path():
+def test_output_gate_linear_lifetime_matches_separate_path():
     torch.manual_seed(23)
     batch, length, heads, width = 2, 5, 2, 16
-    module = RadialRMSNormGated(width, heads, eps=1e-6).cuda()
+    module = RMSNormGated(width, eps=1e-6).cuda()
     projection = torch.nn.Linear(heads * width, 24, bias=True).cuda()
     x_separate = torch.randn(
         batch,
@@ -658,7 +642,6 @@ def test_radial_output_gate_linear_lifetime_matches_separate_path():
     gate_combined = gate_separate.detach().clone().requires_grad_()
     parameters = (
         module.weight,
-        module.radial_strength,
         projection.weight,
         projection.bias,
     )
@@ -677,8 +660,16 @@ def test_radial_output_gate_linear_lifetime_matches_separate_path():
         (x_combined, gate_combined, *parameters),
     )
     torch.testing.assert_close(combined, separate, rtol=0.0, atol=0.0)
-    for actual, expected in zip(combined_gradients, separate_gradients):
+    for actual, expected in zip(
+        combined_gradients[:-1], separate_gradients[:-1]
+    ):
         torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(
+        combined_gradients[-1],
+        upstream.reshape(-1, upstream.shape[-1]).float().sum(dim=0),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 @CUDA_ONLY

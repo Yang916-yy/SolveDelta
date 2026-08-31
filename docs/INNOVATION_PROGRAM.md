@@ -21,6 +21,11 @@ observed direction immediately becomes `(1-gamma_t)r_t`. A large residual
 writes quickly, a small residual writes little, and directions orthogonal to
 `u_t` are unaffected.
 
+The geometry bias initializes to `logit(0.9)`. Here `gamma` is solver
+relaxation, not merely a conservative feature gate: high relaxation exposes
+the residual predictor from the beginning while the token-local projection
+can still learn lower rates.
+
 Unlike the former RLS route, there is no covariance that is globally
 multiplied by a forgetting factor and later inverted. The model therefore has
 no persistent-excitation requirement, SPD prior, covariance windup, or CG
@@ -96,22 +101,18 @@ reduction, not a limit argument.
 
 The dynamic coordinate decay and output gate use GDN2/KDA's low-rank
 projections. Decay retains a distinct value for every key coordinate, while a
-head-wise positive rate supplies its static scale. A plain RMSNorm readout
-removes the component of the core gradient parallel to its output. SolveDelta
-instead retains a bounded radial coordinate:
+head-wise positive rate supplies its static scale. The readout is the standard
+sigmoid-gated RMSNorm:
 
 ```text
-r = sqrt(mean(o^2)+eps),  r0 = 1/sqrt(V)
-z = (r-r0)/(r+r0)
-alpha_h = sigmoid(2*a_h)-1/2
-y = (1+alpha_h*z) RMSNorm(o) sigmoid(gate).
+y = RMSNorm(o) sigmoid(gate).
 ```
 
-This is still scale-controlled because the learned multiplier lies in
-`(1/2,3/2)`, but it does not make the geometry-dependent output magnitude
-completely unobservable. The radial path has an exact composed transpose and
-adds only one scalar parameter per head. SolveDelta's principal added model
-content remains the residual predictor and relative frame.
+The relative frame already carries geometry through coordinate direction.
+Matched training found that retaining an additional output-radius channel at
+high relaxation hurt held-out NLL, so output magnitude is not given a second
+model path. SolveDelta's added model content remains the residual predictor and
+relative frame.
 
 ## Relationship to GDN2
 
@@ -156,9 +157,8 @@ relative frame is identity plus rank one, its radial map is scaled L2Norm, and
 the memory update is a generalized-Delta/DPLR transition. Its forward and
 strict transpose therefore reuse the same norm, pair, WY, state, output, and
 output-owner reverse families used by FLA. Decay reuses KDA's low-rank gate.
-Output gating specializes FLA's gated RMSNorm owner in place, reusing its
-resident `rstd` and strict transpose rather than introducing an elementwise
-HBM chain or a tokenwise dense solve.
+Output gating uses FLA's gated RMSNorm owner and strict transpose directly,
+rather than introducing an elementwise HBM chain or a tokenwise dense solve.
 
 This equivalence concerns concrete computation blocks. SolveDelta still owns
 the operand mapping, local similarity contract, composition, public state, and

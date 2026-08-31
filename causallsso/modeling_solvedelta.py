@@ -216,7 +216,6 @@ class SolveDeltaPreTrainedModel(PreTrainedModel):
         "geometry_write_bias",
         "associative_log_rate",
         "associative_decay_bias",
-        "radial_strength",
     ]
 
     def _init_weights(self, module: nn.Module) -> None:

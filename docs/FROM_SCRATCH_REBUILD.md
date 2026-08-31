@@ -55,6 +55,9 @@ C = C_prev + delta u^T.
 Because `u` is normalized, the just-observed residual becomes
 `(1-gamma)r`. Orthogonal source directions are unchanged. No full-state
 forgetting factor, covariance, ridge, or linear solve is part of this model.
+The per-head geometry bias initializes to `logit(0.9)=log(9)`, so the
+predictor begins as a high-relaxation normalized-LMS solver while the
+token-local projection remains free to learn smaller or larger rates.
 
 The token-local relative frame and its exact inverse-transpose action are
 
@@ -194,24 +197,16 @@ separate GEMM. The core output uses the matching KDA readout owner:
 ```text
 gate_hidden = W_gate_in x                   [d_gate]
 gate_raw = W_gate_out gate_hidden           [H,V]
-r = sqrt(mean(o^2) + eps),  r0 = 1/sqrt(V)
-z = (r-r0)/(r+r0)
-alpha_h = sigmoid(2*a_h)-1/2
-y = (1+alpha_h*z) RMSNorm(o) sigmoid(gate_raw).
+y = RMSNorm(o) sigmoid(gate_raw).
 ```
 
-`a_h` is one per-head FP32 parameter initialized to `1`. The scale is strictly
-inside `(1/2,3/2)`: it preserves a bounded component of output magnitude while
-retaining RMSNorm's stable coordinate normalization. CUDA uses FLA
-`fused_kda_gate` and a specialization of FLA's fused RMSNorm-gate row owner.
-The owner reuses resident FP32 `rstd`; its strict transpose adds the exact
-radial `grad_o` and `grad_a` before the final output store. The CPU/FP64 model
-path evaluates the same formulas explicitly. The output projection follows
-FLA's norm-linear lifetime ownership: forward does not checkpoint the 2 MiB
-normalized output panel, and the existing norm transpose regenerates it for
-the ordinary Tensor Core weight-gradient GEMM. The GEMM is not fused into the
-Triton row owner. No raw-output or norm panel is added to the persistent HBM
-ABI.
+CUDA uses FLA `fused_kda_gate` and FLA's fused sigmoid RMSNorm-gate row owner
+with its strict transpose. The CPU/FP64 model path evaluates the same formula
+explicitly. The output projection follows FLA's norm-linear lifetime
+ownership: forward does not checkpoint the 2 MiB normalized output panel, and
+the existing norm transpose regenerates it for the ordinary Tensor Core
+weight-gradient GEMM. The GEMM is not fused into the Triton row owner. No
+raw-output or norm panel is added to the persistent HBM ABI.
 
 ## 5. Memory exterior
 
@@ -339,8 +334,8 @@ panel-native production composition measured:
 ```text
 eager forward median/p95  0.412 / 0.538 ms
 eager F+B median/p95      1.476 / 1.663 ms
-Graph forward median/p95  0.172 / 0.178 ms
-Graph F+B median/p95      0.611 / 0.793 ms
+Graph forward median/p95  0.173 / 0.178 ms
+Graph F+B median/p95      0.610 / 0.785 ms
 Graph allocated           58.1 MiB
 ```
 
@@ -349,8 +344,8 @@ complete mixer or causal-LM numbers. Benchmark reports must continue to state
 shape, dtype, device, scope, and execution mode.
 
 The complete projected mixer at the same shape, using FP32 master parameters
-and BF16 autocast, measured Graph forward `0.430/0.603 ms` median/p95 and F+B
-`1.435/1.623 ms`, with `245.8 MiB` Graph allocation. The synchronized p95
+and BF16 autocast, measured Graph forward `0.428/0.614 ms` median/p95 and F+B
+`1.437/1.632 ms`, with `245.8 MiB` Graph allocation. The synchronized p95
 samples in this run include the same roughly `0.17 ms` P-state tail observed
 for the matched GDN2 run. The mixer has `8.99M` parameters versus `9.46M`
 before low-rank decay and output gating.

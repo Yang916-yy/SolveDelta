@@ -119,9 +119,8 @@ normalized HBM panels. Its bounded frame actions have a static range proof, so
 their private `d/e/chi` panels are written directly from the FP32 producer to
 FP16; operands multiplied by unbounded decay factors remain BF16. The model
 uses KDA's low-rank coordinate-decay
-parameterization and upstream fused gate/transpose. The output readout adapts
-FLA's sigmoid-gated RMSNorm row owner and strict transpose, adding a per-head
-bounded radial scale while its FP32 `rstd` is resident. The exterior retains
+parameterization and upstream fused gate/transpose. The output readout uses
+FLA's sigmoid-gated RMSNorm row owner and strict transpose. The exterior retains
 FLA's chunk cumsum convention and its transpose
 through the direct-e pair owner. Norms, cumsums, and sensitive scalar
 reductions remain FP32. The source owner also specializes scaled-L2Norm
@@ -137,15 +136,6 @@ the ordinary projection-weight GEMM instead of being saved across backward.
 This is a lifetime specialization, not a Triton/CUTLASS mega-fusion. The
 direct-e pair and source reverse owners retain FP32 local accumulation but use
 a BF16 final-shaped handoff after the reduction is complete.
-
-The radial modulation is mathematically related to feature-wise modulation
-and channel recalibration, not copied implementation code:
-
-- FiLM: <https://arxiv.org/abs/1709.07871>;
-- Squeeze-and-Excitation: <https://arxiv.org/abs/1709.01507>.
-
-Unlike a free FiLM scale, SolveDelta maps the per-head strength and observed
-RMS through bounded coordinates, so the multiplier remains in `(1/2,3/2)`.
 
 ## Rank-one invertibility precedents
 
@@ -277,7 +267,7 @@ disabled globally and no PyTorch source is vendored.
 | Predictor schedule | FLA gated-Oja C32 specialization | Exact recurrence and mature forward/transpose |
 | Memory schedule | Exact unbounded Triton direct-e pair + FLA DPLR C16 | Exact decay semantics with mature pair/WY/state/output ownership |
 | Delta gates | Independent channel-wise `sigmoid(erase_raw/write_raw)` | Preserves the full GDN2 update surface and separate source cotangents |
-| Decay/readout | KDA low-rank coordinate gate + bounded radial gated RMSNorm | Preserves coordinate decay/output gating and a controlled geometry-magnitude signal |
+| Decay/readout | KDA low-rank coordinate gate + FLA sigmoid-gated RMSNorm | Preserves coordinate decay/output gating without a separate magnitude channel |
 | Source ABI | Panel-native direct and paired sources | Deletes token-major `d/e/chi` copy boundary |
 | Fusion | Selective | Preserves useful CTA parallelism and short lifetimes |
 | Public state | `(C,S)` only | No redundant inverse or diagnostic state |

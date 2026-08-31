@@ -14,9 +14,9 @@ paths.
 
 | Scope | Path | Forward | F+B | Graph allocated |
 | --- | --- | ---: | ---: | ---: |
-| Core operator | SolveDelta | 0.172 / 0.178 | 0.611 / 0.793 | 58.1 MiB |
+| Core operator | SolveDelta | 0.173 / 0.178 | 0.610 / 0.785 | 58.1 MiB |
 | Core operator | FLA GDN2 | 0.107 / 0.112 | 0.467 / 0.643 | 46.0 MiB |
-| Projected mixer | SolveDelta | 0.430 / 0.603 | 1.435 / 1.623 | 245.8 MiB |
+| Projected mixer | SolveDelta | 0.428 / 0.614 | 1.437 / 1.632 | 245.8 MiB |
 | Projected mixer | FLA GDN2 | 0.364 / 0.534 | 1.276 / 1.468 | 233.2 MiB |
 
 The core comparison exposes all predictor and relative-source work, so its
@@ -70,7 +70,44 @@ to post-capture allocation; measured capture peak increased by `27.5 MiB`.
 It is therefore an explicit accumulation throughput option, not a default or
 a memory optimization.
 
+## Geometry initialization and readout A/B
+
+One paired 50M-token run selected the current high-relaxation/plain-readout
+defaults. Both three-layer models started from identical weights and saw the
+same FineWeb-Edu batches under seed `20260830`; the candidate changed the
+geometry bias from `-2` (`gamma about 0.119`) to `logit(0.9)` and removed the
+bounded output-radius modulation. Shape was `B=8,T=512,hidden=512,H=4,r=128`.
+
+Final fixed validation NLL was `3.91459` for the selected candidate and
+`3.92034` for the former defaults. On 256 held-out windows per corpus, grouped
+into 32 paired samples with 50,000 bootstrap draws:
+
+| Corpus | Former NLL | Selected NLL | Selected advantage | 95% CI |
+| --- | ---: | ---: | ---: | ---: |
+| FineWeb-Edu | 4.32489 | 4.32245 | 0.00244 | [-0.00214, 0.00677] |
+| WikiText-103 | 5.67065 | 5.65833 | 0.01233 | [0.00427, 0.02087] |
+| PG19 | 5.15784 | 5.14661 | 0.01123 | [0.00244, 0.01904] |
+
+A separate matched high-gamma run isolated the readout: plain gated RMSNorm
+beat the radial-aware form by `0.01624` NLL on WikiText-103 and `0.01672` on
+PG19, with both confidence intervals above zero. This is small-scale,
+single-seed evidence, but it directly supports the selected initialization and
+removal of the extra radial output channel.
+
+A follow-up paired 50M-token run compared plain gated RMSNorm at `gamma=0.90`
+and `gamma=0.95`. The fixed validation slice favored `0.90` by `0.00056` NLL.
+External effects were corpus-dependent: `0.95` improved FineWeb-Edu by
+`0.00305` (95% CI `[0.00006,0.00623]`) and WikiText-103 by `0.03674`
+(`[0.03040,0.04333]`), but regressed PG19 by `0.01550`
+(`[-0.01892,-0.01196]`). Because the direction reverses on PG19 and the fixed
+validation does not improve, `0.90` remains the general default rather than
+adding a public initialization variant.
+
 ## Exploratory 200M-token comparison
+
+The run below predates the selected high-relaxation initialization and plain
+gated RMSNorm readout. It remains useful historical model evidence but does
+not measure the current defaults.
 
 One paired run trained three-layer causal LMs from fresh initialization on
 FineWeb-Edu `sample-10BT`:

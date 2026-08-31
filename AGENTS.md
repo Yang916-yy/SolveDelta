@@ -129,25 +129,19 @@ axes, matching GDN2. Query, geometry direction, and edit key are L2-normalized.
 The frontend applies independent depthwise causal conv4 plus SiLU to query,
 edit key, and edit value by default. The token-local geometry rate is
 `gamma_t = sigmoid(geometry_raw_t + geometry_write_bias)`. The core output uses
-a bounded radial-aware sigmoid-gated RMSNorm before output projection. For
-per-head raw output `x` with width `V`, define
+standard sigmoid-gated RMSNorm before output projection:
 
 ```text
-r = sqrt(mean(x^2) + eps),  r0 = 1/sqrt(V)
-z = (r-r0)/(r+r0)
-alpha_h = sigmoid(2*a_h)-1/2
-y = (1+alpha_h*z) RMSNorm(x) sigmoid(output_gate).
+y = RMSNorm(x) sigmoid(output_gate).
 ```
 
-The per-head `a_h` initializes to `1`. Since `|z|<1` and `|alpha_h|<1/2`,
-the extra scale is strictly between `1/2` and `3/2`. Its strict transpose,
-including the radial component of `grad_x` and `grad_a`, is part of the model
-contract; stop-gradient or a surrogate VJP is not permitted.
+Its strict RMSNorm/gate transpose is part of the model contract; stop-gradient
+or a surrogate VJP is not permitted.
 
 At `gamma=0`, the memory path must reduce exactly at finite parameters to the
 ordinary gated Delta edit/read and `C` remains unchanged. The geometry write
-bias initializes to `-2` for every head. This is an initialization, not a
-clamp, threshold, or runtime fallback.
+bias initializes to `logit(0.9)=log(9)` for every head. This high-relaxation
+initialization is not a clamp, threshold, or runtime fallback.
 
 Masks leave `(C,S)` unchanged and return zero operator output. A valid reset
 restores `(0,0)` before consuming that token. Recurrent splitting must preserve
@@ -191,8 +185,8 @@ The selected dense CUDA path is:
    pair formation plus FLA WY/state/output;
 5. matching output-owned reverse, pair transpose, source transpose, and
    predictor transpose;
-6. FLA KDA low-rank coordinate decay and an FLA norm-gate/linear lifetime
-   owner specialized with the bounded radial scale and its strict transpose.
+6. FLA KDA low-rank coordinate decay and FLA's sigmoid-gated RMSNorm owner,
+   with norm-gate/linear lifetime ownership and its strict transpose.
 
 Public fused-projection views may have arbitrary outer strides but require unit
 innermost vector stride. The physical fused projection row is padded to a

@@ -9,7 +9,7 @@ from torch import nn
 
 from .config import SolveDeltaConfig
 from .ops.operator import solvedelta_native
-from .ops.radial_norm_gate import RadialRMSNormGated
+from .ops.norm_gate import RMSNormGated
 from .ops.packing import (
     PackedSegments,
     build_packed_segments,
@@ -65,9 +65,8 @@ class SolveDelta(nn.Module):
         self.output_gate_proj = nn.Linear(
             gate_rank, heads * value_width, bias=True
         )
-        self.output_norm = RadialRMSNormGated(
+        self.output_norm = RMSNormGated(
             value_width,
-            heads,
             eps=config.norm_eps,
         )
         if config.use_short_conv:
@@ -77,7 +76,7 @@ class SolveDelta(nn.Module):
 
         # The projected scalar is a token-local normalized-LMS write rate.
         self.geometry_write_bias = nn.Parameter(
-            torch.full((heads,), -2.0, dtype=torch.float32)
+            torch.full((heads,), math.log(9.0), dtype=torch.float32)
         )
 
         # Match the mature GDN2/Mamba decay initialization: a positive rate
