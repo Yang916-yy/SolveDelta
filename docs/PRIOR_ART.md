@@ -33,6 +33,11 @@ The selected runtime and source-compatibility baseline is FLA `0.6.0`.
 SolveDelta imports private kernel modules, so this version is pinned until a
 new release passes the full oracle, VJP, model, and CUDA Graph suite. Runtime
 installation details are maintained in `docs/ENVIRONMENT.md`.
+The September 2026 audit compared the pinned CUDA sources at
+`35dceaee5408e69a555fec34cb215c93c375dabe` with upstream main
+`8e84ed4a6727be082c34a3855c60623fd11411e9`. No intervening CUDA change in
+gated Oja, generalized DPLR, GDN2/KDA, L2Norm, or fused norm-gate replaces a
+selected owner; the newer relevant commit was Ascend-specific.
 
 ### Gated Oja predictor
 
@@ -171,6 +176,13 @@ hybrid-attention routing, RMSNorm, GatedMLP, fused-loss, and generation
 ownership. SolveDelta replaces the mixer recurrence and cache payload with
 FP32 `(C,S)`.
 
+The dense MLP stores gate/up weights as one `[2I,D]` `gate_up_proj`, performs
+one common-input GEMM, then splits the result before FLA's fused SwiGLU/down
+owner. Packed gate-up weights are an established Transformers and tensor-
+parallel layout; the local change is a parameter packing, not copied kernel
+source. An FP64 output/VJP test proves equivalence after concatenating the two
+ordinary projection weights.
+
 ## MESA as a research precursor
 
 FLA MESA supplied the paired covariance/cross-moment scans and matrix-free CG
@@ -278,6 +290,7 @@ import path: <https://github.com/pytorch/pytorch/pull/189914>. Stable PyTorch
 | Public state | `(C,S)` | Geometry solution plus Delta memory |
 | Precision | bounded FP16 dual panels, BF16 primal/decay-scaled operands/final-shaped cotangent handoff, FP32 accumulation/state/scalars | Uses extra mantissa where a static range proof or composed-VJP evidence requires it |
 | Fused projection | 64-row physical alignment, logical prefix consumers | Improves the dominant projection transpose and preserves strided views |
+| MLP input projection | One packed `D -> 2I` gate-up GEMM | Exact common-input factorization; removes one launch and a 2 MiB Graph slot |
 | Accumulation weights | Optimizer-bound BF16 Linear shadows | Amortizes casts while FP32 masters retain optimizer ownership |
 | Tails and masks/resets | Neutral tail padding plus reset-free segmented native batch | Exact state identity on padding; one native owner batch without token-wise Python scheduling |
 | Single-token cache | Pre-forgetting recurrent predictor + FLA recurrent DPLR | Inference-only owner avoids C16 padding while retaining FP32 `(C,S)` |
@@ -298,6 +311,9 @@ import path: <https://github.com/pytorch/pytorch/pull/189914>. Stable PyTorch
 | FLA fused DPLR `chunk_ho` at C16 | Saved state/output HBM but regressed the target shape because too few CTAs serially advanced all chunks |
 | Public canonicalization copies | Stride-aware owners made the copies unnecessary |
 | Grouped decay/output-gate GEMM | Packing and grouped-bias epilogues exceeded the two-GEMM launch saving |
+| Save relative-source panels for backward | Saves about 19 us core F+B but retains 6 MiB of activations per layer; local recomputation is the better deep-training trade |
+| BF16 predictor pair / exterior triangular pair | Predictor had no complete-path gain; exterior coefficients are FP32 triangular loop state |
+| Two-level predictor pair transpose at C32 | Improved the isolated kernel but not complete Graph F+B because the shallow cross-subchunk work extended fragment lifetime |
 | BF16-to-FP16 conversion | Discarded BF16 mantissa bits cannot be recovered by a later cast |
 | Denominator clamp/fallback | The smooth radial parameterization supplies an analytic lower bound |
 

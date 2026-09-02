@@ -22,11 +22,17 @@ from fla.utils import check_shared_mem
 
 
 @triton.jit
-def _merge_gate_cotangents_kernel(
+def _close_vector_gate_bwd_kernel(
     grad_output,
     grad_wy,
     grad_last,
-    merged,
+    grad_gate_pair,
+    grad_beta_wy,
+    grad_beta_pair,
+    grad_log_decay_wy,
+    grad_log_decay_pair,
+    grad_beta,
+    grad_log_decay,
     T: tl.constexpr,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -55,35 +61,27 @@ def _merge_gate_cotangents_kernel(
     value += tl.load(grad_last + offset, mask=mask, other=0.0).to(
         tl.float32
     )
-    tl.store(merged + offset, value, mask=mask)
+    pair_value = tl.load(
+        grad_gate_pair + offset, mask=mask, other=0.0
+    ).to(tl.float32)
+    value += tl.cumsum(pair_value, axis=0, reverse=True)
+    value += tl.load(
+        grad_log_decay_wy + offset, mask=mask, other=0.0
+    ).to(tl.float32)
+    value += tl.load(
+        grad_log_decay_pair + offset, mask=mask, other=0.0
+    ).to(tl.float32)
+    tl.store(grad_log_decay + offset, value, mask=mask)
 
-
-def merge_gate_cotangents(
-    grad_output: torch.Tensor,
-    grad_wy: torch.Tensor,
-    grad_last: torch.Tensor,
-    *,
-    chunk_size: int,
-) -> torch.Tensor:
-    """Merge FLA gate branches and perform their chunk-local suffix sum."""
-    batch, length, heads, rank = grad_output.shape
-    merged = torch.empty_like(grad_output, dtype=torch.float32)
-    _merge_gate_cotangents_kernel[
-        (triton.cdiv(rank, 64), triton.cdiv(length, chunk_size), batch * heads)
-    ](
-        grad_output,
-        grad_wy,
-        grad_last,
-        merged,
-        T=length,
-        H=heads,
-        R=rank,
-        C=chunk_size,
-        BR=64,
-        num_warps=4,
-        num_stages=2,
-    )
-    return merged
+    if coord_block == 0:
+        beta_offset = (batch * T + token) * H + head
+        beta_value = tl.load(
+            grad_beta_wy + beta_offset, mask=token < T, other=0.0
+        ).to(tl.float32)
+        beta_value += tl.load(
+            grad_beta_pair + beta_offset, mask=token < T, other=0.0
+        ).to(tl.float32)
+        tl.store(grad_beta + beta_offset, beta_value, mask=token < T)
 
 
 @triton.jit
@@ -123,50 +121,6 @@ def merge_source_cotangents(
         num_warps=4,
     )
     return output
-
-
-@triton.jit
-def _close_vector_gate_bwd_kernel(
-    grad_gate_vector,
-    grad_gate_pair,
-    grad_beta_wy,
-    grad_beta_pair,
-    grad_log_decay_wy,
-    grad_log_decay_pair,
-    grad_beta,
-    grad_log_decay,
-    ROWS: tl.constexpr,
-    R: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-):
-    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    valid_row = row < ROWS
-    coord = tl.arange(0, BLOCK_R)
-    valid_coord = coord < R
-    offset = row[:, None] * R + coord[None, :]
-    mask = valid_row[:, None] & valid_coord[None, :]
-    value = tl.load(grad_gate_vector + offset, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    value += tl.load(grad_gate_pair + offset, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    value += tl.load(grad_log_decay_wy + offset, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    value += tl.load(grad_log_decay_pair + offset, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    tl.store(grad_log_decay + offset, value, mask=mask)
-
-    beta_value = tl.load(
-        grad_beta_wy + row, mask=valid_row, other=0.0
-    ).to(tl.float32)
-    beta_value += tl.load(
-        grad_beta_pair + row, mask=valid_row, other=0.0
-    ).to(tl.float32)
-    tl.store(grad_beta + row, beta_value, mask=valid_row)
 
 
 @triton.autotune(
@@ -473,23 +427,42 @@ def recompute_leaky_w_u_fwd(
 
 
 def close_vector_gate_backward(
-    grad_gate_vector: torch.Tensor,
+    grad_output: torch.Tensor,
+    grad_wy: torch.Tensor,
+    grad_last: torch.Tensor,
     grad_gate_pair: torch.Tensor,
     grad_beta_wy: torch.Tensor,
     grad_beta_pair: torch.Tensor,
     grad_log_decay_wy: torch.Tensor,
     grad_log_decay_pair: torch.Tensor,
+    *,
+    chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if grad_gate_vector.shape != grad_log_decay_wy.shape:
+    if any(
+        value.shape != grad_output.shape
+        for value in (
+            grad_wy,
+            grad_last,
+            grad_gate_pair,
+            grad_log_decay_wy,
+            grad_log_decay_pair,
+        )
+    ):
         raise ValueError("vector gate cotangents must have matching shapes")
-    rows = grad_beta_wy.numel()
-    rank = grad_gate_vector.shape[-1]
+    batch, length, heads, rank = grad_output.shape
     grad_beta = torch.empty_like(grad_beta_wy, dtype=torch.float32)
-    grad_log_decay = torch.empty_like(grad_gate_vector, dtype=torch.float32)
-    block_rows = 8
-    block_rank = triton.next_power_of_2(rank)
-    _close_vector_gate_bwd_kernel[(triton.cdiv(rows, block_rows),)](
-        grad_gate_vector,
+    grad_log_decay = torch.empty_like(grad_output, dtype=torch.float32)
+    block_rank = min(64, triton.next_power_of_2(rank))
+    _close_vector_gate_bwd_kernel[
+        (
+            triton.cdiv(rank, block_rank),
+            triton.cdiv(length, chunk_size),
+            batch * heads,
+        )
+    ](
+        grad_output,
+        grad_wy,
+        grad_last,
         grad_gate_pair,
         grad_beta_wy,
         grad_beta_pair,
@@ -497,11 +470,12 @@ def close_vector_gate_backward(
         grad_log_decay_pair,
         grad_beta,
         grad_log_decay,
-        ROWS=rows,
+        T=length,
+        H=heads,
         R=rank,
-        BLOCK_ROWS=block_rows,
-        BLOCK_R=block_rank,
-        num_warps=8,
+        C=chunk_size,
+        BR=block_rank,
+        num_warps=4,
         num_stages=2,
     )
     return grad_beta, grad_log_decay
@@ -582,7 +556,6 @@ def prepare_leaky_wy_bwd(
 
 __all__ = [
     "close_vector_gate_backward",
-    "merge_gate_cotangents",
     "merge_source_cotangents",
     "prepare_leaky_wy_bwd",
     "recompute_leaky_w_u_fwd",

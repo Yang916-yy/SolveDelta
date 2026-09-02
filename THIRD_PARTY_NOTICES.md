@@ -10,8 +10,9 @@ Adapted production files:
 
 - `causallsso/modeling_solvedelta.py` and `causallsso/config.py`: FLA's
   GatedDeltaNet/MESA Hugging Face model, hybrid-attention, recurrent Cache,
-  RMSNorm, GatedMLP, and fused-loss ownership specialized around the
-  SolveDelta mixer and `(C,S)` state;
+  RMSNorm, GatedMLP activation/down owner, and fused-loss ownership specialized
+  around the SolveDelta mixer, packed common-input gate/up projection, and
+  `(C,S)` state;
 - `causallsso/model.py`: FLA GDN2/KDA-style low-rank coordinate decay,
   independent erase/write gates, and fused-projection ownership;
 - `causallsso/ops/norm_gate.py`: FLA fused sigmoid RMSNorm-gate row ownership,

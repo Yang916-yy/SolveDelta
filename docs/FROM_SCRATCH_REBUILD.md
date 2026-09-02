@@ -300,6 +300,12 @@ refreshes all shadows once, outside capture; replay rejects a stale shadow.
 This is selected only for gradient accumulation because factor-one refresh
 cost exceeds the saved casts.
 
+The model MLP stores its two algebraically independent gate/up weights as one
+`[2I,D]` parameter and evaluates one common-input `D -> 2I` GEMM. Splitting the
+output restores the ordinary gate and value panels before FLA's fused
+SwiGLU/down owner. This changes checkpoint parameter layout but not parameter
+count or the represented function.
+
 The recurrent operator state is FP32 `(C,S)`. Forward caches follow a simple
 rule: keep a panel when complete F+B beats local recomputation under the same
 VJP gate.
@@ -331,10 +337,11 @@ Production-observable gates:
 - fixed-shape CausalLM CUDA Graph loss and gradients against eager.
 
 At `B=1,T=1024,H=8,r=V=128` on the development RTX 5070 Ti, CUDA Graph replay
-measures `0.262/0.279 ms` forward median/p95 and `0.908/1.068 ms` F+B for the
-core with random FP32 initial `(C,S)` and final continuation output disabled.
-The complete projected mixer measures `0.514/0.682 ms` forward and
-`1.753/1.954 ms` F+B. Live Graph allocations are `63.0 MiB` and `208.1 MiB`
+measures `0.264/0.286 ms` forward median/p95, `0.639/0.837 ms` backward, and
+`0.905/1.114 ms` F+B for the core with random FP32 initial `(C,S)` and final
+continuation output disabled. The complete projected mixer measures
+`0.515/0.696 ms` forward, `1.222/1.423 ms` backward, and `1.760/1.993 ms` F+B.
+Live Graph allocations are `63.0 MiB` and `208.1 MiB`
 respectively. Reports must continue to state shape, dtype, device, scope, and
 execution mode.
 

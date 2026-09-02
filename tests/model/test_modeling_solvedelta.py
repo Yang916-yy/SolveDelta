@@ -8,9 +8,12 @@ import warnings
 import pytest
 import torch
 import torch.distributed as dist
+from torch.nn import functional as F
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 pytest.importorskip("fla")
+
+from fla.modules import GatedMLP
 
 from causallsso import (
     SolveDelta,
@@ -19,6 +22,7 @@ from causallsso import (
     SolveDeltaGraphedTrainingStep,
     SolveDeltaModel,
 )
+from causallsso.modeling_solvedelta import SolveDeltaMLP
 
 
 CUDA_ONLY = pytest.mark.skipif(
@@ -72,6 +76,61 @@ def test_huggingface_auto_registration_and_config_roundtrip():
     )
     assert isinstance(AutoModel.from_config(config), SolveDeltaModel)
     assert isinstance(AutoModelForCausalLM.from_config(config), SolveDeltaForCausalLM)
+
+
+def test_fused_gate_up_projection_matches_two_projection_mlp():
+    torch.manual_seed(11)
+    separate = GatedMLP(
+        hidden_size=32,
+        intermediate_size=48,
+        fuse_swiglu=False,
+    ).double()
+    fused = SolveDeltaMLP(
+        hidden_size=32,
+        intermediate_size=48,
+        fuse_swiglu=False,
+    ).double()
+    with torch.no_grad():
+        fused.gate_up_proj.weight.copy_(
+            torch.cat((separate.gate_proj.weight, separate.up_proj.weight), dim=0)
+        )
+        fused.down_proj.weight.copy_(separate.down_proj.weight)
+
+    separate_input = torch.randn(2, 5, 32, dtype=torch.float64, requires_grad=True)
+    fused_input = separate_input.detach().clone().requires_grad_(True)
+    cotangent = torch.randn(2, 5, 32, dtype=torch.float64)
+    separate_output = separate.down_proj(
+        F.silu(separate.gate_proj(separate_input))
+        * separate.up_proj(separate_input)
+    )
+    fused_output = fused(fused_input)
+    separate_output.backward(cotangent)
+    fused_output.backward(cotangent)
+
+    torch.testing.assert_close(fused_output, separate_output, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(
+        fused_input.grad,
+        separate_input.grad,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        fused.gate_up_proj.weight.grad,
+        torch.cat(
+            (separate.gate_proj.weight.grad, separate.up_proj.weight.grad), dim=0
+        ),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    torch.testing.assert_close(
+        fused.down_proj.weight.grad,
+        separate.down_proj.weight.grad,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert sum(p.numel() for p in fused.parameters()) == sum(
+        p.numel() for p in separate.parameters()
+    )
 
 
 def test_huggingface_checkpoint_roundtrip(tmp_path):

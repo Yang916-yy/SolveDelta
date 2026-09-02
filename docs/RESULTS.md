@@ -12,11 +12,11 @@ FLA 0.6.0, BF16 public operands and FP32 `(C,S)`. Shape:
 800 samples for the core and 400 for each model surface. Final continuation
 output is disabled.
 
-| Scope | Forward | F+B | Graph allocated |
-| --- | ---: | ---: | ---: |
-| Core operator | 0.262 / 0.279 ms | 0.908 / 1.068 ms | 63.0 MiB |
-| Projected mixer | 0.514 / 0.682 ms | 1.753 / 1.954 ms | 208.1 MiB |
-| Full model block | 0.754 / 0.781 ms | 2.822 / 3.002 ms | 278.1 MiB |
+| Scope | Forward | Backward | F+B | Graph allocated |
+| --- | ---: | ---: | ---: | ---: |
+| Core operator | 0.264 / 0.286 ms | 0.639 / 0.837 ms | 0.905 / 1.114 ms | 63.0 MiB |
+| Projected mixer | 0.515 / 0.696 ms | 1.222 / 1.423 ms | 1.760 / 1.993 ms | 208.1 MiB |
+| Full model block | 0.761 / 0.959 ms | 1.910 / 1.954 ms | 2.695 / 2.764 ms | 276.1 MiB |
 
 The core row uses random FP32 initial `(C,S)` and omits final continuation
 output. The projected mixer and block include their trainable projections; the
@@ -26,11 +26,12 @@ strict transpose evaluate only nonpositive exclusive-prefix exponents.
 
 The preceding scalar-retention contract measured `0.246 ms` forward and
 `0.796 ms` F+B at the core, `1.592 ms` F+B at the projected mixer, and
-`2.709 ms` F+B at the block. The right-coordinate contract measures `0.262`,
-`0.908`, `1.753`, and `2.822 ms` respectively. Live allocation is unchanged at
-each scope. These are different model semantics, so the comparison quantifies
-the price of retaining the complete DeltaRule forgetting field rather than an
-implementation-only regression.
+`2.709 ms` F+B at the block. At the initial right-coordinate landing, the same
+surfaces measured `0.262`, `0.908`, `1.753`, and `2.822 ms` respectively, with
+unchanged allocation. Those paired landing measurements quantify the semantic
+price of retaining the complete DeltaRule forgetting field. The table above is
+the later post-audit implementation and is not used to attribute that model
+change.
 
 A matched private ablation under the preceding scalar-retention contract
 replaced the accumulated action `C^T k` by `C k`
@@ -40,6 +41,77 @@ F+B while `C k` took `0.852-0.856 ms`; forward was tied at `0.232-0.234 ms`
 and allocation was identical. The `C k` owner was removed after the ablation,
 and no long training comparison was started because it did not pass the
 latency prerequisite.
+
+## Post-contract implementation audit
+
+The right-coordinate recurrence was audited directly against the FP64 oracle,
+without treating the existing native ABI as a mathematical requirement. The
+following identities are necessary rather than implementation artifacts:
+
+- the residual precedes forgetting, so moving `D_t` before the residual changes
+  the online fitting trajectory;
+- `C_t=C_{t-1}D_t+delta_t u_t^T` and
+  `(C_{t-1}D_t)^T k_t=D_t C_{t-1}^T k_t` require right-coordinate decay;
+- the exterior is exactly generalized DPLR with
+  `a=-D_t e_t` and `k=b=d`, and its common-left contraction is already
+  specialized to `d(z+z_new)^T`;
+- `rho=5/8` supplies the static inverse bound for the local frame; it is not a
+  numerical patch;
+- omitting a second `||u||^2` in the native radial scale is exact after the
+  unique L2Norm producer, and its radial cotangent is removed by the same
+  normalization transpose.
+
+No formula error hidden by FP32 was found. Against the quantized-input FP64
+oracle at `T=32,r=128`, representative relative errors were:
+
+| Quantity | Relative error |
+| --- | ---: |
+| accumulated frame action | 0.003735 |
+| predictor update | 0.002537 |
+| final `C` | 0.002648 |
+| `grad_h / grad_u / grad_gamma` | 0.002799 / 0.003655 / 0.002732 |
+| `grad_log_decay` | 0.006948 |
+| `grad_query / grad_C0` | 0.004385 / 0.002533 |
+
+The larger decay-gradient error is consistent with a long prefix derivative,
+not a mismatched recurrence. Consequently `(C,S)`, log-decay prefixes,
+triangular coefficients, radial/denominator reductions, and multi-owner
+partials remain FP32. Public vectors and eligible contraction operands remain
+BF16; bounded `e/chi` panels remain direct FP32-to-FP16 outputs. Lowering the
+predictor interaction matrix to BF16 passed the local VJP gate but did not
+improve latency or allocation. Lowering exterior `A_ed` is structurally
+invalid because FLA's triangular inverse carries it as FP32 loop state.
+
+Two exact implementation changes survived complete A/B:
+
+| Change | Matched result | Decision |
+| --- | --- | --- |
+| fuse predictor gate merge, chunk suffix, and final decay/gamma closure | core F+B `0.97685 -> 0.97056 ms`; deletes two final-shaped FP32 intermediates (`8 MiB`) | selected |
+| pack MLP gate/up weights into one `D -> 2I` projection | block F+B `2.68490 -> 2.67963 ms`; Graph allocation `278.13 -> 276.13 MiB`; unchanged parameter count | selected |
+
+Saving the relative-source `paired/injection` panels instead of recomputing
+them reduced core F+B from `0.97152` to `0.95264 ms`, but retained exactly
+`6 MiB` more forward activation per layer. The single-layer peak happened to
+be dominated by a later workspace; a deep model would accumulate the saved
+panels across layers. Production therefore keeps source recomputation.
+
+A two-level Tensor Core predictor-pair transpose reduced its isolated kernel
+from about `131.5` to `118.9 us`, but complete Graph F+B did not improve and
+p95 regressed. At C32 there is only one cross-C16 subchunk, so added fragment
+and shared-memory lifetime consumes the local reduction gain. The analogous
+exterior C16-to-C32 change is not a free retile: without a new exact-unbounded
+cross-subchunk factorization it doubles scalar pair work and reduces output
+CTA count. The selected path therefore retains C32 predictor and C16 exterior
+ownership.
+
+An eager diagnostic profile localized the remaining largest kernels to the
+predictor pair transpose, exact direct-`e` transpose, and the two resident
+state owners. These are arithmetic owners, not launch-only epilogues. The one
+remaining launch-only predictor closure is the fused owner selected above.
+FLA `0.6.0` was compared with upstream main at revision
+`8e84ed4a6727be082c34a3855c60623fd11411e9`; no CUDA changes in gated Oja,
+generalized DPLR, GDN2/KDA, L2Norm, or fused norm-gate supersede the selected
+schedules.
 
 ## Archived residual-local comparison
 

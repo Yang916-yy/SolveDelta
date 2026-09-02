@@ -14,7 +14,7 @@ from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.models.hybrid import get_hybrid_attention_spec
 from fla.models.utils import Cache, FLAUnsupportedCacheGenerationMixin
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
-from fla.modules import GatedMLP
+from fla.modules.activations import powglu, powglu_linear, swiglu_linear
 from fla.modules.l2warp import l2_warp
 
 from .config import SolveDeltaConfig
@@ -28,17 +28,67 @@ except ImportError:
     from fla.models.modeling_layers import GradientCheckpointingLayer
 
 
-class SolveDeltaMLP(GatedMLP):
-    """FLA GatedMLP with its algebraically identical CPU oracle path."""
+class SolveDeltaMLP(nn.Module):
+    """FLA GatedMLP with one common-input gate/up projection."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        hidden_ratio: int | None = None,
+        intermediate_size: int | None = None,
+        hidden_act: str = "swish",
+        fuse_swiglu: bool = True,
+        powglu_power: float = 3.0,
+    ) -> None:
+        super().__init__()
+        if hidden_ratio is None:
+            hidden_ratio = 4
+        if intermediate_size is None:
+            intermediate_size = int(hidden_size * hidden_ratio * 2 / 3)
+            intermediate_size = 256 * ((intermediate_size + 255) // 256)
+        if hidden_act not in ("swish", "powlu"):
+            raise ValueError(f"Unsupported hidden_act: {hidden_act}")
+        self.hidden_size = hidden_size
+        self.hidden_ratio = hidden_ratio
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+        self.fuse_swiglu = fuse_swiglu
+        self.powglu_power = powglu_power
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size,
+            2 * self.intermediate_size,
+            bias=False,
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+        )
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        if x.device.type != "cpu":
-            return super().forward(x, **kwargs)
-        gate = self.gate_proj(x)
-        value = self.up_proj(x)
+        gate, value = self.gate_up_proj(x).chunk(2, dim=-1)
         if self.hidden_act == "swish":
+            if x.device.type != "cpu" and self.fuse_swiglu:
+                return swiglu_linear(
+                    gate,
+                    value,
+                    self.down_proj.weight,
+                    self.down_proj.bias,
+                )
             activated = F.silu(gate)
         else:
+            if x.device.type != "cpu":
+                if self.fuse_swiglu:
+                    return powglu_linear(
+                        gate,
+                        value,
+                        self.down_proj.weight,
+                        self.down_proj.bias,
+                        self.powglu_power,
+                    )
+                return self.down_proj(
+                    powglu(gate, value, self.powglu_power)
+                )
             sigmoid = torch.sigmoid(gate)
             positive = gate > 0
             safe = torch.where(positive, gate, torch.ones_like(gate))

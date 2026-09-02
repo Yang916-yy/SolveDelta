@@ -22,7 +22,6 @@ from fla.ops.utils import chunk_local_cumsum, solve_tril
 
 from .leaky_wy import (
     close_vector_gate_backward,
-    merge_gate_cotangents,
     merge_source_cotangents,
     prepare_leaky_wy_bwd,
     recompute_leaky_w_u_fwd,
@@ -260,26 +259,16 @@ class _OjaResidual(torch.autograd.Function):
             grad_source_pair,
             output_dtype=source.dtype,
         )
-        grad_gate_cumsum = merge_gate_cotangents(
+        grad_beta, grad_log_decay = close_vector_gate_backward(
             grad_gate_output,
             grad_gate_wy,
             grad_gate_last,
-            chunk_size=ctx.chunk_size,
-        )
-
-        grad_gate_pair = chunk_local_cumsum(
-            grad_gate_pair,
-            chunk_size=ctx.chunk_size,
-            reverse=True,
-            output_dtype=torch.float32,
-        )
-        grad_beta, grad_log_decay = close_vector_gate_backward(
-            grad_gate_cumsum,
             grad_gate_pair,
             grad_beta_wy,
             grad_beta_pair,
             grad_log_decay_wy,
             grad_log_decay_pair,
+            chunk_size=ctx.chunk_size,
         )
         return (
             grad_target,

@@ -249,9 +249,9 @@ stay selectively split to preserve chunk/rank/value CTA parallelism.
 
 ## Model and Cache
 
-`SolveDeltaForCausalLM` uses an FLA-style prenorm block, GatedMLP, final
-RMSNorm, LM head, and optional fused cross entropy. It registers with
-`AutoConfig`, `AutoModel`, and `AutoModelForCausalLM`.
+`SolveDeltaForCausalLM` uses an FLA-style prenorm block, a packed gate-up
+GatedMLP, final RMSNorm, LM head, and optional fused cross entropy. It registers
+with `AutoConfig`, `AutoModel`, and `AutoModelForCausalLM`.
 
 `past_key_values` stores each layer's FP32 `(C,S)` and conv4 state. Packed
 training may provide `cu_seqlens`; explicit resets may provide
@@ -265,17 +265,18 @@ The current accumulated-primal core was measured on an RTX 5070 Ti at
 `B=1,T=1024,H=8,r=V=128`, BF16 autocast, FP32 master parameters/state, and
 CUDA Graph replay. Final continuation output is disabled.
 
-| Scope | Forward median/p95 | F+B median/p95 | Graph allocated |
-| --- | ---: | ---: | ---: |
-| Core operator | 0.262 / 0.279 ms | 0.908 / 1.068 ms | 63.0 MiB |
-| Projected mixer | 0.514 / 0.682 ms | 1.753 / 1.954 ms | 208.1 MiB |
-| Full model block | 0.754 / 0.781 ms | 2.822 / 3.002 ms | 278.1 MiB |
+| Scope | Forward median/p95 | Backward median/p95 | F+B median/p95 | Graph allocated |
+| --- | ---: | ---: | ---: | ---: |
+| Core operator | 0.264 / 0.286 ms | 0.639 / 0.837 ms | 0.905 / 1.114 ms | 63.0 MiB |
+| Projected mixer | 0.515 / 0.696 ms | 1.222 / 1.423 ms | 1.760 / 1.993 ms | 208.1 MiB |
+| Full model block | 0.761 / 0.959 ms | 1.910 / 1.954 ms | 2.695 / 2.764 ms | 276.1 MiB |
 
-These measurements cover the right-coordinate forgetting contract. Relative
-to the preceding scalar-retention contract, core F+B increased from `0.796` to
-`0.908 ms`; projected-mixer F+B increased from `1.592` to `1.753 ms`; Graph
-allocation was unchanged. The cost is the coordinate-aware pair and strict
-transpose, not an added gate projection or continuation state.
+These measurements cover the right-coordinate forgetting contract. Its
+initial matched landing comparison increased core F+B from `0.796` to
+`0.908 ms` and projected-mixer F+B from `1.592` to `1.753 ms`, with unchanged
+allocation. The cost was localized to the coordinate-aware pair and strict
+transpose, not an added gate projection or continuation state. The table above
+includes the subsequent implementation audit.
 
 Scope, numerical quality, the exploratory 200M-token comparison, and complete
 measurement conditions are recorded in
