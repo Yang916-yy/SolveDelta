@@ -9,6 +9,7 @@ from .exterior import _backward as exterior_backward
 from .exterior import _forward as exterior_forward
 from .l2norm import strided_l2norm
 from .predictor import oja_residual
+from .recurrent import solvedelta_recurrent_inference
 from .sources import relative_sources_backward, relative_sources_forward
 
 
@@ -20,6 +21,7 @@ class _RelativeExterior(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
+        direct,
         u,
         update,
         q,
@@ -32,7 +34,7 @@ class _RelativeExterior(torch.autograd.Function):
         chunk_size,
         output_final_state,
     ):
-        direct, paired, injection = relative_sources_forward(
+        paired, injection = relative_sources_forward(
             u,
             update,
             q,
@@ -56,6 +58,7 @@ class _RelativeExterior(torch.autograd.Function):
         ctx.set_materialize_grads(False)
         saved_initial = u.new_empty(0) if initial_state is None else initial_state
         ctx.save_for_backward(
+            direct,
             u,
             update,
             q,
@@ -71,6 +74,7 @@ class _RelativeExterior(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, grad_final_state):
         (
+            direct,
             u,
             update,
             q,
@@ -82,7 +86,7 @@ class _RelativeExterior(torch.autograd.Function):
             saved_initial,
         ) = ctx.saved_tensors
         initial_state = saved_initial if ctx.has_initial_state else None
-        direct, paired, injection = relative_sources_forward(
+        paired, injection = relative_sources_forward(
             u,
             update,
             q,
@@ -120,18 +124,31 @@ class _RelativeExterior(torch.autograd.Function):
             value,
             erase_raw,
             write_raw,
-            grad_direct,
             grad_paired,
             grad_injection,
             chunk_size=ctx.chunk_size,
         )
         return (
+            grad_direct,
             *source_gradients,
             grad_decay,
             grad_initial,
             None,
             None,
         )
+
+
+def _pack_primal(direct: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    batch, length, heads, rank = direct.shape
+    if length % chunk_size:
+        raise ValueError("primal panel packing requires an aligned sequence")
+    chunks = length // chunk_size
+    return (
+        direct.view(batch, chunks, chunk_size, heads, rank)
+        .permute(0, 3, 1, 2, 4)
+        .reshape(batch * heads * chunks, 1, chunk_size, rank)
+        .contiguous()
+    )
 
 
 def solvedelta_residual_frame_native(
@@ -177,8 +194,55 @@ def solvedelta_residual_frame_native(
         raise TypeError("associative_log_decay must be FP32")
     if geometry_write.dtype != torch.float32:
         raise TypeError("geometry_write must be FP32")
-    if length % EXTERIOR_CHUNK_SIZE:
-        raise ValueError("the first native Residual-Frame path requires T divisible by 16")
+
+    if (
+        length == 1
+        and rank <= 128
+        and value_dim <= 128
+        and not torch.is_grad_enabled()
+    ):
+        return solvedelta_recurrent_inference(
+            u,
+            h,
+            q,
+            keys,
+            values,
+            associative_log_decay,
+            erase_raw,
+            write_raw,
+            geometry_write,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+        )
+
+    tail = length % EXTERIOR_CHUNK_SIZE
+    if tail:
+        padding = EXTERIOR_CHUNK_SIZE - tail
+
+        def pad_tokens(tensor: torch.Tensor) -> torch.Tensor:
+            shape = list(tensor.shape)
+            shape[1] = padding
+            return torch.cat((tensor, tensor.new_zeros(shape)), dim=1)
+
+        padded_geometry_write = (
+            pad_tokens(geometry_write)
+            if geometry_write.shape == (batch, length, heads)
+            else geometry_write
+        )
+        padded_output, padded_state = solvedelta_residual_frame_native(
+            pad_tokens(u),
+            pad_tokens(h),
+            pad_tokens(q),
+            pad_tokens(keys),
+            pad_tokens(values),
+            pad_tokens(associative_log_decay),
+            pad_tokens(erase_raw),
+            pad_tokens(write_raw),
+            padded_geometry_write,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+        )
+        return padded_output[:, :length], padded_state
 
     if initial_state is None:
         predictor_initial = None
@@ -198,24 +262,29 @@ def solvedelta_residual_frame_native(
         predictor_initial, memory_initial = initial_state
 
     u_panel = strided_l2norm(u)
+    key_panel = strided_l2norm(keys.squeeze(-2))
     if geometry_write.shape != (batch, length, heads):
         geometry_write = geometry_write.reshape(1, 1, heads).expand(
             batch, length, heads
         )
 
-    update, final_predictor = oja_residual(
+    frame_action, update, final_predictor = oja_residual(
         h,
         u_panel,
         geometry_write,
+        associative_log_decay,
+        key_panel,
         predictor_initial,
         chunk_size=PREDICTOR_CHUNK_SIZE,
         output_final_state=return_final_state,
     )
+    direct = _pack_primal(key_panel + frame_action, EXTERIOR_CHUNK_SIZE)
     output, final_memory = _RelativeExterior.apply(
+        direct,
         u_panel,
         update,
         q,
-        keys.squeeze(-2),
+        key_panel,
         values.squeeze(-2),
         erase_raw.squeeze(-2),
         write_raw.squeeze(-2),

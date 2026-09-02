@@ -12,6 +12,8 @@ from causallsso import (
     solvedelta_zero_state,
 )
 from causallsso.ops.operator import solvedelta_native
+from causallsso.ops.operator import solvedelta_segmented_native
+from causallsso.ops.packing import build_packed_segments
 from causallsso.ops.residual_frame.exterior import direct_e_residual
 from causallsso.ops.residual_frame.predictor import oja_residual
 from causallsso.ops.norm_gate import (
@@ -55,7 +57,7 @@ def _reference_inputs(*, length: int = 6, rank: int = 8, value_dim: int = 5):
     )
 
 
-def test_fp64_residual_predictor_and_local_similarity():
+def test_fp64_residual_predictor_accumulated_primal_and_local_dual():
     args = _reference_inputs()
     output, state = solvedelta_reference(*args)
     u, h, q, keys, values, log_decay, erase, write, geometry_write = args
@@ -74,7 +76,6 @@ def test_fp64_residual_predictor_and_local_similarity():
     predictor = expected.predictor
     memory = expected.S
     expected_outputs = []
-    identity = torch.eye(rank, dtype=torch.float64).view(1, 1, rank, rank)
     for token in range(length):
         direction = normalized_u[:, token]
         residual = h[:, token] - (
@@ -82,17 +83,8 @@ def test_fp64_residual_predictor_and_local_similarity():
         ).squeeze(-1)
         predictor_update = geometry_write.view(1, heads, 1) * residual
         predictor = (
-            predictor
+            predictor * log_decay[:, token].exp()[..., None, :]
             + predictor_update[..., :, None] * direction[..., None, :]
-        )
-        residual_after = h[:, token] - (
-            predictor @ direction.unsqueeze(-1)
-        ).squeeze(-1)
-        torch.testing.assert_close(
-            residual_after,
-            (1.0 - geometry_write).view(1, heads, 1) * residual,
-            rtol=2e-12,
-            atol=2e-12,
         )
 
         frame_scale = RELATIVE_FRAME_RADIUS / torch.sqrt(
@@ -101,18 +93,17 @@ def test_fp64_residual_predictor_and_local_similarity():
             * predictor_update.square().sum(dim=-1, keepdim=True)
         )
         frame_covector = frame_scale * predictor_update
-        frame = (
-            identity
-            + direction[..., :, None] * frame_covector[..., None, :]
-        )
+        frame = torch.eye(rank, dtype=torch.float64).view(
+            1, 1, rank, rank
+        ) + direction[..., :, None] * frame_covector[..., None, :]
         denominator = 1.0 + (direction * frame_covector).sum(dim=-1)
         assert torch.all(denominator > 1.0 - RELATIVE_FRAME_RADIUS)
         assert torch.all(denominator < 1.0 + RELATIVE_FRAME_RADIUS)
         key = normalized_keys[:, token, :, 0]
         erase_key = erase[:, token, :, 0] * key
-        direct = key + direction * (
-            frame_covector * key
-        ).sum(dim=-1, keepdim=True)
+        direct = key + (
+            predictor.transpose(-1, -2) @ key.unsqueeze(-1)
+        ).squeeze(-1)
         dual = erase_key - frame_covector * (
             (direction * erase_key).sum(dim=-1, keepdim=True)
             / denominator[..., None]
@@ -120,12 +111,6 @@ def test_fp64_residual_predictor_and_local_similarity():
         query = normalized_q[:, token] - frame_covector * (
             (direction * normalized_q[:, token]).sum(dim=-1, keepdim=True)
             / denominator[..., None]
-        )
-        torch.testing.assert_close(
-            (dual * direct).sum(dim=-1),
-            (erase_key * key).sum(dim=-1),
-            rtol=2e-12,
-            atol=2e-12,
         )
         expected_query = torch.linalg.solve(
             frame.transpose(-1, -2), normalized_q[:, token].unsqueeze(-1)
@@ -145,6 +130,102 @@ def test_fp64_residual_predictor_and_local_similarity():
         state.predictor, predictor, rtol=2e-12, atol=2e-12
     )
     torch.testing.assert_close(state.S, memory, rtol=2e-12, atol=2e-12)
+
+
+def test_primal_uses_accumulated_predictor_while_dual_stays_local():
+    dtype = torch.float64
+    u = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], dtype=dtype)
+    h = torch.tensor([[[[0.0, 1.0]], [[0.0, 0.0]]]], dtype=dtype)
+    q = torch.tensor([[[[1.0, 0.0]], [[1.0, 0.0]]]], dtype=dtype)
+    keys = torch.tensor(
+        [[[[[1.0, 0.0]]], [[[0.0, 1.0]]]]], dtype=dtype
+    )
+    values = torch.tensor([0.0, 1.0], dtype=dtype).view(1, 2, 1, 1, 1)
+    log_decay = torch.zeros(1, 2, 1, 2, dtype=dtype)
+    erase = torch.zeros_like(keys)
+    write = torch.ones_like(values)
+    gamma = torch.ones(1, dtype=dtype)
+
+    output, state = solvedelta_reference(
+        u,
+        h,
+        q,
+        keys,
+        values,
+        log_decay,
+        erase,
+        write,
+        gamma,
+    )
+
+    # Token 1 writes C=e2 e1^T. Token 2 has zero local innovation, so its
+    # residual-local frame is identity, while (I+C)^T e2=e1+e2.
+    torch.testing.assert_close(output[:, 1], torch.ones_like(output[:, 1]))
+    expected_predictor = torch.tensor(
+        [[[[0.0, 0.0], [1.0, 0.0]]]], dtype=dtype
+    )
+    torch.testing.assert_close(state.predictor, expected_predictor)
+
+
+def test_frame_forgetting_uses_pre_decay_residual_and_right_channel_gate():
+    dtype = torch.float64
+    u = torch.tensor([[[[1.0, 0.0]]]], dtype=dtype)
+    initial_predictor = torch.tensor(
+        [[[[2.0, 3.0], [4.0, 1.0]]]], dtype=dtype
+    )
+    h = torch.tensor([[[[2.0, 4.0]]]], dtype=dtype)
+    q = torch.tensor([[[[1.0, 0.0]]]], dtype=dtype)
+    keys = torch.tensor([[[[[1.0, 0.0]]]]], dtype=dtype)
+    values = torch.zeros(1, 1, 1, 1, 1, dtype=dtype)
+    log_decay = torch.tensor(
+        [[[[torch.log(torch.tensor(0.25)), 0.0]]]], dtype=dtype
+    ).reshape(1, 1, 1, 2)
+    erase = torch.zeros_like(keys)
+    write = torch.zeros_like(values)
+    gamma = torch.tensor([0.75], dtype=dtype)
+    initial_memory = torch.tensor([[[[5.0], [7.0]]]], dtype=dtype)
+    initial_state = SolveDeltaState(
+        initial_predictor,
+        initial_memory,
+    )
+
+    _, state = solvedelta_reference(
+        u,
+        h,
+        q,
+        keys,
+        values,
+        log_decay,
+        erase,
+        write,
+        gamma,
+        initial_state=initial_state,
+    )
+
+    # h == C_0 u, so the pre-decay residual and current write are exactly zero.
+    # The old predictor is right-decayed by the complete channel gate. This is
+    # distinct from left decay and from geometric-mean scalar retention.
+    retention = log_decay[:, 0].exp()
+    expected = initial_predictor * retention[..., None, :]
+    left_decayed = retention[..., :, None] * initial_predictor
+    scalar_decayed = log_decay[:, 0].mean(dim=-1).exp()[..., None, None] * (
+        initial_predictor
+    )
+    torch.testing.assert_close(state.predictor, expected)
+    torch.testing.assert_close(
+        state.S, retention[..., :, None] * initial_memory
+    )
+    assert not torch.allclose(state.predictor, left_decayed)
+    assert not torch.allclose(state.predictor, scalar_decayed)
+
+    probe = torch.tensor([[[1.0, -2.0]]], dtype=dtype)
+    torch.testing.assert_close(
+        (state.predictor.transpose(-1, -2) @ probe.unsqueeze(-1)).squeeze(-1),
+        retention
+        * (
+            initial_predictor.transpose(-1, -2) @ probe.unsqueeze(-1)
+        ).squeeze(-1),
+    )
 
 
 def test_frame_radius_bounds_adversarial_residual():
@@ -502,11 +583,18 @@ def test_native_forward_and_composed_state_vjp_match_fp64_oracle():
     expected_gradients = list(
         torch.autograd.grad(reference_loss, (*reference_leaves, *reference_state))
     )
-    for actual, expected in zip(gradients, expected_gradients):
+    for index, (actual, expected) in enumerate(
+        zip(gradients, expected_gradients)
+    ):
         assert torch.isfinite(actual).all()
         relative = (actual.float() - expected.float()).norm()
         relative = relative / expected.float().norm().clamp_min(1e-8)
-        assert relative < 3e-2
+        assert relative < 3e-2, (
+            index,
+            relative.item(),
+            actual.float().norm().item(),
+            expected.float().norm().item(),
+        )
 
 
 @CUDA_ONLY
@@ -522,15 +610,28 @@ def test_native_predictor_multitile_source_transpose_matches_fp64():
         bf16_leaf(batch, length, heads, rank), dim=-1
     ).detach().requires_grad_()
     beta = torch.sigmoid(
-        torch.randn(batch, length, heads, device="cuda") - 2.0
+        torch.randn(batch, length, heads, device="cuda") + 2.0
+    ).requires_grad_()
+    predictor_log_decay = (
+        -0.4
+        * (
+            0.75
+            + 0.25
+            * torch.rand(batch, length, heads, rank, device="cuda")
+        )
     ).requires_grad_()
     initial = (
         0.02 * torch.randn(batch, heads, rank, rank, device="cuda")
     ).requires_grad_()
-    update, final = oja_residual(
+    query = F.normalize(
+        bf16_leaf(batch, length, heads, rank), dim=-1
+    ).detach().requires_grad_()
+    frame_action, update, final = oja_residual(
         target,
         source,
         beta,
+        predictor_log_decay,
+        query,
         initial,
         chunk_size=32,
         output_final_state=True,
@@ -538,38 +639,112 @@ def test_native_predictor_multitile_source_transpose_matches_fp64():
 
     reference_inputs = tuple(
         value.detach().double().requires_grad_()
-        for value in (target, source, beta, initial)
+        for value in (target, source, beta, predictor_log_decay, query, initial)
     )
-    target_ref, source_ref, beta_ref, predictor = reference_inputs
+    (
+        target_ref,
+        source_ref,
+        beta_ref,
+        predictor_log_decay_ref,
+        query_ref,
+        predictor,
+    ) = reference_inputs
     updates = []
+    frame_actions = []
     for token in range(length):
         residual = target_ref[:, token] - (
             predictor @ source_ref[:, token].unsqueeze(-1)
         ).squeeze(-1)
         token_update = beta_ref[:, token, :, None] * residual
         predictor = (
-            predictor
+            predictor * predictor_log_decay_ref[:, token].exp()[..., None, :]
             + token_update[..., :, None] * source_ref[:, token, :, None, :]
         )
         updates.append(token_update)
+        frame_actions.append(
+            (
+                predictor.transpose(-1, -2)
+                @ query_ref[:, token].unsqueeze(-1)
+            ).squeeze(-1)
+        )
     update_ref = torch.stack(updates, dim=1)
+    frame_action_ref = torch.stack(frame_actions, dim=1)
 
+    action_cotangent = torch.randn_like(frame_action)
     update_cotangent = torch.randn_like(update)
     state_cotangent = torch.randn_like(final)
     gradients = torch.autograd.grad(
-        (update, final),
-        (target, source, beta, initial),
-        (update_cotangent, state_cotangent),
+        (frame_action, update, final),
+        (target, source, beta, predictor_log_decay, query, initial),
+        (action_cotangent, update_cotangent, state_cotangent),
     )
     reference_gradients = torch.autograd.grad(
-        (update_ref, predictor),
+        (frame_action_ref, update_ref, predictor),
         reference_inputs,
-        (update_cotangent.double(), state_cotangent.double()),
+        (
+            action_cotangent.double(),
+            update_cotangent.double(),
+            state_cotangent.double(),
+        ),
     )
-    for actual, expected in zip(gradients, reference_gradients):
+    gradient_limits = (8e-3, 8e-3, 8e-3, 1.2e-2, 8e-3, 8e-3)
+    for actual, expected, limit in zip(
+        gradients, reference_gradients, gradient_limits
+    ):
         relative = (actual.float() - expected.float()).norm()
         relative = relative / expected.float().norm().clamp_min(1e-8)
-        assert relative < 8e-3
+        assert relative < limit
+
+
+@CUDA_ONLY
+def test_native_predictor_extreme_forgetting_remains_finite():
+    torch.manual_seed(137)
+    batch, length, heads, rank = 1, 16, 1, 16
+
+    def bf16_leaf(*shape):
+        return torch.randn(
+            *shape, device="cuda", dtype=torch.bfloat16
+        ).requires_grad_()
+
+    target = bf16_leaf(batch, length, heads, rank)
+    source = F.normalize(
+        bf16_leaf(batch, length, heads, rank), dim=-1
+    ).detach().requires_grad_()
+    beta = torch.sigmoid(
+        torch.randn(batch, length, heads, device="cuda")
+    ).requires_grad_()
+    predictor_log_decay = torch.full(
+        (batch, length, heads, rank),
+        -100.0,
+        device="cuda",
+        requires_grad=True,
+    )
+    query = F.normalize(
+        bf16_leaf(batch, length, heads, rank), dim=-1
+    ).detach().requires_grad_()
+    initial = torch.randn(
+        batch, heads, rank, rank, device="cuda", requires_grad=True
+    )
+    inputs = (target, source, beta, predictor_log_decay, query, initial)
+
+    frame_action, update, final = oja_residual(
+        *inputs,
+        chunk_size=16,
+        output_final_state=True,
+    )
+    assert all(torch.isfinite(value).all() for value in (frame_action, update, final))
+
+    cotangents = tuple(torch.randn_like(value) for value in (frame_action, update, final))
+    gradients = torch.autograd.grad(
+        (frame_action, update, final),
+        inputs,
+        cotangents,
+    )
+    for name, value in zip(
+        ("target", "source", "beta", "log_decay", "query", "initial"),
+        gradients,
+    ):
+        assert torch.isfinite(value).all(), name
 
 
 @CUDA_ONLY
@@ -690,6 +865,178 @@ def test_native_aligned_recurrent_split():
     )
     for actual, expected in zip(right_state, whole_state):
         torch.testing.assert_close(actual, expected, rtol=8e-3, atol=2e-2)
+
+
+@CUDA_ONLY
+@pytest.mark.parametrize("length", (1, 19))
+def test_native_neutral_tail_matches_fp64_oracle(length):
+    args = _native_inputs(length=length)
+    initial_state = _native_state()
+    output, state = solvedelta_native(
+        *args,
+        initial_state=initial_state,
+        return_final_state=True,
+    )
+    reference_args = tuple(value.detach().double() for value in args)
+    reference_state = SolveDeltaState(
+        *(value.detach().double() for value in initial_state)
+    )
+    expected_output, expected_state = solvedelta_reference(
+        *reference_args[:6],
+        torch.sigmoid(reference_args[6]),
+        torch.sigmoid(reference_args[7]),
+        reference_args[8],
+        initial_state=reference_state,
+    )
+    torch.testing.assert_close(
+        output.float(), expected_output.float(), rtol=2e-2, atol=2e-2
+    )
+    for actual, expected in zip(state, expected_state):
+        torch.testing.assert_close(
+            actual, expected.float(), rtol=1e-2, atol=3e-2
+        )
+
+
+@CUDA_ONLY
+def test_native_single_token_recurrent_inference_matches_fp64():
+    args = tuple(value.detach() for value in _native_inputs(length=1))
+    initial_state = SolveDeltaState(
+        *(value.detach() for value in _native_state())
+    )
+    with torch.no_grad():
+        output, state = solvedelta_native(
+            *args,
+            initial_state=initial_state,
+            return_final_state=True,
+        )
+    reference_args = tuple(value.double() for value in args)
+    reference_state = SolveDeltaState(
+        *(value.double() for value in initial_state)
+    )
+    expected_output, expected_state = solvedelta_reference(
+        *reference_args[:6],
+        torch.sigmoid(reference_args[6]),
+        torch.sigmoid(reference_args[7]),
+        reference_args[8],
+        initial_state=reference_state,
+    )
+    torch.testing.assert_close(
+        output.float(), expected_output.float(), rtol=8e-3, atol=2e-3
+    )
+    for actual, expected in zip(state, expected_state):
+        torch.testing.assert_close(
+            actual, expected.float(), rtol=5e-3, atol=3e-3
+        )
+
+
+@CUDA_ONLY
+def test_segmented_native_masks_resets_and_vjp_match_fp64():
+    torch.manual_seed(149)
+    batch, length, heads, rank, value_dim = 2, 19, 1, 16, 16
+
+    def leaf(shape, scale=1.0):
+        return (scale * torch.randn(*shape, device="cuda")).to(
+            torch.bfloat16
+        ).requires_grad_()
+
+    args = (
+        leaf((batch, length, heads, rank)),
+        leaf((batch, length, heads, rank)),
+        leaf((batch, length, heads, rank)),
+        leaf((batch, length, heads, 1, rank)),
+        leaf((batch, length, heads, 1, value_dim)),
+        (-0.03 * torch.rand(batch, length, heads, rank, device="cuda"))
+        .detach()
+        .requires_grad_(),
+        leaf((batch, length, heads, 1, rank), 0.5),
+        leaf((batch, length, heads, 1, value_dim), 0.5),
+        torch.sigmoid(
+            torch.randn(batch, length, heads, device="cuda") + 2.0
+        ).requires_grad_(),
+    )
+    initial_state = SolveDeltaState(
+        (0.02 * torch.randn(batch, heads, rank, rank, device="cuda"))
+        .requires_grad_(),
+        (0.02 * torch.randn(batch, heads, rank, value_dim, device="cuda"))
+        .requires_grad_(),
+    )
+    valid = torch.tensor(
+        [
+            [1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    reset = torch.zeros_like(valid)
+    reset[0, 8] = True
+    plan = build_packed_segments(valid, reset)
+    output, state = solvedelta_segmented_native(
+        *args,
+        plan,
+        initial_state=initial_state,
+        return_final_state=True,
+    )
+
+    reference_args = tuple(
+        value.detach().double().requires_grad_() for value in args
+    )
+    reference_state = SolveDeltaState(
+        *(value.detach().double().requires_grad_() for value in initial_state)
+    )
+    expected_output, expected_state = solvedelta_reference(
+        *reference_args[:6],
+        torch.sigmoid(reference_args[6]),
+        torch.sigmoid(reference_args[7]),
+        reference_args[8],
+        initial_state=reference_state,
+        valid_mask=valid,
+        reset_mask=reset,
+    )
+    torch.testing.assert_close(
+        output.float(), expected_output.float(), rtol=2e-2, atol=2e-2
+    )
+    for actual, expected in zip(state, expected_state):
+        torch.testing.assert_close(
+            actual, expected.float(), rtol=1e-2, atol=3e-2
+        )
+
+    output_cotangent = torch.randn_like(output)
+    state_cotangents = tuple(torch.randn_like(value) for value in state)
+    gradients = torch.autograd.grad(
+        (output, *state),
+        (*args, *initial_state),
+        (output_cotangent, *state_cotangents),
+    )
+    expected_gradients = torch.autograd.grad(
+        (expected_output, *expected_state),
+        (*reference_args, *reference_state),
+        (
+            output_cotangent.double(),
+            *(value.double() for value in state_cotangents),
+        ),
+    )
+    for index, (actual, expected) in enumerate(
+        zip(gradients, expected_gradients)
+    ):
+        assert torch.isfinite(actual).all()
+        relative = (actual.float() - expected.float()).norm()
+        relative = relative / expected.float().norm().clamp_min(1e-8)
+        assert relative < 3e-2, (
+            index,
+            relative.item(),
+            actual.float().norm().item(),
+            expected.float().norm().item(),
+            tuple(
+                (
+                    (actual[batch_index].float() - expected[batch_index].float())
+                    .norm()
+                    .item(),
+                    expected[batch_index].float().norm().item(),
+                )
+                for batch_index in range(actual.shape[0])
+            ),
+        )
 
 
 @CUDA_ONLY

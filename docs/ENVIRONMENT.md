@@ -19,10 +19,11 @@ currently supported production surfaces. WSL2 works with a compatible NVIDIA
 driver. Ampere or newer hardware is recommended because the production
 precision contract uses BF16 operands and Tensor Core accumulation.
 
-The dense CUDA path currently requires sequence lengths divisible by 16 and a
-unit innermost vector stride. `r=128` is the first tuned profile, not a
-mathematical requirement. Masks, resets, and irregular segments preserve the
-same Residual-Frame semantics through the PyTorch reference path.
+The fastest dense CUDA path uses C16-aligned sequences and unit innermost
+vector stride. Non-C16 tails use neutral private padding; masks and resets use
+reset-free segmented native batches. `r=128` is the first tuned profile, not a
+mathematical requirement. No-grad `T=1` cache inference uses recurrent native
+owners for widths up to 128.
 
 ## Dependency ownership
 
@@ -156,8 +157,8 @@ on every microbatch; it is not recommended for accumulation factor one.
   the installed PyTorch CUDA runtime, and install `ninja` and `packaging`.
 - CPU tensors entering the native path: run the FP64/PyTorch oracle directly
   or move the dense model and inputs to one CUDA device.
-- unexpected reference dispatch: omit an all-ones attention mask for dense
-  batches and use a length divisible by 16.
+- unexpected slow dispatch: omit an all-ones attention mask for dense batches;
+  aligned dense batches avoid segment packing and neutral tail padding.
 - slow first iteration: allow Triton and causal-conv1d warmup before timing;
   use CUDA Graph replay only after capture has completed.
 - CUDA Graph `AccumulateGrad` stream mismatch: use PyTorch 2.13 or newer,

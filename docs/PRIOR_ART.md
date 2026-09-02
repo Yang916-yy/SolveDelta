@@ -13,7 +13,7 @@ SolveDelta contributes:
 
 - the residual predictor recurrence;
 - the mapping from its residual write to the relative frame;
-- the exact local primal/dual similarity contract;
+- the accumulated primal and residual-local dual address contract;
 - the composition with channel decay and the ordinary Delta edit/read;
 - the public `(C,S)` state and mixed-precision contract;
 - model integration, tests, and acceptance gates.
@@ -41,17 +41,17 @@ Principal source areas:
 - `fla/ops/gated_oja_rule/chunk_kkt.py`;
 - `fla/ops/gated_oja_rule/wy_fast.py`;
 - `fla/ops/gated_oja_rule/chunk_h.py`;
+- `fla/ops/gated_oja_rule/chunk_o.py`;
 - the matching backward owners in those files.
 
-The Residual-Frame predictor is exactly the ungated vector-decay subset of
-FLA's gated Oja recurrence under
-
-```text
-FLA key/target <- h
-FLA value      <- normalized u
-FLA beta       <- gamma
-FLA state      <- predictor C.
-```
+The Residual-Frame predictor keeps FLA's pair/WY/state/output ownership but
+specializes its algebra to the pre-forgetting residual. For coordinate prefix
+`G_{i,c}=sum_{l<=i} log_alpha_{l,c}`, the strict source interaction is
+`gamma_i sum_c u_{i,c}u_{j,c}exp(G_{i,c}-log_alpha_{i,c}-G_{j,c})` for `j<i`.
+The target branch consumes `gamma*h`; the source branch consumes the
+coordinatewise exclusive prefix. Every active exponent is nonpositive, and no
+reciprocal retention is formed. The strict transpose uses the same schedule and
+closes a final-shaped channel cotangent before returning to public operands.
 
 The production specialization retains FLA's:
 
@@ -60,15 +60,21 @@ The production specialization retains FLA's:
 - recomputed WY source/update panels;
 - FP32 chunk-boundary matrix state;
 - resident state forward;
+- chunk-parallel accumulated-state output;
 - reverse chunk-state traversal;
-- WY and pair transposes.
+- output/state, WY, and pair transposes.
 
-SolveDelta keeps the chunk mechanics and specializes their surface: the Oja
-query/output branch and constant-zero vector decay disappear, WY reads the
-model's strided projection view directly, and the public ABI becomes private
-panel ownership. At `r=128`, an identical-gradient A/B selected 32-row reverse
-tiles for lower register/shared-memory pressure and greater CTA parallelism
-than the donor's 64-row schedule.
+SolveDelta keeps the chunk mechanics and specializes their surface. The Oja
+query/output branch evaluates `C_t^T k_t` for the accumulated primal; its
+strict reverse is retained. The coordinate-gated pair keeps FLA's two-level
+schedule: cross-16-token subchunks use centered Tensor Core contractions and
+diagonal subchunks use direct bounded coordinate reductions. Its transpose is
+partitioned by token subchunk and coordinate tile, with FP32 beta partials.
+The public ABI remains independent of FLA's private panels.
+The final reverse specialization fuses FLA's gate-branch merge with its
+chunk-local suffix sum and uses one final-shaped owner for the state, WY, and
+pair source cotangents. This removes launch-only epilogues without changing
+the upstream pair/WY/state ownership.
 
 ### Generalized DPLR memory exterior
 
@@ -95,11 +101,12 @@ mapping. The direct-`e` specialization folds it into the inclusive decay
 prefix instead of materializing a scaled source panel.
 
 Production adapts FLA's exact unbounded scalar pair forward/transpose to the
-source-native rectangular panels. Two distinct pair matrices are sufficient;
-duplicated source cotangents merge in-register and decay closes through FLA's
-vector reverse cumsum. Fast-WY, FP32 state boundaries, chunk-parallel output,
-output-owned reverse, state reverse, and triangular transpose keep their donor
-ownership.
+source-native rectangular panels. Because `k=b=d` and `A_qk=A_qb`, the state
+and output owners use the common-left identity
+`d z^T+d z_new^T=d(z+z_new)^T`. Forward shares one contraction; reverse makes
+the final `z/z_new` cotangent the owner and deletes the separate `dV` pass.
+Fast-WY, FP32 state boundaries, chunk-parallel output, state reverse, and
+triangular transpose keep their donor ownership.
 
 ### L2 normalization, decay, and output gate
 
@@ -113,10 +120,10 @@ Principal source areas:
 - `fla/ops/utils/`.
 
 The standalone native L2Norm keeps FLA's row ownership and strict transpose for
-`u`. The relative source owner applies the same FP32 reduction to strided q/key
-views while generating exterior panels, removing two normalized HBM
-intermediates. The bounded actions write private FP16 `d/e/chi` panels directly
-from FP32 registers; decay-scaled operands use BF16 for exponent range.
+`u` and the edit key. The relative source owner applies the same FP32 reduction
+to the strided query while generating exterior panels. Bounded dual actions
+write private FP16 `e/chi` panels directly from FP32 registers; the accumulated
+primal and decay-scaled operands use BF16 for range.
 
 KDA supplies the low-rank coordinate-decay parameterization and fused gate
 transpose. FLA's sigmoid-gated RMSNorm owns the final readout. The exterior
@@ -246,6 +253,11 @@ edges on the caller's replay stream, captures local loss forward/backward, and
 installs DDP afterward. DDP reducer hooks and NCCL collectives remain outside
 the graph.
 
+For fixed dense fused-linear loss, SolveDelta reuses FLA's chunked linear,
+logsumexp, and cross-entropy kernels with the static causal-LM denominator
+`B(T-1)`. This removes FLA's capture-time `.item()` and always launches the
+small scalar-cotangent epilogue instead of branching on a device tensor.
+
 PyTorch PR 189914 removes eager TorchScript compilation from the Inductor
 import path: <https://github.com/pytorch/pytorch/pull/189914>. Stable PyTorch
 2.13.0 predates that change, so package initialization scopes the exact MKLDNN
@@ -256,18 +268,19 @@ import path: <https://github.com/pytorch/pytorch/pull/189914>. Stable PyTorch
 | Decision | Selected form | Reason |
 | --- | --- | --- |
 | Geometry state | FP32 solution `C` | Carries the online second-order fit in action-ready coordinates |
-| Frame | Token-local `F=I+u phi^T`, `||u|| ||phi||<5/8` | Exact similarity with `den>3/8` and bounded conditioning |
-| Predictor schedule | FLA gated-Oja C32 specialization | Exact recurrence and mature forward/transpose |
+| Primal/dual geometry | Accumulated `d=(I+C)^T k`; residual-local `F^-T` for `e,chi` | Full solution history on the stable non-inverting path; bounded residual-aligned dual |
+| Predictor schedule | FLA coordinate-gated Oja C32 pair/WY/state/output with split pre-decay coefficients | Exact right-coordinate leak without reciprocal retention; mature state/output transpose |
 | Memory schedule | Exact unbounded Triton direct-e pair + FLA DPLR C16 | Exact decay semantics with mature pair/WY/state/output ownership |
 | Delta gates | Independent channel-wise `sigmoid(erase_raw/write_raw)` | Preserves the full GDN2 update surface and separate source cotangents |
 | Decay/readout | KDA low-rank coordinate gate + FLA sigmoid-gated RMSNorm | Matches the GDN2 memory surface and selected plain readout |
-| Source ABI | Panel-native direct and paired sources | Produces the consumer layout in one pass |
+| Source ABI | BF16 accumulated direct plus panel-native paired sources | Keeps unbounded `C` action in BF16 and bounded dual panels in FP16 |
 | Fusion | Selective | Preserves useful CTA parallelism and short lifetimes |
 | Public state | `(C,S)` | Geometry solution plus Delta memory |
-| Precision | bounded FP16 source panels, BF16 decay-scaled operands/final-shaped cotangent handoff, FP32 accumulation/state/scalars | Uses extra mantissa where a static range proof or composed-VJP evidence requires it |
+| Precision | bounded FP16 dual panels, BF16 primal/decay-scaled operands/final-shaped cotangent handoff, FP32 accumulation/state/scalars | Uses extra mantissa where a static range proof or composed-VJP evidence requires it |
 | Fused projection | 64-row physical alignment, logical prefix consumers | Improves the dominant projection transpose and preserves strided views |
 | Accumulation weights | Optimizer-bound BF16 Linear shadows | Amortizes casts while FP32 masters retain optimizer ownership |
-| Dense masks/resets | Reference recurrence | Same semantics until a mature packed native owner is connected |
+| Tails and masks/resets | Neutral tail padding plus reset-free segmented native batch | Exact state identity on padding; one native owner batch without token-wise Python scheduling |
+| Single-token cache | Pre-forgetting recurrent predictor + FLA recurrent DPLR | Inference-only owner avoids C16 padding while retaining FP32 `(C,S)` |
 | Distributed CUDA Graph | Local graph first, DDP reducer outside capture | Gives compute and collectives independent lifecycle ownership |
 
 ## Alternatives evaluated

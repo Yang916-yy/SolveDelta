@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import SolveDeltaConfig
-from .ops.operator import solvedelta_native
+from .ops.operator import solvedelta_native, solvedelta_segmented_native
 from .ops.norm_gate import RMSNormGated
 from .ops.packing import (
     PackedSegments,
@@ -398,7 +398,22 @@ class SolveDelta(nn.Module):
             associative_log_decay = torch.zeros_like(associative_log_decay)
 
         operator_initial = initial_state.operator if initial_state is not None else None
-        if use_native:
+        if native_inputs and packed_segments is not None:
+            output, operator_state = solvedelta_segmented_native(
+                u.to(torch.bfloat16),
+                h.to(torch.bfloat16),
+                q.to(torch.bfloat16),
+                keys.to(torch.bfloat16),
+                values.to(torch.bfloat16),
+                associative_log_decay.float(),
+                erase_raw.view(batch, length, heads, edits, width),
+                write_raw.view(batch, length, heads, edits, value_width),
+                geometry_write.float(),
+                packed_segments,
+                initial_state=operator_initial,
+                return_final_state=return_final_state,
+            )
+        elif use_native:
             output, operator_state = solvedelta_native(
                 u.to(torch.bfloat16),
                 h.to(torch.bfloat16),

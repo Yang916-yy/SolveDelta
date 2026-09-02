@@ -97,7 +97,11 @@ def solvedelta_reference(
     """Execute Residual-Frame SolveDelta token by token.
 
     FP64 inputs define the operator. The predictor is stored in the orientation
-    ``prediction = C @ u`` and updated by normalized-LMS residual writes.
+    ``prediction = C @ u`` and updated by leaky normalized-LMS residual writes.
+    The residual is evaluated against the complete old predictor before the
+    existing DeltaRule channel retentions right-decay its source coordinates.
+    The primal address uses the accumulated frame ``I+C``; dual addresses
+    retain the bounded inverse-transpose of the current residual-local factor.
     """
     batch, length, heads, edits, rank, value_dim = _validate(
         u,
@@ -148,7 +152,6 @@ def solvedelta_reference(
         geometry_write = geometry_write.reshape(1, 1, heads).expand(
             batch, length, heads
         )
-
     outputs: list[torch.Tensor] = []
     for token in range(length):
         valid = valid_mask[:, token]
@@ -165,10 +168,9 @@ def solvedelta_reference(
             predictor @ u_t.unsqueeze(-1)
         ).squeeze(-1)
         predictor_update = geometry_write[:, token, :, None] * residual
-        predictor_new = (
-            predictor
-            + predictor_update[..., :, None] * u_t[..., None, :]
-        )
+        predictor_new = predictor * associative_log_decay[:, token].exp()[
+            ..., None, :
+        ] + predictor_update[..., :, None] * u_t[..., None, :]
 
         direction_norm_sq = (u_t * u_t).sum(dim=-1, keepdim=True)
         update_norm_sq = (
@@ -183,9 +185,12 @@ def solvedelta_reference(
         denominator = 1.0 + (frame_covector * u_t).sum(dim=-1)
         key = keys[:, token, :, 0]
         erase_key = erase[:, token, :, 0] * key
-        direct = key + u_t * (
-            frame_covector * key
-        ).sum(dim=-1, keepdim=True)
+        # The primal address uses the complete accumulated solution frame.
+        # ``predictor`` stores C, so the identity base preserves the exact
+        # finite-parameter GDN2 reduction when geometry writing is disabled.
+        direct = key + (
+            predictor_new.transpose(-1, -2) @ key.unsqueeze(-1)
+        ).squeeze(-1)
         dual = erase_key - frame_covector * (
             (u_t * erase_key).sum(dim=-1, keepdim=True)
             / denominator[..., None]

@@ -47,19 +47,25 @@ z = sigmoid(write_raw) * v.
 The residual predictor update is
 
 ```text
+D = Diag(exp(log_alpha))
 r = h - C_prev u
 delta = gamma r
-C = C_prev + delta u^T.
+C = C_prev D + delta u^T.
 ```
 
-Because `u` is normalized, the just-observed residual becomes
-`(1-gamma)r`, while orthogonal source directions keep their previous value.
-The recurrence advances the least-squares solution directly in `C`.
+The residual is evaluated before forgetting. Thus `delta` retains the intended
+innovation direction and magnitude, while only historical `C_prev` is turned
+over. `D` is exactly the existing DeltaRule channel retention and has no
+separate projection, parameter, scalar mean, or learned exponent. It acts on
+the right/source axis of `C`, which is also the accumulated primal address axis:
+`(C D)^T k = D C^T k`. The recurrence advances a coordinate-leaky online
+least-squares solution directly in `C`; the former notation's `rho_h` is fixed
+to one.
 The per-head geometry bias initializes to `logit(0.9)=log(9)`, so the
 predictor begins as a high-relaxation normalized-LMS solver while the
 token-local projection remains free to learn smaller or larger rates.
 
-The token-local relative frame and its exact inverse-transpose action are
+The accumulated primal frame and token-local inverse-transpose action are
 
 ```text
 rho = 5/8
@@ -84,20 +90,16 @@ These bounds follow from the smooth model parameterization itself.
 The three public source actions are
 
 ```text
-d   = F k
+P   = I + C
+d   = P^T k
 e   = F^-T b
 chi = F^-T q.
 ```
 
-Therefore
-
-```text
-e^T d = b^T k
-I - d e^T = F (I - k b^T) F^-1.
-```
-
-This is an exact local similarity transform. `F_t` is the relative factor for
-the current solve residual; prefix history remains in `C_t`.
+The primal consumes the complete ordered prefix in `C_t`; the dual and query
+remain aligned with the current solve residual through the exact rank-one
+inverse-transpose. This intentionally does not form a local similarity pair and
+never requires an inverse of accumulated `C_t`.
 
 The memory recurrence is
 
@@ -107,51 +109,54 @@ S = S_decay + d (z - S_decay^T e)^T
 o = S^T chi.
 ```
 
-At finite `gamma=0`, `delta=phi=0`, `F=I`, `C` is unchanged, and the memory
-path is exactly the ordinary gated Delta edit/read.
+From zero continuation, finite `gamma=0` gives `C=0`, `delta=phi=0`, and
+`P=F=I`, so the memory path is exactly the ordinary gated Delta edit/read.
 
 ## 3. Chunk predictor
 
-For one chunk, stack source rows in `U`, target rows in `H`, and write rates
-in diagonal `Gamma`. Define `D_gamma=Gamma U`. With entry predictor `C0`,
+The production owner specializes FLA coordinate-gated Oja to the
+pre-forgetting residual order. Let
+`G_{i,c}=sum_{l<=i} log_alpha_{l,c}` within a chunk. The source interaction for
+`j<i` is
 
 ```text
-W = I + tril(U D_gamma^T, -1)
-R = W^-1 (H - U C0^T)
-C_out = C0 + (D_gamma^T R)^T.
+L_ij = gamma_i sum_c u_{i,c} u_{j,c}
+       exp(G_{i,c} - log_alpha_{i,c} - G_{j,c}).
 ```
 
-The stored implementation uses `C=X^T`, so equivalent transposes may appear
-in code. The production owner is a specialization of FLA gated Oja:
+Every active exponent is nonpositive. Cross-16-token subchunks retain FLA's
+centered Tensor Core factorization; diagonal subchunks evaluate the bounded
+coordinate exponent directly. The target branch consumes `gamma_i h_i`, while
+the pair/WY branch uses the coordinatewise exclusive prefix. Neither a
+decay-compensated target nor `gamma/a` is materialized. The strict transpose
+differentiates the same form and returns one cotangent per channel retention.
+The resulting state update is exactly `C_prev D + delta u^T`, not a
+decay-before-residual approximation.
 
-```text
-FLA key    <- h
-FLA value  <- u
-FLA beta   <- gamma
-FLA state  <- C.
-```
-
-Its pair GEMM, unit-lower triangular WY solve, state GEMM, chunk boundaries,
-and reverse schedule are retained. Forward emits the token-local `delta` panel
-and final FP32 `C`; reverse applies `W^-T` and returns final-shaped cotangents
-for `h,u,gamma,C0`. The specialization drops FLA's constant-zero vector-gate
-panel and reads strided target views directly. At `r=128`, reverse owns 32
-predictor rows per CTA, doubling CTA parallelism relative to the 64-row donor
-schedule and lowering register/shared-memory pressure.
+Its pair GEMM, unit-lower triangular WY solve, state GEMM, chunk-parallel output
+owner, chunk boundaries, and reverse schedule are retained. Forward emits
+`C_t^T k_t`, the token-local `delta` panel, and final FP32 `C`; reverse uses
+FLA's matching output/state owners before applying `W^-T`, returning
+final-shaped cotangents for `h,u,gamma,log_alpha,k,C0`.
 
 ## 4. Relative source owner
 
-The source owner consumes normalized `u`, raw strided `q/k`, predictor update
-`delta`, raw erase/write logits, and value. It computes q/key L2 norms and
-generates and discards `phi` in the same CTA:
+The source owner consumes normalized `u/k`, raw strided `q`, predictor update
+`delta`, raw erase/write logits, and value. It computes q L2Norm and generates
+and discards `phi` in the same CTA:
 
 ```text
 phi = rho delta / sqrt(rho^2 + ||delta||^2)  # ||u||=1
 den = 1 + phi^T u
-d = k + u (phi^T k)
 e = b - phi (u^T b) / den
 chi = q - phi (u^T q) / den
 z = sigmoid(write_raw) * v.
+```
+
+The primal is produced separately by the Oja output owner:
+
+```text
+d = k + C^T k.
 ```
 
 The upstream L2Norm owner establishes `||u||=1`, making the shortened radial
@@ -160,23 +165,26 @@ formula algebraically exact in the composed operator. Its purely radial
 This identity avoids a repeated BF16-rounded norm and slightly improves the
 production-observable oracle/VJP error.
 
-Q/key norm reductions, frame actions, and erase/write sigmoid arithmetic are
-evaluated in FP32. The bounded frame gives a static range proof for the private
-`d/e/chi` panels, so the source owner writes FP16 directly from FP32 registers.
+Q norm reductions, dual actions, and erase/write sigmoid arithmetic are
+evaluated in FP32. The bounded local factor gives a static range proof for the
+private `e/chi` panels, so the source owner writes FP16 directly from FP32
+registers. The accumulated primal is BF16 because `C` has no static range
+bound.
 Products with the unbounded decay exponent are materialized later in BF16 to
 retain exponent range:
 
 ```text
-d           [panels,1,C16,r] FP16
+d           [panels,1,C16,r] BF16
 paired e,q  [panels,2,C16,r] FP16
 z           [B,T,H,V]        BF16.
 ```
 
-The panel layout is produced in consumer order, eliminating a token-major
-`cat/permute/contiguous` handoff. The source transpose consumes the matching
-panel cotangents, closes the shared denominator once, applies the
-scaled-L2Norm transpose for `phi`, and returns independent erase/write
-cotangents. Radial and gate scalars stay resident.
+The dual panel layout is produced in consumer order. The source transpose
+consumes the matching panel cotangents, closes the shared denominator once,
+applies the scaled-L2Norm transpose for `phi`, and returns independent
+erase/write cotangents. The primal cotangent is owned by the Oja output
+transpose and closes through the shared key L2Norm. Radial and gate scalars
+stay resident.
 
 The model frontend uses KDA's low-rank coordinate-decay parameterization:
 
@@ -244,16 +252,18 @@ Backward is the strict transpose of the composed forward blocks:
    `bar_o,bar_S_final`;
 2. fast-WY reverse applies the transpose triangular action;
 3. the direct-`e` pair transpose owns final source tiles and closes decay;
-4. the source transpose returns `bar_u,bar_delta,bar_q,bar_k,bar_v` and the
-   independent raw erase/write cotangents;
-5. the gated-Oja transpose combines `bar_delta` with `bar_C_final` and
-   returns `bar_h,bar_u,bar_gamma,bar_C0`;
-6. the source transpose applies q/key L2Norm transposes, while the standalone
-   u L2Norm transpose returns the remaining gradient to its strided view.
+4. the dual source transpose returns `bar_u,bar_delta,bar_q,bar_k,bar_v` and
+   the independent raw erase/write cotangents;
+5. the gated-Oja output/state transpose combines `bar_d,bar_delta` with
+   `bar_C_final` and returns `bar_h,bar_u,bar_gamma,bar_log_a,bar_k,bar_C0`;
+6. the source transpose applies q L2Norm, while shared key and u L2Norm owners
+   return their accumulated gradients to strided public views.
 
 Each reverse owner mirrors one forward block and emits final-shaped
 cotangents. Contributions to shared `u` close after the source and predictor
-owners have both completed.
+owners have both completed. The predictor epilogue merges its final-shaped
+source cotangents directly into BF16 and combines the output, WY, and boundary
+gate terms with the chunk-local suffix sum in one FP32 owner.
 
 The pair and source transposes accumulate locally in FP32. Their
 single-consumer, final-shaped BF16 handoff reduces this backward interface from
@@ -262,10 +272,10 @@ single-consumer, final-shaped BF16 handoff reduces this backward interface from
 ## 7. Precision map
 
 ```text
-BF16: public vector operands/output; decay-scaled DPLR, WY, and state multiplicands;
+BF16: public vector operands/output; accumulated d panel; decay-scaled DPLR, WY, and state multiplicands;
       final-shaped pair-to-source cotangent handoff
-FP16: statically bounded source-native d/e/chi panels, written directly from FP32
-FP32: C,S,erase/write gates,gamma,log_alpha,norm/radial and denominator reductions, divisions,
+FP16: statically bounded source-native e/chi panels, written directly from FP32
+FP32: C,S,erase/write gates,gamma,frame/channel log_alpha,norm/radial and denominator reductions, divisions,
       Tensor Core accumulators, backward partials, continuation boundaries
 FP64: token oracle only
 ```
@@ -294,16 +304,21 @@ The recurrent operator state is FP32 `(C,S)`. Forward caches follow a simple
 rule: keep a panel when complete F+B beats local recomputation under the same
 VJP gate.
 
-Dense native currently requires lengths aligned to C16. Masks and resets run
-the same recurrence through the model reference path.
+Non-C16 tails are padded with neutral private tokens whose state transpose is
+the identity. Masks and valid resets are compacted into independent segments,
+executed as one neutral-padded native batch, and scattered back; the first
+segment may inherit continuation while reset segments start from zero. No-grad
+`T=1` cache inference uses a residual-before-forgetting recurrent predictor
+owner followed by FLA's inference-only DPLR recurrent memory owner.
 
 ## 9. Acceptance and benchmark
 
 Hard gates:
 
-- FP64 predictor recurrence and exact relative-frame action;
+- FP64 pre-decay residual, right coordinate frame forgetting, accumulated
+  primal action, and exact local inverse-transpose action;
 - adversarial verification of the `3/8` denominator lower bound;
-- exact local similarity and finite `gamma=0` GDN2 reduction;
+- finite `gamma=0` GDN2 reduction from zero continuation;
 - independent erase/write activation and KDA gated-output formula;
 - masks, resets, recurrent splits, `K=1`, and a non-128 reference width;
 - complete initial/final `(C,S)` composed VJP.
@@ -315,27 +330,13 @@ Production-observable gates:
 - dense projected layer forward/backward from real strided projection views;
 - fixed-shape CausalLM CUDA Graph loss and gradients against eager.
 
-At `B1,T1024,H8,r=V=128`, BF16 public operands and FP32 state, the
-panel-native production composition measured:
-
-```text
-eager forward median/p95  0.412 / 0.538 ms
-eager F+B median/p95      1.476 / 1.663 ms
-Graph forward median/p95  0.173 / 0.178 ms
-Graph F+B median/p95      0.610 / 0.785 ms
-Graph allocated           58.1 MiB
-```
-
-These are core-operator measurements on the development RTX 5070 Ti, not
-complete mixer or causal-LM numbers. Benchmark reports must continue to state
-shape, dtype, device, scope, and execution mode.
-
-The complete projected mixer at the same shape, using FP32 master parameters
-and BF16 autocast, measured Graph forward `0.428/0.614 ms` median/p95 and F+B
-`1.437/1.632 ms`, with `245.8 MiB` Graph allocation. The synchronized p95
-samples in this run include the same roughly `0.17 ms` P-state tail observed
-for the matched GDN2 run. The mixer has `8.99M` parameters versus `9.46M`
-before low-rank decay and output gating.
+At `B=1,T=1024,H=8,r=V=128` on the development RTX 5070 Ti, CUDA Graph replay
+measures `0.262/0.279 ms` forward median/p95 and `0.908/1.068 ms` F+B for the
+core with random FP32 initial `(C,S)` and final continuation output disabled.
+The complete projected mixer measures `0.514/0.682 ms` forward and
+`1.753/1.954 ms` F+B. Live Graph allocations are `63.0 MiB` and `208.1 MiB`
+respectively. Reports must continue to state shape, dtype, device, scope, and
+execution mode.
 
 The matched FLA GDN2 comparison and exploratory model evidence are maintained
 in `docs/RESULTS.md`; they do not alter this implementation contract.

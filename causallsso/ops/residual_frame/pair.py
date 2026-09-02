@@ -156,13 +156,11 @@ def _direct_e_pair_bwd_kernel(
     d,
     paired,
     gi,
-    dAqd0,
-    dAqd1,
+    dAqd,
     dAed0,
     dAed1,
     dqg,
-    ddtail0,
-    ddtail1,
+    ddtail,
     dag,
     dg_tail,
     dd,
@@ -212,14 +210,10 @@ def _direct_e_pair_bwd_kernel(
     valid_len = min(T - i_t * BT, BT)
     m_A = m_t[:, None] & (o_j[None, :] < valid_len)
     A_base = (i_b * T + o_t) * (H * BT) + i_h * BT
-    p_dAqd0 = dAqd0 + A_base[:, None] + o_j[None, :]
-    p_dAqd1 = dAqd1 + A_base[:, None] + o_j[None, :]
+    p_dAqd = dAqd + A_base[:, None] + o_j[None, :]
     p_dAed0 = dAed0 + A_base[:, None] + o_j[None, :]
     p_dAed1 = dAed1 + A_base[:, None] + o_j[None, :]
-    b_dAqd = (
-        tl.load(p_dAqd0, mask=m_A, other=0.0).to(tl.float32)
-        + tl.load(p_dAqd1, mask=m_A, other=0.0).to(tl.float32)
-    )
+    b_dAqd = tl.load(p_dAqd, mask=m_A, other=0.0).to(tl.float32)
     b_dAed = (
         tl.load(p_dAed0, mask=m_A, other=0.0).to(tl.float32)
         + tl.load(p_dAed1, mask=m_A, other=0.0).to(tl.float32)
@@ -284,8 +278,7 @@ def _direct_e_pair_bwd_kernel(
 
     p_dqg = dqg + token_base[:, None] + o_k[None, :]
     p_dag = dag + token_base[:, None] + o_k[None, :]
-    p_ddtail0 = ddtail0 + token_base[:, None] + o_k[None, :]
-    p_ddtail1 = ddtail1 + token_base[:, None] + o_k[None, :]
+    p_ddtail = ddtail + token_base[:, None] + o_k[None, :]
     last = min((i_t + 1) * BT, T) - 1
     p_last = gi + (i_b * T + last) * (H * K) + i_h * K + o_k
     b_last = tl.load(p_last, mask=m_k, other=0.0).to(tl.float32)
@@ -296,9 +289,8 @@ def _direct_e_pair_bwd_kernel(
     b_da += (
         tl.load(p_dag, mask=m_tk, other=0.0).to(tl.float32) * exp2(b_gi)
     )
-    b_dd += (
-        tl.load(p_ddtail0, mask=m_tk, other=0.0).to(tl.float32)
-        + tl.load(p_ddtail1, mask=m_tk, other=0.0).to(tl.float32)
+    b_dd += tl.load(p_ddtail, mask=m_tk, other=0.0).to(
+        tl.float32
     ) * exp2(b_last[None, :] - b_gi)
 
     p_dd = dd + panel[:, None] * (FC * K) + row[:, None] * K + o_k[None, :]
@@ -404,13 +396,11 @@ def direct_e_pair_backward(
     d: torch.Tensor,
     paired: torch.Tensor,
     inclusive: torch.Tensor,
-    dA_qd_0: torch.Tensor,
-    dA_qd_1: torch.Tensor,
+    dA_qd: torch.Tensor,
     dA_ed_0: torch.Tensor,
     dA_ed_1: torch.Tensor,
     dq_scaled: torch.Tensor,
-    dd_tail_0: torch.Tensor,
-    dd_tail_1: torch.Tensor,
+    dd_tail: torch.Tensor,
     de_scaled: torch.Tensor,
     dg_tail: torch.Tensor,
     *,
@@ -434,13 +424,11 @@ def direct_e_pair_backward(
         d,
         paired,
         inclusive,
-        dA_qd_0,
-        dA_qd_1,
+        dA_qd,
         dA_ed_0,
         dA_ed_1,
         dq_scaled,
-        dd_tail_0,
-        dd_tail_1,
+        dd_tail,
         de_scaled,
         dg_tail,
         dd,

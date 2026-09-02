@@ -6,12 +6,13 @@ before deciding how to edit memory.**
 Most Delta-rule layers write in a fixed coordinate system. SolveDelta adds an
 online matrix solver. Directional observations `u -> h` define second and
 cross moments whose least-squares equation is `C J = G`; a normalized-LMS
-step advances the solution `C` directly. The current solve residual then
-creates a bounded relative frame for the token's write, erase, and read:
+step advances the solution `C` directly. The accumulated solution directs the
+primal write, while the current solve residual supplies a bounded dual action
+for erase and read:
 
 ```text
-prefix observations -> online geometry solve -> relative frame
-                    -> Delta edit -> memory read
+prefix observations -> online geometry solve -> accumulated primal write
+                    -> residual-local dual erase/read -> Delta memory
 ```
 
 The recurrent state is two fixed-size FP32 matrices: `C`, the geometry
@@ -34,9 +35,10 @@ modeling**, **PyTorch**, **Triton**, and **CUDA**.
   cross-moment fitting supply the problem; normalized-LMS supplies a fast
   rank-one iteration. The full `r x r` solution evolves without carrying a
   covariance inverse through the sequence.
-- **Exact coordinate transport.** A bounded factor `F=I+u phi^T` maps the edit
-  key with `F` and erase/query covectors with `F^-T`. Every realized Delta
-  transition is an exact, analytically conditioned similarity transform.
+- **History-bearing primal, stable residual dual.** The write direction uses
+  the full accumulated frame `I+C`, while erase/query use an analytically
+  conditioned rank-one inverse-transpose aligned with the current residual.
+  No inverse of the accumulated matrix is required.
 - **A strict GDN2 reduction.** At finite `gamma=0`, `F=I` and the memory path
   becomes GDN2's channel-wise Delta edit/read. Geometry is an added capability,
   not a replacement memory rule.
@@ -148,8 +150,9 @@ One helper instance owns one `[B,T]` shape and CUDA device. Backward must run
 before its next replay. The optimizer, clipping, gradient accumulation, and
 distributed reduction remain outside capture. Masks, resets, recurrent cache,
 gradient checkpointing, and module hooks are outside this dense graph surface.
-Use ordinary fused cross entropy and construct/replay the helper on one CUDA
-stream.
+Ordinary fused cross entropy and fixed-dense fused-linear cross entropy are
+both graph-safe; the latter requires replay labels without user-supplied
+ignore entries. Construct and replay the helper on one CUDA stream.
 
 Two optional training modes are available: optimizer-bound BF16 Linear shadows
 amortize weight casts across gradient-accumulation microbatches, and
@@ -172,16 +175,22 @@ direction `u_t`, target `h_t`, and learned relaxation
 `gamma_t in (0,1)`:
 
 ```text
+D_t = Diag(exp(log_alpha_t))
 r_t = h_t - C_{t-1} u_t
 delta_t = gamma_t r_t
-C_t = C_{t-1} + delta_t u_t^T.
+C_t = C_{t-1} D_t + delta_t u_t^T.
 ```
 
-This is the negative instantaneous least-squares gradient in solution
-coordinates. Ordering and learned relaxation make `C_t` a recurrent online
-solution rather than a batch closed form.
+This is a leaky normalized-LMS step in solution coordinates. The residual is
+measured against the complete old solution before forgetting, so current
+innovation is unchanged. `C` reuses DeltaRule's complete channel-retention
+field on its source/address axis; it adds no gate projection, scalar reduction,
+or parameter. This orientation is aligned with the primal readout because
+`(C_t D_t)^T k = D_t C_t^T k`. Ordering, relaxation, and coordinate-selective
+turnover make `C_t` a recurrent online solution rather than a batch closed form.
+Equivalently, the geometry retention exponent is fixed at `rho_h=1`.
 
-The relative frame is
+The accumulated primal frame and residual-local dual factor are
 
 ```text
 rho = 5/8
@@ -196,17 +205,20 @@ The radial map is identity to first order and gives
 With normalized edit key `k_t`, erase covector `b_t`, and query `q_t`:
 
 ```text
-d_t   = F_t k_t
 e_t   = F_t^-T b_t
 chi_t = F_t^-T q_t.
 ```
 
-This gives
+The primal line is evaluated from the complete solution:
 
 ```text
-e_t^T d_t = b_t^T k_t
-I-d_t e_t^T = F_t (I-k_t b_t^T) F_t^-1.
+P_t = I + C_t
+d_t = P_t^T k_t.
 ```
+
+The asymmetry is deliberate: accumulated history controls the stable primal
+action, while the dual follows the current innovation without forming
+`C_t^-1`.
 
 The channel-decayed memory applies GDN2's independent channel-wise write and
 erase gates in that relative frame and reads with `chi_t`. The core output then
@@ -221,10 +233,11 @@ The CUDA path specializes concrete mature primitives around SolveDelta's
 private panel ownership:
 
 - stride-aware FLA L2Norm for the predictor source;
-- FLA gated-Oja pair, triangular WY, matrix-state forward, and an ungated
-  transpose specialization for the residual predictor;
-- a fused source owner that normalizes strided query/key views and writes
-  direct/dual/query exterior panels while closing erase/write transposes;
+- FLA coordinate-gated Oja pair, triangular WY, matrix-state/output forward,
+  and matching transpose for the pre-decay residual predictor and accumulated
+  primal action;
+- a shared key normalization owner and fused source owner for residual-local
+  dual/query panels plus erase/write transposes;
 - an exact unbounded Triton specialization of FLA's direct-`e` pair
   forward/transpose;
 - FLA generalized-DPLR WY, state/output, and output-owned reverse;
@@ -242,31 +255,27 @@ RMSNorm, LM head, and optional fused cross entropy. It registers with
 
 `past_key_values` stores each layer's FP32 `(C,S)` and conv4 state. Packed
 training may provide `cu_seqlens`; explicit resets may provide
-`solvedelta_reset_mask`. Dense batches without padding should omit an
-all-ones `attention_mask` so they stay on the optimized native path.
+`solvedelta_reset_mask`. Invalid tokens and resets are compacted into native
+reset-free segment batches. Non-C16 tails use neutral private padding, while
+no-grad single-token cache steps use recurrent predictor and DPLR owners.
 
 ## Performance Snapshot
 
-Development measurements use an RTX 5070 Ti at
+The current accumulated-primal core was measured on an RTX 5070 Ti at
 `B=1,T=1024,H=8,r=V=128`, BF16 autocast, FP32 master parameters/state, and
-CUDA Graph replay. Both paths omit final continuation output in this table.
+CUDA Graph replay. Final continuation output is disabled.
 
-| Scope | Path | Forward median/p95 | F+B median/p95 | Graph allocated |
-| --- | --- | ---: | ---: | ---: |
-| Core operator | SolveDelta | 0.173 / 0.178 ms | 0.610 / 0.785 ms | 58.1 MiB |
-| Core operator | FLA GDN2 | 0.107 / 0.112 ms | 0.467 / 0.643 ms | 46.0 MiB |
-| Projected mixer | SolveDelta | 0.428 / 0.614 ms | 1.437 / 1.632 ms | 245.8 MiB |
-| Projected mixer | FLA GDN2 | 0.364 / 0.534 ms | 1.276 / 1.468 ms | 233.2 MiB |
+| Scope | Forward median/p95 | F+B median/p95 | Graph allocated |
+| --- | ---: | ---: | ---: |
+| Core operator | 0.262 / 0.279 ms | 0.908 / 1.068 ms | 63.0 MiB |
+| Projected mixer | 0.514 / 0.682 ms | 1.753 / 1.954 ms | 208.1 MiB |
+| Full model block | 0.754 / 0.781 ms | 2.822 / 3.002 ms | 278.1 MiB |
 
-At the projected-mixer boundary, SolveDelta currently pays about `18%` forward
-and `12%` F+B latency over GDN2, plus `12.6 MiB` active Graph allocation, for
-the residual predictor and relative-frame actions. The mixer comparison adds
-projection, conv4, gates, normalization, and output projection, but excludes
-the MLP, LM head, optimizer, and distributed communication.
-
-The core rows expose different mathematical contracts: SolveDelta includes its
-predictor and initial `(C,S)` cotangents, while GDN2 has no predictor. The
-projected-mixer rows are the primary hidden-to-hidden comparison.
+These measurements cover the right-coordinate forgetting contract. Relative
+to the preceding scalar-retention contract, core F+B increased from `0.796` to
+`0.908 ms`; projected-mixer F+B increased from `1.592` to `1.753 ms`; Graph
+allocation was unchanged. The cost is the coordinate-aware pair and strict
+transpose, not an added gate projection or continuation state.
 
 Scope, numerical quality, the exploratory 200M-token comparison, and complete
 measurement conditions are recorded in
@@ -293,10 +302,10 @@ python -m pytest -q -s
 
 ## Current Limits
 
-- Dense native execution currently requires sequence lengths divisible by 16.
-- Masks and resets currently run through the reference implementation.
-- Recurrent cache semantics are connected; optimized single-token decode is an
-  open performance target.
+- C16-aligned dense training is the tuned surface; tail and reset-density
+  performance has not received the same breadth of profiling.
+- CUDA Graph training remains fixed-shape and excludes masks, resets, cache,
+  hooks, and gradient checkpointing.
 - Broader multi-seed and history-conditioned retrieval evaluation remains the
   main model-quality target.
 

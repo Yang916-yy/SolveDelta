@@ -1,18 +1,60 @@
 # Evaluation and Performance
 
-This page answers three practical questions about the current Residual-Frame
-operator: what the geometry solver costs, which implementation choices earned
-their place, and what the first language-model runs suggest.
+The current measurement covers the accumulated-primal operator defined by the
+oracle. Older mixer and training results are retained below with their model
+contract stated explicitly.
 
-The short version:
+## Current right-coordinate forgetting path
+
+Environment: RTX 5070 Ti, Python 3.12, PyTorch 2.13.0+cu130, Triton 3.7.1,
+FLA 0.6.0, BF16 public operands and FP32 `(C,S)`. Shape:
+`B=1,T=1024,H=8,r=V=128`. CUDA Graph timings report median/p95 after warmup:
+800 samples for the core and 400 for each model surface. Final continuation
+output is disabled.
+
+| Scope | Forward | F+B | Graph allocated |
+| --- | ---: | ---: | ---: |
+| Core operator | 0.262 / 0.279 ms | 0.908 / 1.068 ms | 63.0 MiB |
+| Projected mixer | 0.514 / 0.682 ms | 1.753 / 1.954 ms | 208.1 MiB |
+| Full model block | 0.754 / 0.781 ms | 2.822 / 3.002 ms | 278.1 MiB |
+
+The core row uses random FP32 initial `(C,S)` and omits final continuation
+output. The projected mixer and block include their trainable projections; the
+block also includes prenorm and MLP. The coordinate-gated pair retains FLA's
+centered Tensor Core cross-subchunk schedule, while diagonal subchunks and the
+strict transpose evaluate only nonpositive exclusive-prefix exponents.
+
+The preceding scalar-retention contract measured `0.246 ms` forward and
+`0.796 ms` F+B at the core, `1.592 ms` F+B at the projected mixer, and
+`2.709 ms` F+B at the block. The right-coordinate contract measures `0.262`,
+`0.908`, `1.753`, and `2.822 ms` respectively. Live allocation is unchanged at
+each scope. These are different model semantics, so the comparison quantifies
+the price of retaining the complete DeltaRule forgetting field rather than an
+implementation-only regression.
+
+A matched private ablation under the preceding scalar-retention contract
+replaced the accumulated action `C^T k` by `C k`
+using transposed reads of the same chunk-boundary state and a strict FLA-style
+reverse. Across interleaved Graph measurements, `C^T k` took `0.831-0.834 ms`
+F+B while `C k` took `0.852-0.856 ms`; forward was tied at `0.232-0.234 ms`
+and allocation was identical. The `C k` owner was removed after the ablation,
+and no long training comparison was started because it did not pass the
+latency prerequisite.
+
+## Archived residual-local comparison
+
+The remaining operator/mixer comparison was collected for commit `93735fad`,
+whose primal used the token-local residual frame. It remains useful historical
+evidence for the shared predictor, dual, exterior, and model shell, but it is
+not a current accumulated-primal comparison.
+
+For that archived execution graph:
 
 - at the projected-mixer boundary, SolveDelta adds about `18%` forward and
   `12%` F+B latency over same-shape FLA GDN2;
 - paired 50M-token runs selected `gamma=0.90` with plain gated RMSNorm;
 - an earlier 200M-token run was competitive on average NLL and produced a
   positive paired LAMBADA NLL signal.
-
-## CUDA Graph operator and mixer
 
 Environment: RTX 5070 Ti, Python 3.12, PyTorch 2.13.0+cu130, Triton 3.7.1,
 FLA 0.6.0, BF16 public operands/autocast, FP32 master parameters and recurrent
@@ -104,6 +146,53 @@ The effect was corpus-dependent: `0.95` improved FineWeb-Edu by
 (`[0.03040,0.04333]`), but regressed PG19 by `0.01550`
 (`[-0.01892,-0.01196]`). The reversal on PG19 and the fixed-validation result
 favor `0.90` as the general default.
+
+## Independent source/target versus shared geometry A/B
+
+A paired 300M-token run tested whether the independent geometry projections
+`u=W_u x` and `h=W_h x` could be replaced by one projection `g=W_g x`, used
+as normalized source `u=normalize(g)` and unnormalized target `h=g`. The
+candidate is the variance-matched folded form of `(u_raw+h_raw)/sqrt(2)` and
+removes one complete `d_model x H*r` projection. The operator, accumulated
+`C^T k` primal, dual, memory recurrence, optimizer, token order, and all other
+initial weights were matched.
+
+```text
+seed                 20260831
+shape                B=48, T=512, hidden=768, H=6, r=128, layers=7
+tokens/model         300,023,808
+parameters           independent 101,881,556; shared 97,752,788
+optimizer            AdamW, betas=(0.9,0.95), weight decay=0.1
+learning rate        3e-4 peak, 4% warmup, cosine decay to zero
+precision            FP32 parameters, BF16 autocast
+```
+
+The shared candidate learned faster early and retained a small final
+FineWeb-Edu validation advantage: `3.44060` independent versus `3.43228`
+shared. Frozen paired evaluation gave a mixed result:
+
+| Corpus | Independent NLL | Shared NLL | Shared advantage | 95% CI |
+| --- | ---: | ---: | ---: | ---: |
+| FineWeb-Edu | 3.61293 | 3.60552 | 0.00742 | [0.00303, 0.01180] |
+| WikiText-103 | 4.46044 | 4.47461 | -0.01416 | [-0.02379, -0.00485] |
+| PG19 | 4.26036 | 4.24425 | 0.01611 | [0.00977, 0.02245] |
+| LAMBADA item | 5.72098 | 5.70820 | 0.01278 | [-0.00619, 0.03172] |
+
+The shared parameterization did not pass the structure-sensitive gate. Across
+lengths 128, 256, and 512, its target-versus-best-wrong margins were lower by
+about `0.81` on recall, `0.73` on overwrite, `0.49` on disambiguation, and
+`0.21` on instruction override. Overwrite accuracy at lengths 256 and 512
+fell from `20.3/21.9%` to `9.4/10.9%`; both paired intervals excluded zero.
+These low absolute accuracies come from an exploratory three-token-per-
+parameter run, but the consistent paired margin loss directly localizes the
+missing arbitrary source-to-target direction.
+
+At `B=1,T=1024,H=8,r=V=128` on the RTX 5070 Ti, the shared candidate reduced
+projected-mixer CUDA Graph forward from `0.4873` to `0.4666 ms` and F+B from
+`1.6598` to `1.5857 ms`, while stable Graph allocation fell by `10 MiB`.
+That engineering gain does not compensate for the structure-sensitive
+regression. Independent `u/h` remains selected; the shared form is not a
+maintained model variant.
 
 ## Exploratory 200M-token comparison
 

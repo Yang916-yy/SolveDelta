@@ -86,19 +86,29 @@ Production carries the online solution `C` in the orientation
 normalized geometry direction `u_t`, the update is
 
 ```text
+D_t = Diag(exp(log_alpha_t))
 r_t = h_t - C_{t-1} u_t
 delta_t = gamma_t r_t
-C_t = C_{t-1} + delta_t u_t^T.
+C_t = C_{t-1} D_t + delta_t u_t^T.
 ```
 
-The token-local relative frame is
+The residual is evaluated before forgetting. `C` right-decays with the complete
+ordinary DeltaRule channel-retention field; there is no independent projection,
+parameter, scalar mean, or learned time-scale exponent. Right decay is aligned
+with the accumulated primal because `(C D)^T k = D C^T k`. Forgetting therefore
+removes stale source/address coordinates without attenuating or fabricating the
+current innovation. In the earlier exponent notation, `rho_h=1` is fixed and is
+not a model parameter.
+
+The accumulated primal frame and token-local dual factor are
 
 ```text
 rho = 5/8
 phi_t = rho delta_t / sqrt(rho^2 + ||u_t||^2 ||delta_t||^2)
 F_t = I + u_t phi_t^T
 den_t = 1 + phi_t^T u_t
-d_t = F_t k_t
+P_t = I + C_t
+d_t = P_t^T k_t
 e_t = F_t^-T (erase_t * k_t)
 chi_t = F_t^-T q_t.
 ```
@@ -109,11 +119,13 @@ The implementation uses the exact rank-one inverse-transpose action
 F_t^-T x = x - phi_t (u_t^T x) / den_t.
 ```
 
-This preserves `e_t^T d_t = (erase_t*k_t)^T k_t` and makes the erase transition
-an exact local similarity transform. The static radial parameterization gives
+The primal path therefore consumes the complete ordered solution history,
+while erase and query remain aligned with the current solve residual. No
+inverse of accumulated `C` is formed or carried. The static radial
+parameterization gives
 `3/8 < den_t < 13/8`, `||F_t^-1||_2 <= 8/3`, and
 `kappa_2(F_t) <= 13/3`; it is part of the model definition, not a runtime
-clamp. It does not claim that `F_t` is the accumulated absolute frame `I+X_t`.
+clamp.
 
 The memory is channel-decayed, updated by the conjugated Delta edit, and read
 through the same relative frame:
@@ -139,10 +151,11 @@ y = RMSNorm(x) sigmoid(output_gate).
 Its strict RMSNorm/gate transpose is part of the model contract; stop-gradient
 or a surrogate VJP is not permitted.
 
-At `gamma=0`, the memory path must reduce exactly at finite parameters to the
-ordinary gated Delta edit/read and `C` remains unchanged. The geometry write
-bias initializes to `logit(0.9)=log(9)` for every head. This high-relaxation
-initialization is not a clamp, threshold, or runtime fallback.
+At `gamma=0` from zero geometry continuation, the memory path must reduce
+exactly at finite parameters to the ordinary gated Delta edit/read. A nonzero
+continuation still follows the shared `D_t` forgetting recurrence. The
+geometry write bias initializes to `logit(0.9)=log(9)` for every head. This
+high-relaxation initialization is not a clamp, threshold, or runtime fallback.
 
 Masks leave `(C,S)` unchanged and return zero operator output. A valid reset
 restores `(0,0)` before consuming that token. Recurrent splitting must preserve
@@ -151,7 +164,7 @@ the same continuation semantics.
 ## Precision and Native Ownership
 
 - Public/raw vector operands and native outputs are BF16.
-- `(C,S)`, erase/write gates, `gamma`, log-decays, normalization/radial
+- `(C,S)`, erase/write gates, `gamma`, frame/channel log-decays, normalization/radial
   reductions, relative-frame denominators, sensitive divisions, and backward
   partials are FP32.
 - A final-shaped owner-to-owner source cotangent may use BF16 after its owner
@@ -177,11 +190,15 @@ the same continuation semantics.
 The selected dense CUDA path is:
 
 1. stride-aware FLA L2 normalization for `u`;
-2. a C32 FLA gated-Oja pair/WY/state specialization for the residual predictor
-   and its ungated strict transpose;
-3. source-owned q/key L2 normalization and fused generation of `d`, paired
-   `(e,chi)`, and `z` directly in C16 exterior panels, using the exact
-   normalized-`u` radial specialization;
+2. a C32 FLA coordinate-gated Oja pair/WY/state/output specialization for the
+   leaky residual predictor, accumulated primal action, shared channel decay,
+   and strict transpose; its target branch consumes `gamma*h` and its source
+   pair uses the coordinatewise exclusive retention prefix, so neither a
+   decay-compensated target nor the numerically unsafe `gamma/a` ratio is
+   formed;
+3. a shared key L2Norm owner plus source-owned q normalization and fused
+   generation of paired `(e,chi)` and `z` directly in C16 exterior panels,
+   using the exact normalized-`u` radial specialization;
 4. an exact unbounded Triton direct-`e` specialization of FLA generalized-DPLR
    pair formation plus FLA WY/state/output;
 5. matching output-owned reverse, pair transpose, source transpose, and
@@ -194,9 +211,10 @@ innermost vector stride. The physical fused projection row is padded to a
 multiple of 64 for its Tensor Core GEMM; consumers expose only the logical
 prefix. Packed private panels and padding rows are not public operator ABI.
 
-Dense CUDA BF16 is the optimized training surface. Masks and resets currently
-use the same Residual-Frame semantics through the model reference path; they
-must never fall back to an archived operator.
+Dense CUDA BF16 is the optimized training surface. Non-C16 tails use neutral
+private padding, masks/resets use reset-free segmented native batches, and
+no-grad `T=1` cache inference uses recurrent predictor plus FLA DPLR owners.
+These paths must never fall back to an archived operator.
 
 ## Scope Boundaries
 
@@ -214,11 +232,12 @@ unpacks a chain of private VJPs.
 
 The minimum suite covers:
 
-- FP64 residual predictor and relative-frame recurrence;
+- FP64 pre-decay residual, right coordinate frame forgetting, and
+  relative-frame recurrence;
 - the analytic relative-frame denominator and condition bounds;
 - masks, resets, recurrent splits, and a non-128 width;
 - the finite-parameter GDN2 reduction at `gamma=0`;
-- the exact local similarity and inverse-transpose identities;
+- accumulated primal action and the exact local inverse-transpose identity;
 - independent raw erase/write activation and gated-output formula;
 - native BF16 outputs and FP32 `(C,S)` against the FP64 oracle;
 - composed VJPs, including initial and final `(C,S)`;

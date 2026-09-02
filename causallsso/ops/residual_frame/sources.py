@@ -21,7 +21,6 @@ def _source_fwd_kernel(
     value,
     erase_raw,
     write_raw,
-    direct,
     dual,
     query,
     injection,
@@ -76,13 +75,9 @@ def _source_fwd_kernel(
     u_r = tl.load(u + base_r, mask=mask_r, other=0.0).to(tl.float32)
     update_r = tl.load(update + base_r, mask=mask_r, other=0.0).to(tl.float32)
     q_raw_r = tl.load(q + q_base, mask=mask_r, other=0.0).to(tl.float32)
-    key_raw_r = tl.load(key + key_base, mask=mask_r, other=0.0).to(tl.float32)
+    key_r = tl.load(key + key_base, mask=mask_r, other=0.0).to(tl.float32)
     q_rstd = 1.0 / tl.sqrt(tl.sum(q_raw_r * q_raw_r, axis=0) + 1.0e-24)
-    key_rstd = 1.0 / tl.sqrt(
-        tl.sum(key_raw_r * key_raw_r, axis=0) + 1.0e-24
-    )
     q_r = q_raw_r * q_rstd
-    key_r = key_raw_r * key_rstd
     erase_base = (
         batch * erase_stride_b
         + token * erase_stride_t
@@ -98,13 +93,10 @@ def _source_fwd_kernel(
     frame_scale = frame_radius / tl.sqrt(radial_denom)
     frame_r = frame_scale * update_r
     den = 1.0 + tl.sum(u_r * frame_r, axis=0)
-    direct_score = tl.sum(frame_r * key_r, axis=0)
     dual_score = tl.sum(u_r * erase_key, axis=0) / den
     query_score = tl.sum(u_r * q_r, axis=0) / den
-    direct_offset = (panel * C + panel_row) * rank + r
     dual_offset = ((panel * 2) * C + panel_row) * rank + r
     query_offset = ((panel * 2 + 1) * C + panel_row) * rank + r
-    tl.store(direct + direct_offset, key_r + u_r * direct_score, mask=mask_r)
     tl.store(dual + dual_offset, erase_key - frame_r * dual_score, mask=mask_r)
     tl.store(query + query_offset, q_r - frame_r * query_score, mask=mask_r)
 
@@ -138,7 +130,6 @@ def _source_bwd_kernel(
     value,
     erase_raw,
     write_raw,
-    grad_direct,
     grad_dual,
     grad_query,
     grad_injection,
@@ -200,13 +191,9 @@ def _source_bwd_kernel(
     u_r = tl.load(u + base_r, mask=mask_r, other=0.0).to(tl.float32)
     update_r = tl.load(update + base_r, mask=mask_r, other=0.0).to(tl.float32)
     q_raw_r = tl.load(q + q_base, mask=mask_r, other=0.0).to(tl.float32)
-    key_raw_r = tl.load(key + key_base, mask=mask_r, other=0.0).to(tl.float32)
+    key_r = tl.load(key + key_base, mask=mask_r, other=0.0).to(tl.float32)
     q_rstd = 1.0 / tl.sqrt(tl.sum(q_raw_r * q_raw_r, axis=0) + 1.0e-24)
-    key_rstd = 1.0 / tl.sqrt(
-        tl.sum(key_raw_r * key_raw_r, axis=0) + 1.0e-24
-    )
     q_r = q_raw_r * q_rstd
-    key_r = key_raw_r * key_rstd
     erase_base = (
         batch * erase_stride_b
         + token * erase_stride_t
@@ -217,10 +204,8 @@ def _source_bwd_kernel(
     erase = tl.sigmoid(erase_x)
     erase_key = erase * key_r
 
-    direct_offset = (panel * C + panel_row) * rank + r
     dual_offset = ((panel * 2) * C + panel_row) * rank + r
     query_offset = ((panel * 2 + 1) * C + panel_row) * rank + r
-    gd = tl.load(grad_direct + direct_offset, mask=mask_r, other=0.0).to(tl.float32)
     ge = tl.load(grad_dual + dual_offset, mask=mask_r, other=0.0).to(tl.float32)
     gchi = tl.load(grad_query + query_offset, mask=mask_r, other=0.0).to(tl.float32)
 
@@ -230,20 +215,15 @@ def _source_bwd_kernel(
     frame_r = frame_scale * update_r
     den = 1.0 + tl.sum(u_r * frame_r, axis=0)
     inv_den = 1.0 / den
-    direct_score = tl.sum(frame_r * key_r, axis=0)
     dual_numerator = tl.sum(u_r * erase_key, axis=0)
     query_numerator = tl.sum(u_r * q_r, axis=0)
     dual_score = dual_numerator * inv_den
     query_score = query_numerator * inv_den
 
-    gu = gd * direct_score
+    gu = tl.zeros((block_rank,), dtype=tl.float32)
     gframe = -ge * dual_score - gchi * query_score
-    gkey = gd
+    gkey = tl.zeros((block_rank,), dtype=tl.float32)
     gq = gchi
-
-    g_direct_score = tl.sum(gd * u_r, axis=0)
-    gframe += g_direct_score * key_r
-    gkey += g_direct_score * frame_r
 
     g_dual_score = -tl.sum(ge * frame_r, axis=0)
     g_query_score = -tl.sum(gchi * frame_r, axis=0)
@@ -274,11 +254,8 @@ def _source_bwd_kernel(
     tl.store(grad_u + base_r, gu, mask=mask_r)
     tl.store(grad_update + base_r, gupdate, mask=mask_r)
     gq_raw = (gq - tl.sum(gq * q_r, axis=0) * q_r) * q_rstd
-    gkey_raw = (
-        gkey - tl.sum(gkey * key_r, axis=0) * key_r
-    ) * key_rstd
     tl.store(grad_q + base_r, gq_raw, mask=mask_r)
-    tl.store(grad_key + base_r, gkey_raw, mask=mask_r)
+    tl.store(grad_key + base_r, gkey, mask=mask_r)
     tl.store(grad_erase_raw + base_r, g_erase_x, mask=mask_r)
 
     v = tl.arange(0, block_value)
@@ -320,12 +297,9 @@ def relative_sources_forward(
     batch, length, heads, _ = u.shape
     chunks = triton.cdiv(length, chunk_size)
     panels = batch * heads * chunks
-    # These panels are statically bounded by source normalization and the
-    # relative-frame condition bound.  Write FP16 directly from the FP32
-    # producer; decay-scaled DPLR operands are materialized separately.
-    direct = torch.empty(
-        panels, 1, chunk_size, rank, dtype=torch.float16, device=key.device
-    )
+    # The paired panels are statically bounded by source normalization and the
+    # relative-frame condition bound. Write FP16 directly from the FP32
+    # producer; the accumulated primal has a separate Oja output owner.
     paired = torch.empty(
         panels, 2, chunk_size, rank, dtype=torch.float16, device=key.device
     )
@@ -338,7 +312,6 @@ def relative_sources_forward(
         value,
         erase_raw,
         write_raw,
-        direct,
         paired,
         paired,
         injection,
@@ -369,7 +342,7 @@ def relative_sources_forward(
         frame_radius=RELATIVE_FRAME_RADIUS,
         num_warps=1,
     )
-    return direct, paired, injection
+    return paired, injection
 
 
 def relative_sources_backward(
@@ -380,7 +353,6 @@ def relative_sources_backward(
     value,
     erase_raw,
     write_raw,
-    grad_direct,
     grad_paired,
     grad_injection,
     *,
@@ -389,9 +361,6 @@ def relative_sources_backward(
     batch, length, heads, rank = u.shape
     chunks = triton.cdiv(length, chunk_size)
     panels = batch * heads * chunks
-    grad_direct = torch.zeros(
-        panels, 1, chunk_size, rank, dtype=key.dtype, device=key.device
-    ) if grad_direct is None else grad_direct.contiguous()
     grad_paired = torch.zeros(
         panels, 2, chunk_size, rank, dtype=key.dtype, device=key.device
     ) if grad_paired is None else grad_paired.contiguous()
@@ -412,7 +381,6 @@ def relative_sources_backward(
         value,
         erase_raw,
         write_raw,
-        grad_direct,
         grad_paired,
         grad_paired,
         grad_injection,
@@ -460,10 +428,9 @@ class _RelativeSources(torch.autograd.Function):
         return outputs
 
     @staticmethod
-    def backward(ctx, gd, gpaired, gz):
+    def backward(ctx, gpaired, gz):
         outputs = relative_sources_backward(
             *ctx.saved_tensors,
-            gd,
             gpaired,
             gz,
             chunk_size=ctx.chunk_size,

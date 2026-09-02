@@ -201,15 +201,58 @@ def test_recurrent_cache_matches_unsplit_model_and_owns_fp32_state():
     assert 4 < generated.shape[1] <= 6
 
 
-def test_cuda_graph_training_rejects_fused_linear_loss_before_capture():
+@CUDA_ONLY
+def test_cuda_single_token_recurrent_cache_matches_dense_native():
+    torch.manual_seed(6)
     config = _tiny_config(
-        fuse_cross_entropy=False,
-        fuse_linear_cross_entropy=True,
+        hidden_size=128,
+        num_heads=1,
+        head_k_dim=128,
+        head_v_dim=128,
+        num_hidden_layers=1,
+        vocab_size=256,
+        fuse_norm=True,
+        fuse_swiglu=True,
+        fuse_cross_entropy=True,
+        use_cache=True,
     )
-    model = SolveDeltaForCausalLM(config).train()
-    sample_ids = torch.randint(0, config.vocab_size, (1, 8))
-    with pytest.raises(ValueError, match="fused linear cross entropy"):
-        SolveDeltaGraphedTrainingStep(model, sample_ids, sample_ids)
+    model = SolveDeltaForCausalLM(config).cuda().eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 16), device="cuda")
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        dense = model(input_ids, use_cache=False).logits
+        cached = None
+        pieces = []
+        for token in range(input_ids.shape[1]):
+            result = model(
+                input_ids[:, token : token + 1],
+                past_key_values=cached,
+                use_cache=True,
+            )
+            pieces.append(result.logits)
+            cached = result.past_key_values
+    recurrent = torch.cat(pieces, dim=1)
+    torch.testing.assert_close(
+        recurrent.float(), dense.float(), rtol=1e-2, atol=2e-2
+    )
+    assert cached.get_seq_length() == input_ids.shape[1]
+    for layer_state in cached:
+        assert all(
+            tensor.dtype == torch.float32
+            for tensor in layer_state["recurrent_state"]
+        )
+
+
+@CUDA_ONLY
+def test_cuda_graph_training_rejects_ignored_labels_for_fixed_dense_loss():
+    config = _tiny_config(fuse_linear_cross_entropy=True)
+    model = SolveDeltaForCausalLM(config).cuda().train()
+    sample_ids = torch.randint(
+        0, config.vocab_size, (1, 16), device="cuda"
+    )
+    labels = sample_ids.clone()
+    labels[:, 3] = -100
+    with pytest.raises(ValueError, match="does not accept ignored"):
+        SolveDeltaGraphedTrainingStep(model, sample_ids, labels)
 
 
 @CUDA_ONLY
@@ -259,7 +302,10 @@ def test_causal_lm_cuda_bf16_native_forward_backward(monkeypatch):
 @pytest.mark.filterwarnings(
     "error:The AccumulateGrad node's stream does not match.*"
 )
-def test_causal_lm_cuda_graph_training_matches_eager():
+@pytest.mark.parametrize("fuse_linear_cross_entropy", (False, True))
+def test_causal_lm_cuda_graph_training_matches_eager(
+    fuse_linear_cross_entropy,
+):
     torch.manual_seed(11)
     config = _tiny_config(
         hidden_size=128,
@@ -270,7 +316,8 @@ def test_causal_lm_cuda_graph_training_matches_eager():
         vocab_size=256,
         fuse_norm=True,
         fuse_swiglu=True,
-        fuse_cross_entropy=True,
+        fuse_cross_entropy=not fuse_linear_cross_entropy,
+        fuse_linear_cross_entropy=fuse_linear_cross_entropy,
     )
     eager_model = SolveDeltaForCausalLM(config).cuda().train()
     graphed_model = copy.deepcopy(eager_model).train()

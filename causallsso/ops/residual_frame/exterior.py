@@ -6,14 +6,13 @@ from .pair import (
     direct_e_pair_backward,
     direct_e_pair_forward,
 )
-from fla.ops.generalized_delta_rule.dplr.chunk_h_bwd import chunk_dplr_bwd_dhu
-from fla.ops.generalized_delta_rule.dplr.chunk_h_fwd import chunk_dplr_fwd_h
-from fla.ops.generalized_delta_rule.dplr.chunk_o_bwd import (
+from .common_left_h import chunk_dplr_fwd_h
+from .common_left_o_bwd import (
     chunk_dplr_bwd_dAu,
-    chunk_dplr_bwd_dv,
     chunk_dplr_bwd_o,
 )
-from fla.ops.generalized_delta_rule.dplr.chunk_o_fwd import chunk_dplr_fwd_o
+from .common_left_o_fwd import chunk_dplr_fwd_o
+from fla.ops.generalized_delta_rule.dplr.chunk_h_bwd import chunk_dplr_bwd_dhu
 from fla.ops.generalized_delta_rule.dplr.wy_fast_bwd import chunk_dplr_bwd_wy
 from fla.ops.generalized_delta_rule.dplr.wy_fast_fwd import prepare_wy_repr_fwd
 from fla.ops.rwkv6.chunk import chunk_rwkv6_fwd_cumsum
@@ -52,7 +51,6 @@ def _forward(
     )
     states, z_new, state_out = chunk_dplr_fwd_h(
         kg=d_tail,
-        bg=d_tail,
         v=z,
         w=w,
         u=update,
@@ -70,7 +68,6 @@ def _forward(
             v=z,
             v_new=z_new,
             A_qk=A_qd,
-            A_qb=A_qd,
             h=states,
             cu_seqlens=None,
             chunk_size=chunk_size,
@@ -135,7 +132,7 @@ def _backward(
         final_state=False,
         output_required=False,
     )
-    grad_z_new, grad_A_qd_0, grad_A_qd_1 = chunk_dplr_bwd_dAu(
+    grad_z_output, grad_A_qd = chunk_dplr_bwd_dAu(
         v=z,
         v_new=z_new,
         do=grad_output,
@@ -153,30 +150,19 @@ def _backward(
         h0=initial_state,
         dht=grad_final_state,
         do=grad_output,
-        dv=grad_z_new,
+        dv=grad_z_output,
         cu_seqlens=None,
         chunk_size=chunk_size,
         chunk_indices=None,
     )
-    del grad_z_new
-    grad_z_0 = chunk_dplr_bwd_dv(
-        A_qk=A_qd,
-        kg=d_tail,
-        do=grad_output,
-        dh=grad_states,
-        cu_seqlens=None,
-        chunk_size=chunk_size,
-        chunk_indices=None,
-    )
+    del grad_z_output
     (
         grad_q_scaled,
-        grad_d_tail_0,
+        grad_d_tail,
         grad_w,
-        grad_d_tail_1,
         grad_gate_tail,
     ) = chunk_dplr_bwd_o(
         k=d_tail,
-        b=d_tail,
         v=z,
         v_new=z_new,
         gk=cumulative,
@@ -198,12 +184,12 @@ def _backward(
         ag=e_scaled,
         dw=grad_w,
         du=grad_update,
-        dv0=grad_z_0,
+        dv0=grad_update,
         cu_seqlens=None,
         chunk_size=chunk_size,
         chunk_indices=None,
     )
-    del A_ed, e_scaled, w, update, inverse, grad_update, grad_z_0, grad_w
+    del A_ed, e_scaled, w, update, inverse, grad_update, grad_w
     del (
         A_qd,
         q_scaled,
@@ -213,13 +199,11 @@ def _backward(
         d_panel,
         paired,
         cumulative,
-        grad_A_qd_0,
-        grad_A_qd_1,
+        grad_A_qd,
         grad_A_ed_0,
         grad_A_ed_1,
         grad_q_scaled,
-        grad_d_tail_0,
-        grad_d_tail_1,
+        grad_d_tail,
         grad_e_scaled,
         grad_gate_tail,
         chunk_size=chunk_size,

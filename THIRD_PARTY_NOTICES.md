@@ -17,20 +17,36 @@ Adapted production files:
 - `causallsso/ops/norm_gate.py`: FLA fused sigmoid RMSNorm-gate row ownership,
   FP32 reductions, strict transpose, and norm-linear checkpoint ownership;
 - `causallsso/ops/residual_frame/predictor.py`: FLA gated-Oja pair,
-  triangular-WY, state, and ungated strict-transpose owners specialized to
-  normalized LMS residual prediction without the unrelated query/output or
-  zero vector-gate branches;
+  triangular-WY, state/output, and strict-transpose owners specialized to
+  shared coordinate-decay normalized LMS residual prediction and accumulated
+  primal action;
+- `causallsso/ops/residual_frame/leaky_wy.py`: FLA gated-Oja WY recompute and
+  transpose schedules specialized to separate target-write and source-erase
+  coefficients, fused vector-gate suffix closure, and
+  final-shaped source cotangent ownership;
+- `causallsso/ops/residual_frame/vector_pair.py`: FLA gated-Oja coordinate-gate
+  pair schedule and transpose specialized to the residual-before-decay
+  exclusive prefix;
 - `causallsso/ops/residual_frame/exterior.py`: FLA generalized-DPLR fast-WY,
   state/output forward, and matching reverse specialized to direct relative
   frame sources;
+- `causallsso/ops/residual_frame/common_left_{h,o_fwd,o_bwd}.py`: FLA DPLR
+  state/output owners specialized to the exact `k=b=d`, `A_qk=A_qb`
+  common-left case and its output-owned transpose;
 - `causallsso/ops/residual_frame/pair.py`: FLA generalized-DPLR exact-unbounded
   Triton pair forward/transpose specialized to one token-local direct-`e`
   edit and the source-native panel layout;
 - `causallsso/ops/residual_frame/sources.py`: FLA/GDN2 output-owner style
-  source generation and transpose, including strided q/key L2Norm,
+  dual source generation and transpose, including strided q L2Norm,
   scaled-L2Norm frame parameterization, and erase/write gate epilogues;
 - `causallsso/ops/residual_frame/l2norm.py`: FLA L2Norm arithmetic and row
   ownership specialized to fused-projection source strides.
+- `causallsso/ops/residual_frame/recurrent.py`: FLA fused-recurrent Oja state
+  ownership specialized to pre-forgetting residual order, composed with FLA's
+  inference-only generalized-DPLR recurrent memory owner;
+- `causallsso/graph_linear_cross_entropy.py`: FLA fused-linear cross-entropy
+  chunking and Triton kernels specialized to a static dense CUDA Graph
+  denominator and graph-safe cotangent epilogue.
 
 Principal upstream source areas:
 

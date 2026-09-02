@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from .bf16_shadow import BF16ShadowWeights
+from .graph_linear_cross_entropy import fixed_dense_linear_cross_entropy
 from .modeling_solvedelta import SolveDeltaForCausalLM
 
 
@@ -33,6 +34,30 @@ class _CausalLMLoss(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
+        if self.model.config.fuse_linear_cross_entropy:
+            outputs = self.model.model(
+                input_ids=input_ids,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=False,
+            )
+            hidden_states = outputs[0]
+            shifted = torch.cat(
+                (
+                    labels[..., 1:],
+                    torch.full_like(labels[:, :1], -100),
+                ),
+                dim=1,
+            )
+            return fixed_dense_linear_cross_entropy(
+                hidden_states.reshape(-1, hidden_states.shape[-1]),
+                shifted.reshape(-1),
+                self.model.lm_head.weight,
+                self.model.lm_head.bias,
+                total=labels.shape[0] * (labels.shape[1] - 1),
+                use_l2warp=self.model.config.use_l2warp,
+            )
         output = self.model(
             input_ids=input_ids,
             labels=labels,
@@ -161,14 +186,16 @@ class SolveDeltaGraphedTrainingStep:
                 )
         if getattr(model.model, "gradient_checkpointing", False):
             raise ValueError("disable gradient checkpointing before CUDA Graph capture")
-        if model.config.fuse_linear_cross_entropy:
-            raise ValueError(
-                "FLA fused linear cross entropy performs a capture-unsafe host "
-                "reduction; disable fuse_linear_cross_entropy for CUDA Graph "
-                "training"
-            )
-
         self._validate_pair(sample_input_ids, sample_labels)
+        if model.config.fuse_linear_cross_entropy:
+            if sample_labels.shape[1] < 2:
+                raise ValueError(
+                    "fixed dense fused-linear loss requires sequence length >= 2"
+                )
+            if bool(sample_labels.eq(-100).any().item()):
+                raise ValueError(
+                    "fixed dense fused-linear loss does not accept ignored input labels"
+                )
         parameter_devices = {parameter.device for parameter in model.parameters()}
         if parameter_devices != {sample_input_ids.device}:
             raise ValueError(
